@@ -1,0 +1,45 @@
+corpus_file = "corpus.bin"
+result_file = "result.bin"
+elites = 5
+# 각 손(왼손·오른손)이 최소 이 비율 이상 입력을 맡아야 함 (0.5 이하, 0.45 = 45~55%)
+min_hand_usage = 0.45
+min_home_diff = 2
+wikipedia_limit = 0
+wikipedia_dump_url = "https://mirror.accum.se/mirror/wikimedia.org/dumps/enwiki/20261001/enwiki-20261001-pages-articles.xml.bz2"
+# 공식(느림, 연결당 제한): https://dumps.wikimedia.org/enwiki/latest/enwiki-latest-pages-articles.xml.bz2
+# 덤프를 result_path 아래 파일로 먼저 받아 두기 (약 26GB, 끊기면 이어받기, 이후 재분석 시 재다운로드 없음)
+wikipedia_dump_file = "enwiki-latest-pages-articles.xml.bz2"
+# 코퍼스 빈도 최하위 n글자를 가운데 두 열(검지 안쪽)에 강제 배치, 나머지 글자는 센터 금지 (0 = 끔, 2~6)
+center_rare = 4
+# 난수 시드 (없으면 실행 시 출력되는 값을 넣어 재현)
+# seed = 12345
+
+[weights]
+gap = 0.90
+row = 0.97
+center = 2.5
+outroll = 0.85
+redirect = -1.5
+# 나쁜 방향 하프 시저스 (인접 손가락 한 줄 차이, 긴 손가락이 아래): 롤이 아닌 시저스로 분류, 페널티 배율
+half_scissors = 1.0
+# 풀 시저스 중 편한 방향(긴 손가락이 위, 예: 중지 윗줄 + 검지 아랫줄) 페널티 배율. 나쁜 방향은 1.0 (1 = 구분 없음)
+full_scissors_good = 0.5
+# 스킵 풀 시저스(1·3번 키가 인접 손가락 두 줄 차이, 가운데 아무 키) 페널티 배율. 방향 구분은 풀 시저스와 같음. 0 = 끔
+skip_scissors = 0.5
+
+[rates]
+effort = 0.20
+sfb = 0.25
+rolling = 0.30
+scissors = 0.25
+
+[sa]
+max_no_improve = 1500
+accept_start = 0.3
+cooling = 0.998
+
+[ga]
+population = 40
+tournament = 3
+# 최고 점수가 이 세대 수 동안 안 오르면 종료 (없으면 population 값)
+max_stall = 40

@@ -1,0 +1,256 @@
+#![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss, clippy::cast_sign_loss, clippy::cast_lossless)]
+use std::collections::HashMap;
+use serde::{Serialize, Deserialize};
+use crate::layout::CHARS;
+
+pub struct CorpusArrays {
+  pub keys: Vec<char>,
+  pub freq: Box<[u64]>,
+  pub nz_bigrams: Vec<(u8, u8, u64)>,
+  pub nz_trigrams: Vec<(u8, u8, u8, u64)>,
+  pub bigram_flat: Vec<usize>,
+  pub bigram_offsets: [usize; CHARS + 1],
+  pub trigram_flat: Vec<usize>,
+  pub trigram_offsets: [usize; CHARS + 1],
+}
+
+impl CorpusArrays {
+  // 빈도 최하위 n글자의 id 비트마스크 (동률은 id 순). n = 0이면 0 (제약 없음)
+  pub fn rare_mask(&self, n: usize) -> u32 {
+    let mut ids: Vec<usize> = (0..self.keys.len()).collect();
+    ids.sort_by_key(|&i| (self.freq[i], i));
+    ids.iter().take(n).fold(0, |m, &i| m | 1 << i)
+  }
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct CorpusStats {
+  pub letters: HashMap<char, u64>,
+  pub bigrams: HashMap<(char, char), u64>,
+  pub trigrams: HashMap<(char, char, char), u64>,
+}
+
+#[derive(Clone)]
+pub struct FastCorpus {
+  pub letters: Box<[u64; CHARS]>,
+  pub bigrams: Box<[u64; CHARS * CHARS]>,
+  pub trigrams: Box<[u64]>,
+}
+
+impl FastCorpus {
+  pub fn new() -> Self {
+    Self {
+      letters: Box::new([0; CHARS]),
+      bigrams: Box::new([0; CHARS * CHARS]),
+      trigrams: vec![0u64; CHARS * CHARS * CHARS].into_boxed_slice(),
+    }
+  }
+
+  #[inline]
+  pub fn add_letter(&mut self, id: u8) {
+    self.letters[id as usize] += 1;
+  }
+
+  #[inline]
+  pub fn add_bigram(&mut self, p: u8, c: u8) {
+    self.bigrams[p as usize * CHARS + c as usize] += 1;
+  }
+
+  #[inline]
+  pub fn add_trigram(&mut self, pp: u8, p: u8, c: u8) {
+    self.trigrams[(pp as usize * CHARS + p as usize) * CHARS + c as usize] += 1;
+  }
+
+  pub fn into_stats(self) -> CorpusStats {
+    let mut stats = CorpusStats::new();
+    let to_char = |idx: usize| -> char {
+      if idx < 26 { (idx as u8 + b'a') as char } else { ' ' }
+    };
+
+    for (i, &cnt) in self.letters.iter().enumerate() {
+      if cnt > 0 { stats.letters.insert(to_char(i), cnt); }
+    }
+    for (i, &cnt) in self.bigrams.iter().enumerate() {
+      if cnt > 0 { stats.bigrams.insert((to_char(i / CHARS), to_char(i % CHARS)), cnt); }
+    }
+    for (i, &cnt) in self.trigrams.iter().enumerate() {
+      if cnt > 0 {
+        let pp = to_char(i / (CHARS * CHARS));
+        let p = to_char((i / CHARS) % CHARS);
+        let c = to_char(i % CHARS);
+        stats.trigrams.insert((pp, p, c), cnt);
+      }
+    }
+    stats
+  }
+}
+
+impl CorpusStats {
+  pub fn new() -> Self {
+    Self {
+      letters: HashMap::new(),
+      bigrams: HashMap::new(),
+      trigrams: HashMap::new(),
+    }
+  }
+
+  // include_space=false: 공백을 엄지 키로 보고 배열에서 뺌 (a-z 26키만 배치, 공백이 낀 빅/트라이그램은 버림)
+  pub fn to_arrays(&self, include_space: bool) -> CorpusArrays {
+    let keys: Vec<char> = ('a'..='z').chain(include_space.then_some(' ')).collect();
+
+    let lu = |ch: char| -> Option<u8> {
+      if ch.is_ascii_lowercase() { Some(ch as u8 - b'a') }
+      else if ch == ' ' && include_space { Some(26) }
+      else { None }
+    };
+
+    let mut freq = vec![0u64; CHARS].into_boxed_slice();
+    for (&ch, &cnt) in &self.letters {
+      if let Some(i) = lu(ch) { freq[i as usize] = cnt; }
+    }
+
+    let mut nz_bigrams: Vec<(u8, u8, u64)> = self.bigrams.iter()
+      .filter_map(|(&(a, b), &cnt)| {
+        Some((lu(a)?, lu(b)?, cnt))
+      })
+      .collect();
+    nz_bigrams.sort_unstable_by_key(|&(a, b, _)| (a, b));
+
+    let mut nz_trigrams: Vec<(u8, u8, u8, u64)> = self.trigrams.iter()
+      .filter_map(|(&(a, b, c), &cnt)| {
+        Some((lu(a)?, lu(b)?, lu(c)?, cnt))
+      })
+      .collect();
+    nz_trigrams.sort_unstable_by_key(|&(a, b, c, _)| (a, b, c));
+
+    let mut bg_lists: Vec<Vec<usize>> = vec![Vec::new(); CHARS];
+    for (i, &(a, b, _)) in nz_bigrams.iter().enumerate() {
+      let (a, b) = (a as usize, b as usize);
+      bg_lists[a].push(i);
+      if b != a { bg_lists[b].push(i); }
+    }
+    let mut bigram_flat = Vec::new();
+    let mut bigram_offsets = [0usize; CHARS + 1];
+    for id in 0..CHARS {
+      bigram_offsets[id] = bigram_flat.len();
+      bigram_flat.extend_from_slice(&bg_lists[id]);
+    }
+    bigram_offsets[CHARS] = bigram_flat.len();
+
+    let mut tg_lists: Vec<Vec<usize>> = vec![Vec::new(); CHARS];
+    for (i, &(a, b, c, _)) in nz_trigrams.iter().enumerate() {
+      let (a, b, c) = (a as usize, b as usize, c as usize);
+      tg_lists[a].push(i);
+      if b != a { tg_lists[b].push(i); }
+      if c != a && c != b { tg_lists[c].push(i); }
+    }
+    let mut trigram_flat = Vec::new();
+    let mut trigram_offsets = [0usize; CHARS + 1];
+    for id in 0..CHARS {
+      trigram_offsets[id] = trigram_flat.len();
+      trigram_flat.extend_from_slice(&tg_lists[id]);
+    }
+    trigram_offsets[CHARS] = trigram_flat.len();
+
+    CorpusArrays { keys, freq, nz_bigrams, nz_trigrams, bigram_flat, bigram_offsets, trigram_flat, trigram_offsets }
+  }
+
+  // 빅그램은 누적 99%, 트라이그램은 누적 90% 커버리지까지만 보존
+  pub fn trim_by_coverage(&mut self) {
+    fn trim<K: Eq + std::hash::Hash + Clone + Ord>(map: &mut HashMap<K, u64>, threshold: f64) {
+      if map.is_empty() { return; }
+      let total: u64 = map.values().sum();
+      let limit = (total as f64 * threshold) as u64;
+      let mut items: Vec<(K, u64)> = map.iter().map(|(k, &v)| (k.clone(), v)).collect();
+      // 동률은 키 순으로 정렬: HashMap 순회 순서는 실행마다 달라서, 경계에서 잘리는 항목이 바뀌면 재현이 깨짐
+      items.sort_by(|(ka, ca), (kb, cb)| cb.cmp(ca).then_with(|| ka.cmp(kb)));
+
+      let mut cumulative = 0u64;
+      let mut keep_count = 0;
+      for (_, count) in &items {
+        cumulative += count;
+        keep_count += 1;
+        if cumulative >= limit { break; }
+      }
+      items.truncate(keep_count);
+      *map = items.into_iter().collect();
+    }
+    trim(&mut self.bigrams,  0.99);
+    trim(&mut self.trigrams, 0.90);
+  }
+
+  pub fn save(&self, path: &str) -> anyhow::Result<()> {
+    let bytes = bincode::serialize(self)?;
+    std::fs::write(path, bytes)?;
+    Ok(())
+  }
+
+  pub fn load(path: &str) -> anyhow::Result<Self> {
+    let bytes = std::fs::read(path)?;
+    Ok(bincode::deserialize(&bytes)?)
+  }
+
+  pub fn print(&self) {
+    let total_letters: u64 = self.letters.values().sum();
+
+    let mut letters: Vec<_> = self.letters.iter().collect();
+    letters.sort_by(|a, b| b.1.cmp(a.1));
+    println!("\n[Letters]");
+    for (ch, count) in &letters {
+      println!("  {}: {:>12}  ({:.2}%)", ch, count, **count as f64 / total_letters as f64 * 100.0);
+    }
+
+    let mut bigrams: Vec<_> = self.bigrams.iter().collect();
+    bigrams.sort_by(|a, b| b.1.cmp(a.1));
+    println!("\n[Bigrams] top 20");
+    for ((c1, c2), count) in bigrams.iter().take(20) {
+      println!("  {c1}{c2}: {count:>12}");
+    }
+
+    let mut trigrams: Vec<_> = self.trigrams.iter().collect();
+    trigrams.sort_by(|a, b| b.1.cmp(a.1));
+    println!("\n[Trigrams] top 20");
+    for ((c1, c2, c3), count) in trigrams.iter().take(20) {
+      println!("  {c1}{c2}{c3}: {count:>12}");
+    }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn trim_breaks_ties_by_key() {
+    // 빈도가 모두 같으면 90% 경계에서 어떤 항목이 남는지가 HashMap 순서에 좌우되면 안 됨
+    for _ in 0..20 {
+      let mut s = CorpusStats::new();
+      for (i, c) in ('a'..='j').enumerate() { s.bigrams.insert((c, 'z'), 10); s.trigrams.insert((c, 'y', 'z'), 10 + (i as u64 % 2)); }
+      s.trim_by_coverage();
+      let mut kept: Vec<char> = s.bigrams.keys().map(|k| k.0).collect();
+      kept.sort_unstable();
+      assert_eq!(kept, ('a'..='j').collect::<Vec<_>>()); // 99% → 10개 모두
+      let mut tri: Vec<char> = s.trigrams.keys().map(|k| k.0).collect();
+      tri.sort_unstable();
+      // 빈도 11인 b,d,f,h,j 먼저, 그다음 빈도 10은 키 순 a,c,e,g
+      assert_eq!(tri, vec!['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'j']);
+    }
+  }
+
+  #[test]
+  fn to_arrays_can_drop_space() {
+    let stats = crate::test_util::stats();
+    let with = stats.to_arrays(true);
+    let without = stats.to_arrays(false);
+    assert_eq!(with.keys.len(), 27);
+    assert_eq!(without.keys.len(), 26);
+    assert!(!without.keys.contains(&' '));
+    assert_eq!(without.freq[26], 0);
+    assert!(without.nz_bigrams.iter().all(|&(a, b, _)| a < 26 && b < 26));
+    assert!(without.nz_trigrams.iter().all(|&(a, b, c, _)| a < 26 && b < 26 && c < 26));
+    // 공백 없는 n-gram은 그대로 남아야 함
+    let letters_only = with.nz_bigrams.iter().filter(|&&(a, b, _)| a < 26 && b < 26).count();
+    assert_eq!(without.nz_bigrams.len(), letters_only);
+    assert_eq!(without.bigram_offsets[26], without.bigram_offsets[27]);
+  }
+}
