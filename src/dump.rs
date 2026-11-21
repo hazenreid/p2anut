@@ -4,11 +4,38 @@
 //   3) 위키 원문 자체의 HTML 엔티티 해제 (`&nbsp;`, `&ndash;` 등). 모르는 엔티티는 공백으로 바꿔 글자로 세지 않음
 // 3)을 2) 뒤에 해야 원문의 `&lt;`(글자 그대로의 <)가 태그로 오인되지 않음
 
+// 문서 끝의 정형 섹션 제목 (내용이 대부분 인용·링크 목록이고, 제목 단어도 모든 문서에서 반복됨)
+// 이 중 하나가 2단계 제목(== X ==)으로 처음 나오는 곳부터 문서 끝까지 버림
+const TAIL_SECTIONS: [&[u8]; 17] = [
+  b"references", b"reference", b"notes", b"note", b"footnotes", b"citations", b"sources",
+  b"see also", b"external links", b"external link", b"further reading", b"bibliography",
+  b"notes and references", b"references and notes", b"works cited", b"sources and further reading",
+  b"notes and sources",
+];
+
+// 끝 섹션이 시작되는 줄의 위치 (마크업 제거 전, XML 엔티티만 푼 원문 기준)
+pub fn tail_section_start(text: &[u8]) -> Option<usize> {
+  let mut start = 0;
+  for line in text.split(|&b| b == b'\n') {
+    let t = line.trim_ascii();
+    if t.len() > 4 && t.starts_with(b"==") && t.ends_with(b"==") && t[2] != b'=' && t[t.len() - 3] != b'=' {
+      let title = t[2..t.len() - 2].trim_ascii();
+      if TAIL_SECTIONS.iter().any(|s| s.eq_ignore_ascii_case(title)) {
+        return Some(start);
+      }
+    }
+    start += line.len() + 1;
+  }
+  None
+}
+
 // 위키 본문 텍스트 정리기 (버퍼 재사용)
 pub struct ArticleCleaner {
   decoded: Vec<u8>,
   stripped: Vec<u8>,
   text: Vec<u8>,
+  // 마지막 clean()에서 끝 섹션을 잘라 냈는지 (검증 도구용)
+  pub tail_cut: bool,
 }
 
 impl ArticleCleaner {
@@ -17,12 +44,16 @@ impl ArticleCleaner {
       decoded: Vec::with_capacity(128 * 1024),
       stripped: Vec::with_capacity(128 * 1024),
       text: Vec::with_capacity(128 * 1024),
+      tail_cut: false,
     }
   }
 
   // raw: 덤프 XML의 <text> 내용 (XML 이스케이프된 상태 그대로)
   pub fn clean(&mut self, raw: &[u8]) -> &[u8] {
     decode_html_entities_into(raw, &mut self.decoded);
+    let tail = tail_section_start(&self.decoded);
+    self.tail_cut = tail.is_some();
+    if let Some(p) = tail { self.decoded.truncate(p); }
     strip_wiki_markup_into(&self.decoded, &mut self.stripped);
     decode_wiki_entities_into(&self.stripped, &mut self.text);
     &self.text
@@ -352,6 +383,26 @@ mod tests {
     assert_eq!(strip("[[:Category:Foo|foo list]]"), "foo list");
     assert_eq!(strip("a[[Category:People]]b[[image:x.png]]c[[ fr :Paris]]d[[zh-yue:X]]e"), "abcde");
     assert_eq!(strip("[[Media:Sound.ogg|listen]]."), ".");
+  }
+
+  #[test]
+  fn tail_sections_are_cut() {
+    let body = "Intro text.\n== History ==\nOld story.\n=== Notes ===\nsub note kept\n";
+    let tail = "==See also==\n* [[Other]]\n== References ==\n{{reflist}}\n[[Category:X]]";
+    assert_eq!(tail_section_start(format!("{body}{tail}").as_bytes()), Some(body.len()));
+    // 대소문자·공백 변형
+    assert_eq!(tail_section_start(b"a\n  ==  EXTERNAL LINKS  ==  \nb"), Some(2));
+    // 3단계 제목, 본문 섹션, 제목이 아닌 줄은 자르지 않음
+    assert_eq!(tail_section_start(b"a\n=== References ===\nb"), None);
+    assert_eq!(tail_section_start(b"a\n== Referenced works ==\nb"), None);
+    assert_eq!(tail_section_start(b"see also == references == here"), None);
+
+    let mut c = ArticleCleaner::new();
+    let out = String::from_utf8(c.clean(format!("{body}{tail}").as_bytes()).to_vec()).unwrap();
+    assert!(c.tail_cut);
+    assert!(out.contains("sub note kept") && !out.contains("Other") && !out.contains("References"), "{out}");
+    c.clean(b"no tail here");
+    assert!(!c.tail_cut);
   }
 
   #[test]

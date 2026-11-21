@@ -50,3 +50,16 @@ cargo run --release -- <result_path> results     # 저장된 결과 출력
 ```bash
 cargo test
 ```
+
+### 덤프 파싱 확인 (`test_dump`)
+
+```bash
+cargo run --release --bin test_dump -- <result_path> [articles]   # 기본 2000, 0이면 첫 문서만
+```
+
+- 첫 본문 문서의 원문과 정리된 결과를 보여 줍니다.
+- 앞쪽 `articles`개 문서를 정리해서 아래 내용을 출력합니다.
+  - 많이 나온 단어 상위 60개
+  - 마크업 찌꺼기로 의심되는 토큰(`nbsp`, `frac`, `jpg`, `http` 등)의 100만 단어당 빈도
+  - 끝 섹션(References, See also 등)을 잘라 낸 문서의 비율
+- 의심 토큰 가운데 `times`, `minus`처럼 원래 영어 단어인 것은 절대값보다 수정 전후 비교에 쓰세요.
