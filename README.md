@@ -29,8 +29,10 @@ cargo run --release -- <result_path> analyze     # 코퍼스 분석 → <result_
 cargo run --release -- <result_path> optimize    # 최적화 → <result_path>/result.bin
 cargo run --release -- <result_path> run         # analyze + optimize
 cargo run --release -- <result_path> results     # 저장된 결과 출력
+cargo run --release -- <result_path> score mine.txt   # 내 배열을 저장된 결과 1등과 같은 기준으로 채점
 ```
 
+- `score`의 배열 파일은 행마다 10칸(빈칸은 `.`)씩 3행입니다. `results` 출력 형식도 그대로 읽습니다. 점수와 함께 행별 사용률, SFB·스킵그램·롤·시저스·리다이렉트 비율을 보여 줍니다.
 - `--reset`을 붙이면 기존 결과를 무시하고 새로 시작합니다. 분석 중간 저장(`.partial`)은 덤프·파서·표본 비율이 같으면 `--reset`이어도 이어서 씁니다. 처음부터 다시 하려면 그 파일을 지우세요.
 - 예전 버전이 만든 `corpus.bin`은 형식이 달라 읽지 못합니다. `analyze --reset`으로 다시 만드세요.
 - Ctrl-C를 한 번 누르면 이번 라운드가 끝난 뒤 저장하고 종료합니다. 두 번 누르면 바로 종료합니다.

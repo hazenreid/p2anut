@@ -117,6 +117,64 @@ impl Layout {
     }
   }
 
+  // 배열 텍스트 읽기: 행마다 10칸, 글자는 a-z, 빈칸은 '.' 또는 '_'. 공백은 무시 (print() 출력도 그대로 읽힘).
+  // 빈 줄은 건너뛰고, 정확히 3행이어야 하며 각 글자는 한 번씩만
+  pub fn parse(text: &str) -> anyhow::Result<Self> {
+    let rows: Vec<Vec<char>> = text.lines()
+      .map(|l| l.chars().filter(|c| !c.is_whitespace()).collect::<Vec<char>>())
+      .filter(|r| !r.is_empty())
+      .collect();
+    anyhow::ensure!(rows.len() == ROWS, "layout must have {ROWS} rows, found {}", rows.len());
+    let mut l = Layout::new();
+    for (r, row) in rows.iter().enumerate() {
+      anyhow::ensure!(row.len() == COLS, "row {} must have {COLS} keys, found {}: {}", r + 1, row.len(), row.iter().collect::<String>());
+      for (c, &ch) in row.iter().enumerate() {
+        let ch = ch.to_ascii_lowercase();
+        if ch == '.' || ch == '_' { continue; }
+        anyhow::ensure!(ch.is_ascii_lowercase(), "unexpected character {ch:?} in row {}", r + 1);
+        let id = ch as u8 - b'a';
+        anyhow::ensure!(l.pos[id as usize] == EMPTY, "letter {ch} appears more than once");
+        let p = r * COLS + c;
+        l.slots[p] = id;
+        l.pos[id as usize] = p as u8;
+      }
+    }
+    Ok(l)
+  }
+
+  // 사람이 읽기 쉬운 비율 지표 (corpus 기준, 0~100%). 분모는 각각 전체 글자·바이그램·트라이그램 빈도
+  pub fn print_stats(&self, corpus: &CorpusArrays, precomp: &Precomp) {
+    let pct = |a: u64, b: u64| if b == 0 { 0.0 } else { a as f64 * 100.0 / b as f64 };
+    let mut rows = [0u64; ROWS];
+    let mut letters = 0u64;
+    for (p, &id) in self.slots.iter().enumerate() {
+      if id < CHARS as u8 { rows[p / COLS] += corpus.freq[id as usize]; letters += corpus.freq[id as usize]; }
+    }
+    let (mut bg, mut sfb, mut roll, mut sciss) = (0u64, 0u64, 0u64, 0u64);
+    for &(a, b, n) in &corpus.nz_bigrams {
+      let (p1, p2) = (self.pos[a as usize], self.pos[b as usize]);
+      bg += n;
+      if p1 == EMPTY || p2 == EMPTY { continue; }
+      let e = precomp.bigram(p1 as usize, p2 as usize);
+      if e.sfb_base > 0.0 { sfb += n; }
+      if e.rolling_base > 0.0 { roll += n; }
+      if e.scissors_base > 0.0 { sciss += n; }
+    }
+    let (mut tg, mut sfs, mut redirect, mut roll3) = (0u64, 0u64, 0u64, 0u64);
+    for &(a, b, c, n) in &corpus.nz_trigrams {
+      let (p1, p2, p3) = (self.pos[a as usize], self.pos[b as usize], self.pos[c as usize]);
+      tg += n;
+      if p1 == EMPTY || p2 == EMPTY || p3 == EMPTY { continue; }
+      let e = precomp.trigram(p1 as usize, p2 as usize, p3 as usize);
+      if e.sfs_base > 0.0 { sfs += n; }
+      if e.roll_base < 0.0 { redirect += n; }
+      if e.roll_base > 0.0 { roll3 += n; }
+    }
+    println!("rows: top={:.1}%  home={:.1}%  bottom={:.1}%", pct(rows[0], letters), pct(rows[1], letters), pct(rows[2], letters));
+    println!("bigrams: sfb={:.2}%  roll={:.1}%  scissors={:.2}%   trigrams: skipgram(sfs)={:.2}%  roll/redirect-bonus={:.1}%  redirect-penalty={:.2}%",
+      pct(sfb, bg), pct(roll, bg), pct(sciss, bg), pct(sfs, tg), pct(roll3, tg), pct(redirect, tg));
+  }
+
   pub fn key_count(&self) -> usize {
     self.slots.iter().filter(|&&id| id < CHARS as u8).count()
   }
@@ -366,6 +424,22 @@ mod tests {
       assert!(home_diff(home_row_keys(&kept[i]), home_row_keys(&kept[j])) >= 3);
     }}
     assert!(kept.windows(2).all(|w| w[0].total >= w[1].total));
+  }
+
+  #[test]
+  fn parse_reads_files_and_print_output() {
+    let l = Layout::parse(".blyx.foup\nmanijzreht\ncgkdq.s.vw\n").unwrap();
+    assert_eq!(l.key_count(), 26);
+    l.assert_invariants();
+    assert_eq!(l.slots[1], b'b' - b'a');
+    assert_eq!(l.slots[COLS], b'm' - b'a');
+    assert_eq!(l.slots[5], EMPTY);
+    // print() 형식(공백, 가운데 간격, '_')도 읽힘
+    let printed = Layout::parse(" . b l y x   _ f o u p\n m a n i j   z r e h t\n\n c g k d q   . s . v w").unwrap();
+    assert_eq!(printed.slots, l.slots);
+    assert!(Layout::parse("abc").is_err());
+    assert!(Layout::parse(".blyx.foup\nmanijzreht\ncgkdq.s.va\n").err().unwrap().to_string().contains("more than once"));
+    assert!(Layout::parse(".blyx.foup\nmanijzreht\ncgkdq.s.v\n").is_err());
   }
 
   #[test]
