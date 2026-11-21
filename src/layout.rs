@@ -167,12 +167,12 @@ impl Layout {
       tg += n;
       if p1 == EMPTY || p2 == EMPTY || p3 == EMPTY { continue; }
       let e = precomp.trigram(p1 as usize, p2 as usize, p3 as usize);
-      if e.sfs_base > 0.0 { sfs += n; }
+      if e.sfs_base > 0.0 && p1 != p3 { sfs += n; } // 같은 키 스킵그램(ere)은 배열로 피할 수 없어 빼고 셈
       if e.roll_base < 0.0 { redirect += n; }
       if e.roll_base > 0.0 { roll3 += n; }
     }
     println!("rows: top={:.1}%  home={:.1}%  bottom={:.1}%", pct(rows[0], letters), pct(rows[1], letters), pct(rows[2], letters));
-    println!("bigrams: sfb={:.2}%  roll={:.1}%  scissors={:.2}%   trigrams: skipgram(sfs)={:.2}%  roll/redirect-bonus={:.1}%  redirect-penalty={:.2}%",
+    println!("bigrams: sfb={:.2}%  roll={:.1}%  scissors={:.2}%   trigrams: skipgram(other key)={:.2}%  roll/redirect-bonus={:.1}%  redirect-penalty={:.2}%",
       pct(sfb, bg), pct(roll, bg), pct(sciss, bg), pct(sfs, tg), pct(roll3, tg), pct(redirect, tg));
   }
 

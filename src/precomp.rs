@@ -138,7 +138,8 @@ impl Precomp {
           if f1 == f3 && f1 != f2 {
             let row_dist = r1.abs_diff(r3);
             let row_mult = 1.0 + (weights.row * row_dist as f32);
-            entry.sfs_base = weights.sfs * (e1 + e3)
+            let w = if p1 == p3 { weights.sfs_same_key() } else { weights.sfs };
+            entry.sfs_base = w * (e1 + e3)
               * (if ic1 || ic3 { weights.center } else { 1.0 })
               * row_mult;
           } else if il1 == il2 && il2 == il3 {
@@ -214,6 +215,22 @@ mod tests {
     assert!(half.bigram(a, c).sfb_base > 0.0);
     // 1이면 스킵그램과 SFB가 같은 무게 (예전 동작)
     assert!((full.trigram(a, b, c).sfs_base - full.bigram(a, c).sfb_base).abs() < 1e-6);
+  }
+
+  #[test]
+  fn same_key_skipgram_has_its_own_weight() {
+    let mut w = crate::test_util::weights();
+    w.sfs = 0.5;
+    let old = Precomp::new(&[1; crate::layout::CHARS], &w, 0.45);
+    w.sfs_same_key = Some(0.0);
+    let new = Precomp::new(&[1; crate::layout::CHARS], &w, 0.45);
+    // 같은 키(검지 홈 → 다른 손가락 → 같은 검지 홈): 없으면 sfs와 같고, 0이면 감점 없음
+    let (k, mid) = (COLS + 3, COLS + 1);
+    assert!(old.trigram(k, mid, k).sfs_base > 0.0);
+    assert_eq!(new.trigram(k, mid, k).sfs_base, 0.0);
+    // 다른 키 스킵그램(검지 홈 → 다른 손가락 → 검지 윗줄)은 그대로
+    assert_eq!(new.trigram(k, mid, 3).sfs_base, old.trigram(k, mid, 3).sfs_base);
+    assert!(new.trigram(k, mid, 3).sfs_base > 0.0);
   }
 
   #[test]

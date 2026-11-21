@@ -26,12 +26,17 @@ pub struct Weights {
   // 1(기본) = SFB와 같은 무게 (예전 동작)
   #[serde(default = "default_one")]
   pub sfs: f32,
+  // 같은 키 스킵그램(1·3번이 같은 글자, 예: ere, iti) 배율. 같은 글자는 어느 배열에서나 같은 키라 배열로 피할 수 없고,
+  // 감점이 그 키의 노력값만 한 번 더 세는 셈이 됨. SFB도 같은 키 연속(ll)은 세지 않음. 없으면 sfs와 같음 (예전 동작)
+  #[serde(default)]
+  pub sfs_same_key: Option<f32>,
 }
 
 fn default_one() -> f32 { 1.0 }
 
 impl Weights {
   pub fn roll_row(&self) -> f32 { self.roll_row.unwrap_or(self.row) }
+  pub fn sfs_same_key(&self) -> f32 { self.sfs_same_key.unwrap_or(self.sfs) }
 }
 
 // 총점의 기준값: 모든 항목을 "검지 홈 행 키 한 번 = 1" 단위의 비용으로 바꿔 그대로 더함.
@@ -204,8 +209,8 @@ impl Config {
       anyhow::bail!("center_rare must be 0 (off) or 2..=6");
     }
     let w = &self.weights;
-    if w.gap < 0.0 || w.row < 0.0 || w.center < 0.0 || w.outroll < 0.0 || w.roll_row() < 0.0 || w.half_scissors < 0.0 || w.full_scissors_good < 0.0 || w.skip_scissors < 0.0 || w.sfs < 0.0 {
-      anyhow::bail!("weights.gap, row, roll_row, center, outroll, half_scissors, full_scissors_good, skip_scissors, sfs must be non-negative (redirect may be negative)");
+    if w.gap < 0.0 || w.row < 0.0 || w.center < 0.0 || w.outroll < 0.0 || w.roll_row() < 0.0 || w.half_scissors < 0.0 || w.full_scissors_good < 0.0 || w.skip_scissors < 0.0 || w.sfs < 0.0 || w.sfs_same_key() < 0.0 {
+      anyhow::bail!("weights.gap, row, roll_row, center, outroll, half_scissors, full_scissors_good, skip_scissors, sfs, sfs_same_key must be non-negative (redirect may be negative)");
     }
     if w.redirect < -5.0 || w.redirect > 5.0 {
       anyhow::bail!("weights.redirect must be in [-5.0, 5.0]");
