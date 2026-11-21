@@ -275,6 +275,9 @@ impl Layout {
   // absolute 방식: 글자 100개당 항목별 비용과 무작위 배열 대비 변화율.
   // iqr 방식: 항목별 정규화 점수 (무작위 배열 중앙값 대비 IQR 배수, 클수록 좋음). 총점은 이 값을 ±Z_CLAMP로 잘라 rates로 가중합한 것
   pub fn print_goodness(&self, norm: &ScoreNorm) {
+    if self.total <= PENALTY_SCORE {
+      println!("DISQUALIFIED: one hand types less than min_hand_usage (scores below are for reference only)");
+    }
     if let Some(c) = norm.cost_breakdown(&self.score) {
       let total = c.effort + c.sfb + c.rolling + c.scissors;
       println!("cost per 100 letters (lower is better): total={total:.1}  effort={:.1}  sfb={:.1}  scissors={:.1}  rolling={:.1}", c.effort, c.sfb, c.scissors, c.rolling);
