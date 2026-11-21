@@ -53,6 +53,7 @@ fn default_cooling() -> f64 { 0.998 }
 fn default_bigram_coverage() -> f64 { 0.99 }
 fn default_trigram_coverage() -> f64 { 0.90 }
 fn default_sample() -> f64 { 1.0 }
+fn default_true() -> bool { true }
 fn default_min_home_diff() -> u32 { 1 }
 
 #[derive(Deserialize, Clone)]
@@ -91,6 +92,9 @@ pub struct Config {
   // (날짜판 URL을 바꾸면 파일 이름도 바뀌어서 예전 덤프를 새 것으로 착각하지 않음)
   #[serde(default)]
   pub wikipedia_download: bool,
+  // 다 받은 덤프를 Wikimedia가 공개하는 SHA-1(<wiki>-<날짜>-sha1sums.txt)과 비교. 기본 true
+  #[serde(default = "default_true")]
+  pub wikipedia_verify: bool,
   // 난수 시드. 없으면 실행마다 새로 뽑아 출력하므로, 그 값을 넣으면 같은 실행을 재현할 수 있음
   #[serde(default)]
   pub seed: Option<u64>,

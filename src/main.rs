@@ -65,7 +65,8 @@ fn analyze_dump(result_path: &Path, config: &Config, corpus_path: &Path) -> anyh
       if urls.is_empty() { anyhow::bail!("dump file {} not found and wikipedia_dump_url is empty", dump_path.display()); }
       if let Some(dir) = dump_path.parent() { fs::create_dir_all(dir)?; }
       println!("[Download] -> {}", dump_path.display());
-      download::download_dump(&download::http_client()?, &urls, &dump_path, &download::DownloadOpts::default())?;
+      let opts = download::DownloadOpts { verify: config.wikipedia_verify, ..Default::default() };
+      download::download_dump(&download::http_client()?, &urls, &dump_path, &opts)?;
     }
     println!("[Wikipedia Dump] Reading {}", dump_path.display());
     if config.wikipedia_limit > 0 {
