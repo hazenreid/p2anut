@@ -62,11 +62,11 @@ skip_scissors = 0.5
 sfs = 0.5
 
 [rates]
-# 롤링 우선, 시저스는 SFB보다 강하게 피함
-effort = 0.15
-sfb = 0.15
-rolling = 0.35
-scissors = 0.35
+# 롤링 우선, 시저스는 SFB보다 강하게 피함 (시저스 세부 배율은 그대로 두고 비중으로만 조절)
+effort = 0.13
+sfb = 0.12
+rolling = 0.30
+scissors = 0.45
 
 [sa]
 max_no_improve = 1500
