@@ -74,7 +74,7 @@ sfb = 2.5
 # 나쁜 방향 풀 시저스 한 번 (중지 아랫줄 → 검지 윗줄). 하프 시저스·편한 방향·스킵 시저스는 [weights] 배율로 이 값에서 줄어듦
 full_scissors = 8.0
 # 안쪽 롤 한 번으로 아끼는 양 (중지 홈 → 검지 홈). 바깥쪽 롤은 outroll 배, 리다이렉트는 redirect 배
-inroll = 2.0
+inroll = 3.0
 
 [rates]
 # score_normalization = "iqr"일 때만 씀
