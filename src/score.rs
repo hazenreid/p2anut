@@ -62,7 +62,8 @@ impl ScoreNorm {
   pub fn total_score(&self, eff: f64, sfb: f64, roll: f64, sciss: f64) -> i64 {
     let a = self.abs;
     let cost = (eff * a.effort + sfb * a.sfb + sciss * a.scissors - roll * a.rolling) * a.per_letter;
-    (-cost * ABS_SCALE) as i64
+    // 비용을 아주 크게 잡아도 손 비율 위반 표시(PENALTY_SCORE)와 겹치지 않게 그보다 위에서 자름
+    ((-cost * ABS_SCALE) as i64).max(crate::layout::PENALTY_SCORE + 1)
   }
 }
 
@@ -80,6 +81,17 @@ mod tests {
     assert!(n.total_score(100.0, 10.0, 3.0, 3.0) > n.total_score(100.0, 10.0, 2.0, 3.0));
     let b = n.cost_breakdown(&Score { effort: 100.0, sfb: 10.0, rolling: 2.0, scissors: 3.0 });
     assert!((b.effort - 100.0).abs() < 1e-9 && (b.sfb - 5.0).abs() < 1e-9 && (b.rolling + 8.0).abs() < 1e-9 && (b.scissors - 6.0).abs() < 1e-9);
+  }
+
+  #[test]
+  fn huge_costs_never_reach_the_penalty_marker() {
+    let n = ScoreNorm { abs: AbsWeights { effort: 1.0, sfb: 0.0, scissors: 0.0, rolling: 0.0, per_letter: 1.0 }, ..Default::default() };
+    // 글자당 비용 1e12 → -1e21은 i64 범위를 넘지만 위반 표시보다 위에서 잘림
+    let t = n.total_score(1e12, 0.0, 0.0, 0.0);
+    assert!(t > crate::layout::PENALTY_SCORE);
+    // 범위 안의 비용은 그대로: 비용이 낮을수록 총점이 큼
+    assert_eq!(n.total_score(1.0, 0.0, 0.0, 0.0), -1_000_000_000);
+    assert!(n.total_score(1.0, 0.0, 0.0, 0.0) > t);
   }
 
   #[test]

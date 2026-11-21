@@ -57,9 +57,13 @@ fn analyze_bytes(bytes: &[u8], stats: &mut corpus::FastCorpus) {
 // 덤프 분석: 받아 둔 파일이 있으면 병렬(멀티스트림)·이어서 분석, 아니면 스트리밍 순차 분석.
 // wikipedia_limit > 0이면 앞쪽 N개만 순차로 (빠른 확인용)
 fn analyze_dump(result_path: &Path, config: &Config, corpus_path: &Path) -> anyhow::Result<CorpusStats> {
+  // 저장할 폴더를 먼저 만듦: 몇 시간짜리 분석이 끝난 뒤 저장 단계에서 실패하지 않도록
+  if let Some(dir) = corpus_path.parent() { fs::create_dir_all(dir)?; }
   let urls = config.dump_urls();
   let sample = config.wikipedia_sample;
   let checkpoint = std::path::PathBuf::from(format!("{}.partial", corpus_path.display()));
+  // 중간 저장은 병렬 분석을 끝까지 마쳤을 때만 지움 (앞쪽 N개만 보는 빠른 확인이 전체 분석의 진행을 지우지 않도록)
+  let mut parallel = false;
   let (fast, counts) = if let Some(dump_path) = config.dump_path(result_path) {
     if !dump_path.exists() {
       if urls.is_empty() { anyhow::bail!("dump file {} not found and wikipedia_dump_url is empty", dump_path.display()); }
@@ -72,6 +76,7 @@ fn analyze_dump(result_path: &Path, config: &Config, corpus_path: &Path) -> anyh
     if config.wikipedia_limit > 0 {
       wiki::analyze_sequential(fs::File::open(&dump_path)?, sample, config.wikipedia_limit)?
     } else {
+      parallel = true;
       wiki::analyze_file_parallel(&dump_path, sample, &checkpoint)?
     }
   } else {
@@ -89,7 +94,7 @@ fn analyze_dump(result_path: &Path, config: &Config, corpus_path: &Path) -> anyh
     counts.articles, counts.redirects, counts.lists, counts.sampled_out);
   let stats = fast.into_stats();
   stats.save(corpus_path.to_str().context("Invalid corpus path")?, dump::PARSER_VERSION)?;
-  if checkpoint.exists() { fs::remove_file(&checkpoint)?; }
+  if parallel && checkpoint.exists() { fs::remove_file(&checkpoint)?; }
   Ok(stats)
 }
 
@@ -320,6 +325,50 @@ mod tests {
     // 단어 경계를 넘지 않음, 대문자는 소문자로
     assert_eq!((bi(&f, "cd"), tri(&f, "bcd"), bi(&f, "de")), (0, 0, 1));
     assert_eq!(f.letters.iter().sum::<u64>(), 5);
+  }
+
+  // 문서 몇 개짜리 bz2 덤프
+  fn tiny_dump(path: &std::path::Path) {
+    use std::io::Write;
+    let mut xml = String::from("<mediawiki>\n");
+    for i in 0..5 { xml.push_str(&format!("<page><title>Article {i}</title><ns>0</ns><revision><text>Some words here {i}.</text></revision></page>\n")); }
+    xml.push_str("</mediawiki>\n");
+    let mut e = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::fast());
+    e.write_all(xml.as_bytes()).unwrap();
+    std::fs::write(path, e.finish().unwrap()).unwrap();
+  }
+
+  fn test_config(dump_file: &std::path::Path, limit: usize) -> crate::config::Config {
+    let mut c = crate::config::load_config(std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/config.toml"))).unwrap();
+    c.wikipedia_dump_file = Some(dump_file.to_str().unwrap().to_string());
+    c.wikipedia_limit = limit;
+    c
+  }
+
+  #[test]
+  fn analyze_creates_missing_result_dir_and_keeps_checkpoint_for_quick_runs() {
+    let root = std::env::temp_dir().join(format!("p2anut-main-{}", std::process::id()));
+    let dumps = root.join("dumps");
+    std::fs::create_dir_all(&dumps).unwrap();
+    let dump = dumps.join("d.xml.bz2");
+    tiny_dump(&dump);
+
+    // 결과 폴더가 없어도 (덤프는 다른 곳) 분석 후 저장까지 됨
+    let result = root.join("new").join("result");
+    let corpus = result.join("corpus.bin");
+    let stats = super::analyze_dump(&result, &test_config(&dump, 2), &corpus).unwrap();
+    assert!(corpus.exists() && stats.letters.values().sum::<u64>() > 0);
+
+    // 앞쪽 N개만 보는 빠른 확인은 전체 분석의 중간 저장을 지우지 않음
+    let checkpoint = std::path::PathBuf::from(format!("{}.partial", corpus.display()));
+    std::fs::write(&checkpoint, b"in-progress").unwrap();
+    super::analyze_dump(&result, &test_config(&dump, 2), &corpus).unwrap();
+    assert_eq!(std::fs::read(&checkpoint).unwrap(), b"in-progress");
+
+    // 병렬 분석을 끝까지 마치면 지움 (내용이 맞지 않는 중간 저장은 무시하고 처음부터 분석)
+    super::analyze_dump(&result, &test_config(&dump, 0), &corpus).unwrap();
+    assert!(!checkpoint.exists());
+    std::fs::remove_dir_all(&root).unwrap();
   }
 
   #[test]

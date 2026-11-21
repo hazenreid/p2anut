@@ -23,7 +23,7 @@ wikipedia_dump_url = [
   # 러시아 PDApps
   "https://wikipedia.mirror.pdapps.org/enwiki/20261101/enwiki-20261101-pages-articles-multistream.xml.bz2",
 ]
-# 덤프를 result_path 아래에 먼저 받아 두기 (약 26GB, 끊기면 이어받기). 파일 이름은 URL의 마지막 부분
+# 덤프를 result_path 아래에 먼저 받아 두기 (약 27GB, 끊기면 이어받기). 파일 이름은 URL의 마지막 부분
 wikipedia_download = true
 # 다 받은 덤프를 Wikimedia가 공개하는 SHA-1과 비교 (여러 미러에서 섞어 받을 수 있으므로 켜 두기를 권장).
 # 다르면 파일을 <이름>.bad로 옮기고 멈춤. 체크섬 파일을 못 구하면 경고만 하고 진행

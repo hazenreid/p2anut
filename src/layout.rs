@@ -17,7 +17,8 @@ pub const EMPTY: u8 = 255;
 pub const CHARS: usize = 27;  // a-z + space(26)
 pub const ROWS: usize = 3;
 pub const COLS: usize = 10;
-pub const PENALTY_SCORE: i64 = -1_000_000_000_000;
+// 손 사용 비율 위반 표시. 정상 총점(-(글자당 비용) × ABS_SCALE)은 이 값보다 항상 크게 잘림 (score::total_score)
+pub const PENALTY_SCORE: i64 = i64::MIN / 2;
 
 
 // 가운데 두 열(4·5열, 검지 안쪽)

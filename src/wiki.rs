@@ -17,7 +17,7 @@ use crate::corpus::FastCorpus;
 use crate::dump::{self, ArticleCleaner, ScanCounts};
 use crate::SHUTDOWN;
 
-// 병렬 분석 덩어리 크기 (압축 상태 기준). 26GB 덤프면 약 400개. 중간 저장 단위이기도 함
+// 병렬 분석 덩어리 크기 (압축 상태 기준). 27GB 덤프면 약 400개. 중간 저장 단위이기도 함
 const CHUNK_BYTES: u64 = 64 << 20;
 // 스트림 경계를 찾을 때 한 번에 읽는 크기
 const SCAN_BYTES: usize = 4 << 20;
