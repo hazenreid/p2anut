@@ -1,5 +1,6 @@
 mod config;
 mod corpus;
+mod download;
 mod dump;
 mod layout;
 mod optimizer;
@@ -11,8 +12,6 @@ mod test_util;
 
 use std::path::Path;
 use std::io::Write;
-use reqwest::blocking::Client;
-use std::time::Duration;
 use std::fs;
 use anyhow::Context;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -55,137 +54,18 @@ fn analyze_bytes(bytes: &[u8], stats: &mut corpus::FastCorpus) {
   }
 }
 
-fn http_client() -> anyhow::Result<Client> {
-  Ok(Client::builder()
-    .connect_timeout(Duration::from_secs(30))
-    .timeout(None)
-    // 상대가 사라진 연결(NAT 만료 등)을 OS 수준에서 감지
-    .tcp_keepalive(Some(Duration::from_secs(60)))
-    .user_agent("KeyboardLayoutOptimizer/1.0 (corpus builder)")
-    .build()?)
-}
-
-// "bytes 0-99/1234" 또는 "bytes */1234" → 1234
-fn content_range_total(resp: &reqwest::blocking::Response) -> Option<u64> {
-  resp.headers().get(reqwest::header::CONTENT_RANGE)?
-    .to_str().ok()?
-    .rsplit('/').next()?
-    .parse().ok()
-}
-
-// 한 번의 Range 요청으로 받는 크기와 그 요청 하나의 제한 시간.
-// reqwest 0.11 blocking에는 읽기 타임아웃이 없어서, 연결이 데이터 없이 멈추면 read가 영원히 막힘
-// (실제로 3GB 지점에서 ESTABLISHED 상태로 2시간 넘게 멈춤). 덩어리마다 요청 전체 제한 시간을 걸어
-// 멈춘 연결은 끊고 받은 데까지 이어받음. 8MiB를 2분 안에 못 받으면(약 70KB/s 미만) 멈춘 것으로 봄.
-// Wikimedia에서 실측한 속도(약 0.18MiB/s)로 한 덩어리에 약 45초 → 여유 약 2.7배.
-// 이보다 느린 회선이면 매 덩어리가 시간 초과되지만, 받은 만큼은 저장되므로 계속 진행됨
-const DOWNLOAD_CHUNK: u64 = 8 << 20;
-const DOWNLOAD_CHUNK_TIMEOUT: Duration = Duration::from_secs(120);
-
-// 덤프를 path로 내려받음. "<path>.part"에 덩어리 단위 Range 요청으로 이어 쓰고, 끝나면 rename
-fn download_dump(url: &str, path: &Path) -> anyhow::Result<()> {
-  const MAX_FAILURES: u32 = 10;
-  let client = http_client()?;
-  let part = std::path::PathBuf::from(format!("{}.part", path.display()));
-  let mut failures = 0u32;
-  let mut total: Option<u64> = None;
-  let mut last_report = 0u64;
-
-  loop {
-    let offset = fs::metadata(&part).map_or(0, |m| m.len());
-    if let Some(t) = total {
-      if offset == t { break; }
-      if offset > t { fs::remove_file(&part)?; anyhow::bail!("partial file larger than remote ({offset} > {t}); removed, re-run to restart"); }
-    }
-
-    // Ok(true) = 파일 끝까지 받음
-    let attempt = |total: &mut Option<u64>, last_report: &mut u64| -> anyhow::Result<bool> {
-      let range_end = offset + DOWNLOAD_CHUNK - 1;
-      let mut resp = client.get(url)
-        .header(reqwest::header::RANGE, format!("bytes={offset}-{range_end}"))
-        .timeout(DOWNLOAD_CHUNK_TIMEOUT)
-        .send()?;
-      let status = resp.status();
-
-      if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
-        let t = content_range_total(&resp);
-        if t == Some(offset) { return Ok(true); } // 이미 다 받음
-        fs::remove_file(&part)?;
-        anyhow::bail!("server rejected range at {offset} (remote size {t:?}); partial file removed");
-      }
-      let (mut file, expected) = if status == reqwest::StatusCode::PARTIAL_CONTENT {
-        let t = content_range_total(&resp).context("206 response without Content-Range total")?;
-        *total = Some(t);
-        (fs::OpenOptions::new().create(true).append(true).open(&part)?, range_end.min(t - 1) + 1 - offset)
-      } else if status.is_success() {
-        // Range 미지원 서버: 덩어리 없이 처음부터 전부 받음 (요청 제한 시간도 걸 수 없음)
-        anyhow::ensure!(offset == 0 || total.is_none(), "server stopped honoring Range");
-        println!("\n[Download] server ignored Range, downloading whole file without stall detection");
-        *total = resp.content_length();
-        let mut file = fs::File::create(&part)?;
-        let n = std::io::copy(&mut resp, &mut file)?;
-        file.flush()?;
-        if let Some(t) = *total { anyhow::ensure!(n == t, "connection closed at {n}/{t} bytes"); }
-        return Ok(true);
-      } else {
-        anyhow::bail!("HTTP {status}");
-      };
-
-      let mut buf = vec![0u8; 1024 * 1024];
-      let mut got = 0u64;
-      loop {
-        if SHUTDOWN.load(Ordering::SeqCst) {
-          file.flush()?;
-          anyhow::bail!("download interrupted at {} MiB (re-run to resume)", (offset + got) >> 20);
-        }
-        let n = std::io::Read::read(&mut resp, &mut buf)?;
-        if n == 0 { break; }
-        file.write_all(&buf[..n])?;
-        got += n as u64;
-        let done = offset + got;
-        if done - *last_report >= 64 << 20 {
-          *last_report = done;
-          if let Some(t) = *total { print!("\r[Download] {} / {} MiB          ", done >> 20, t >> 20); }
-          let _ = std::io::stdout().flush();
-        }
-      }
-      file.flush()?;
-      anyhow::ensure!(got == expected, "chunk ended early at {got}/{expected} bytes");
-      Ok(total.is_some_and(|t| offset + got == t))
-    };
-
-    match attempt(&mut total, &mut last_report) {
-      Ok(true) => break,
-      Ok(false) => failures = 0,
-      Err(e) if SHUTDOWN.load(Ordering::SeqCst) => return Err(e),
-      Err(e) => {
-        // 진행이 있었으면 연속 실패 횟수 초기화
-        if fs::metadata(&part).map_or(0, |m| m.len()) > offset { failures = 0; }
-        failures += 1;
-        if failures > MAX_FAILURES { return Err(e.context(format!("download failed {MAX_FAILURES} times in a row"))); }
-        let wait = Duration::from_secs(u64::from(5 * failures).min(60));
-        eprintln!("\n[Download] {e} — retry {failures}/{MAX_FAILURES} in {}s", wait.as_secs());
-        std::thread::sleep(wait);
-      }
-    }
-  }
-  fs::rename(&part, path)?;
-  println!("\n[Download] done: {}", path.display());
-  Ok(())
-}
-
 // 덤프 분석: 받아 둔 파일이 있으면 병렬(멀티스트림)·이어서 분석, 아니면 스트리밍 순차 분석.
 // wikipedia_limit > 0이면 앞쪽 N개만 순차로 (빠른 확인용)
 fn analyze_dump(result_path: &Path, config: &Config, corpus_path: &Path) -> anyhow::Result<CorpusStats> {
-  let url = &config.wikipedia_dump_url;
+  let urls = config.dump_urls();
   let sample = config.wikipedia_sample;
   let checkpoint = std::path::PathBuf::from(format!("{}.partial", corpus_path.display()));
   let (fast, counts) = if let Some(dump_path) = config.dump_path(result_path) {
     if !dump_path.exists() {
-      if url.is_empty() { anyhow::bail!("dump file {} not found and wikipedia_dump_url is empty", dump_path.display()); }
+      if urls.is_empty() { anyhow::bail!("dump file {} not found and wikipedia_dump_url is empty", dump_path.display()); }
       if let Some(dir) = dump_path.parent() { fs::create_dir_all(dir)?; }
-      println!("[Download] {url} -> {}", dump_path.display());
-      download_dump(url, &dump_path)?;
+      println!("[Download] -> {}", dump_path.display());
+      download::download_dump(&download::http_client()?, &urls, &dump_path, &download::DownloadOpts::default())?;
     }
     println!("[Wikipedia Dump] Reading {}", dump_path.display());
     if config.wikipedia_limit > 0 {
@@ -194,8 +74,14 @@ fn analyze_dump(result_path: &Path, config: &Config, corpus_path: &Path) -> anyh
       wiki::analyze_file_parallel(&dump_path, sample, &checkpoint)?
     }
   } else {
-    println!("[Wikipedia Dump] Connecting... (streaming: single thread, no resume; set wikipedia_download = true for both)");
-    let response = http_client()?.get(url).send()?.error_for_status()?;
+    println!("[Wikipedia Dump] streaming: single thread, no resume (set wikipedia_download = true for both)");
+    let client = download::http_client()?;
+    let url = if urls.len() > 1 {
+      let opts = download::DownloadOpts::default();
+      download::rank_mirrors(&client, &urls, opts.probe_bytes, opts.probe_timeout)?.remove(0).url
+    } else { urls[0].clone() };
+    println!("[Wikipedia Dump] Connecting to {url}");
+    let response = client.get(&url).send()?.error_for_status()?;
     wiki::analyze_sequential(response, sample, config.wikipedia_limit)?
   };
   println!("[Wikipedia Dump] used {} articles; skipped {} redirects, {} list/disambiguation pages, {} outside sample",

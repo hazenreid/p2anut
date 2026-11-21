@@ -42,8 +42,10 @@ fn open_source(cfg: &config::Config, result_path: Option<&str>) -> anyhow::Resul
     .timeout(None)
     .user_agent("KeyboardLayoutOptimizer/1.0 (corpus builder)")
     .build()?;
-  println!("Connecting to {}...", cfg.wikipedia_dump_url);
-  Ok(Box::new(client.get(&cfg.wikipedia_dump_url).send()?.error_for_status()?))
+  // 여러 주소면 첫 번째 (속도 측정은 분석기만 함)
+  let url = cfg.dump_urls().into_iter().next().ok_or_else(|| anyhow::anyhow!("wikipedia_dump_url is empty"))?;
+  println!("Connecting to {url}...");
+  Ok(Box::new(client.get(&url).send()?.error_for_status()?))
 }
 
 // 분석기(analyze_bytes)와 같은 경계: a-z 연속만 한 단어, 대문자는 소문자로

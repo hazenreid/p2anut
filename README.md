@@ -39,7 +39,7 @@ cargo run --release -- <result_path> results     # 저장된 결과 출력
 
 | 항목 | 설명 |
 |---|---|
-| `wikipedia_dump_url` | 덤프 주소입니다. 병렬 분석과 이어서 분석을 하려면 `*-pages-articles-multistream.xml.bz2`를 쓰세요. |
+| `wikipedia_dump_url` | 덤프 주소입니다. 문자열 하나나 목록(공식·미러)으로 적습니다. 목록이면 받기 전에 각 주소에서 앞부분 4MiB를 받아 속도를 재고 빠른 곳부터 씁니다. 응답이 없거나 파일 크기가 다른 주소는 빠지고, 받다가 계속 실패하면 다음 주소로 넘어가 이어받습니다. 모든 주소는 파일 이름이 같아야 합니다. 병렬 분석과 이어서 분석을 하려면 `*-pages-articles-multistream.xml.bz2`를 쓰세요. |
 | `wikipedia_download`, `wikipedia_dump_file` | `wikipedia_download = true`면 덤프를 `result_path` 아래에 먼저 받아 두고, 끊겨도 이어받습니다. 파일 이름은 URL의 마지막 부분입니다. 이름을 직접 정하려면 `wikipedia_dump_file`을 쓰세요. 둘 다 없으면 스트리밍으로 한 스레드에서 분석합니다. 전체 덤프는 약 26GB입니다. |
 | `wikipedia_sample` | 문서 표본 비율입니다(0 초과 1 이하). 제목 해시로 덤프 전체에서 고르게 뽑습니다. |
 | `wikipedia_limit` | 덤프 앞쪽 N개 문서만 분석합니다(0 = 전체). 오래된 문서 위주라 편향되므로 빠른 확인용입니다. |

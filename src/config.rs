@@ -85,7 +85,8 @@ pub struct Config {
   // 문서 표본 비율 (0 초과 1 이하). 제목 해시로 덤프 전체에서 고르게 뽑음. 1(기본) = 전부
   #[serde(default = "default_sample")]
   pub wikipedia_sample: f64,
-  pub wikipedia_dump_url: String,
+  // 덤프 주소. 문자열 하나 또는 목록(공식·미러). 목록이면 받기 전에 속도를 재서 빠른 곳부터 씀
+  pub wikipedia_dump_url: UrlList,
   // true면 덤프를 result_path 아래에 먼저 받아 두고 파일에서 분석. 파일 이름은 URL의 마지막 부분
   // (날짜판 URL을 바꾸면 파일 이름도 바뀌어서 예전 덤프를 새 것으로 착각하지 않음)
   #[serde(default)]
@@ -112,6 +113,13 @@ pub struct Config {
   pub ga: GaParams,
 }
 
+#[derive(Deserialize, Clone, Debug)]
+#[serde(untagged)]
+pub enum UrlList {
+  One(String),
+  Many(Vec<String>),
+}
+
 // URL의 마지막 경로 부분 (쿼리·조각 제외)
 fn url_file_name(url: &str) -> Option<&str> {
   let path = url.split(['?', '#']).next()?;
@@ -119,11 +127,20 @@ fn url_file_name(url: &str) -> Option<&str> {
 }
 
 impl Config {
+  // 비어 있지 않은 덤프 주소들 (적은 순서대로)
+  pub fn dump_urls(&self) -> Vec<String> {
+    let all = match &self.wikipedia_dump_url {
+      UrlList::One(u) => vec![u.clone()],
+      UrlList::Many(v) => v.clone(),
+    };
+    all.into_iter().map(|u| u.trim().to_string()).filter(|u| !u.is_empty()).collect()
+  }
+
   // 덤프를 받아 둘 로컬 경로. None이면 스트리밍
   pub fn dump_path(&self, result_path: &Path) -> Option<std::path::PathBuf> {
     match &self.wikipedia_dump_file {
       Some(file) => Some(result_path.join(file)),
-      None if self.wikipedia_download => url_file_name(&self.wikipedia_dump_url).map(|f| result_path.join(f)),
+      None if self.wikipedia_download => self.dump_urls().first().and_then(|u| url_file_name(u)).map(|f| result_path.join(f)),
       None => None,
     }
   }
@@ -131,11 +148,19 @@ impl Config {
   pub fn validate(&self) -> anyhow::Result<()> {
     if self.elites == 0 { anyhow::bail!("elites must be > 0"); }
     if !(1..=8).contains(&self.min_home_diff) { anyhow::bail!("min_home_diff must be in 1..=8"); }
-    if self.wikipedia_dump_url.is_empty() && self.wikipedia_dump_file.is_none() {
+    let urls = self.dump_urls();
+    if urls.is_empty() && self.wikipedia_dump_file.is_none() {
       anyhow::bail!("wikipedia_dump_url must not be empty (unless wikipedia_dump_file is set)");
     }
+    // 여러 주소는 같은 파일이어야 함 (중간에 주소를 바꿔 이어받으므로)
+    if let Some(first) = urls.first() {
+      let name = url_file_name(first);
+      if let Some(other) = urls.iter().find(|u| url_file_name(u) != name) {
+        anyhow::bail!("all wikipedia_dump_url entries must end with the same file name ({first} vs {other})");
+      }
+    }
     if self.wikipedia_dump_file.as_deref() == Some("") { anyhow::bail!("wikipedia_dump_file must not be empty"); }
-    if self.wikipedia_download && self.wikipedia_dump_file.is_none() && url_file_name(&self.wikipedia_dump_url).is_none() {
+    if self.wikipedia_download && self.wikipedia_dump_file.is_none() && urls.first().and_then(|u| url_file_name(u)).is_none() {
       anyhow::bail!("wikipedia_download needs a wikipedia_dump_url that ends with a file name");
     }
     if !(self.wikipedia_sample > 0.0 && self.wikipedia_sample <= 1.0) {
@@ -190,13 +215,11 @@ mod tests {
 
   fn config(extra: &str) -> Config {
     let base = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/config.toml")).unwrap();
-    // 기본 config.toml에서 덤프 관련 줄을 빼고 테스트할 값만 넣음
-    let base: String = base.lines()
-      .filter(|l| !["wikipedia_", "bigram_coverage", "trigram_coverage"].iter().any(|k| l.starts_with(k)))
-      .map(|l| format!("{l}\n"))
-      .collect();
-    let (top, rest) = base.split_once("[weights]").unwrap();
-    toml::from_str(&format!("{top}{extra}\n[weights]{rest}")).unwrap()
+    // 기본 config.toml에서 덤프·커버리지 항목을 빼고 테스트할 값만 넣음
+    let mut table: toml::Table = toml::from_str(&base).unwrap();
+    table.retain(|k, _| !k.starts_with("wikipedia_") && !k.ends_with("_coverage"));
+    table.extend(toml::from_str::<toml::Table>(extra).unwrap());
+    toml::Value::Table(table).try_into().unwrap()
   }
 
   #[test]
@@ -210,6 +233,18 @@ mod tests {
     let c = config("wikipedia_dump_url = \"https://m.org/a.xml.bz2\"");
     assert_eq!(c.dump_path(root), None);
     assert_eq!((c.wikipedia_limit, c.wikipedia_sample, c.bigram_coverage, c.trigram_coverage), (0, 1.0, 0.99, 0.90));
+  }
+
+  #[test]
+  fn dump_url_accepts_one_or_many() {
+    let c = config("wikipedia_dump_url = [\"https://a.org/d/x.xml.bz2\", \" \", \"https://b.org/mirror/d/x.xml.bz2\"]\nwikipedia_download = true");
+    assert_eq!(c.dump_urls(), vec!["https://a.org/d/x.xml.bz2", "https://b.org/mirror/d/x.xml.bz2"]);
+    assert_eq!(c.dump_path(Path::new("/r")), Some(Path::new("/r").join("x.xml.bz2")));
+    c.validate().unwrap();
+    // 파일 이름이 다른 주소가 섞이면 거부
+    let c = config("wikipedia_dump_url = [\"https://a.org/d/x.xml.bz2\", \"https://b.org/d/y.xml.bz2\"]");
+    assert!(c.validate().unwrap_err().to_string().contains("same file name"));
+    assert!(config("wikipedia_dump_url = []").validate().is_err());
   }
 
   #[test]
