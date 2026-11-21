@@ -62,10 +62,11 @@ skip_scissors = 0.5
 sfs = 0.5
 
 [rates]
-effort = 0.20
-sfb = 0.25
-rolling = 0.30
-scissors = 0.25
+# 롤링 우선, 시저스는 SFB보다 강하게 피함
+effort = 0.15
+sfb = 0.15
+rolling = 0.35
+scissors = 0.35
 
 [sa]
 max_no_improve = 1500

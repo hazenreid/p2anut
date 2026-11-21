@@ -101,7 +101,9 @@ impl<'a> Optimizer<'a> {
       excluded_homes.push(home_row_keys(&elite));
       all_elites.push(elite);
       sort_layouts(&mut all_elites);
-      save_results(&all_elites, result_file).ok();
+      // 이전 라운드 결과와 합쳐서 저장: 라운드 중간에 강제 종료돼도 이전 엘리트를 잃지 않도록
+      let merged = sort_unique_layouts(base_layouts.iter().chain(&all_elites).copied().collect(), elites_len, &[], self.min_home_diff);
+      save_results(&merged, result_file).ok();
       println!("\n[Elite {}/{}] total={}", i + 1, elites_len, fmt_num(elite.total));
       elite.print();
       elite.print_goodness(self.norm);
