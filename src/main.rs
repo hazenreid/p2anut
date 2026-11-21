@@ -5,17 +5,15 @@ mod layout;
 mod optimizer;
 mod precomp;
 mod score;
+mod wiki;
 #[cfg(test)]
 mod test_util;
 
 use std::path::Path;
-use std::io::{BufReader, Write};
+use std::io::Write;
 use reqwest::blocking::Client;
 use std::time::Duration;
 use std::fs;
-use bzip2::read::MultiBzDecoder;
-use quick_xml::events::Event;
-use quick_xml::reader::Reader;
 use anyhow::Context;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -176,90 +174,58 @@ fn download_dump(url: &str, path: &Path) -> anyhow::Result<()> {
   Ok(())
 }
 
-// 원본(bz2 덤프)이 HTTP 스트림이든 로컬 파일이든 동일하게 분석
-// 중단·오류 시에는 부분 통계를 버리고 에러로 끝냄 (부분 코퍼스가 완성본처럼 쓰이지 않도록)
-fn analyze_wikipedia_dump(source: impl std::io::Read, limit: usize) -> anyhow::Result<CorpusStats> {
-  let decoder = MultiBzDecoder::new(BufReader::with_capacity(1024 * 1024, source));
-  let mut reader = Reader::from_reader(BufReader::with_capacity(1024 * 1024, decoder));
-
-  let mut stats = corpus::FastCorpus::new();
-  let mut cleaner = dump::ArticleCleaner::new();
-  let mut buf = Vec::new();
-  let mut in_text = false;
-  let mut in_ns = false;
-  let mut is_main_ns = false;
-  let mut article_count = 0usize;
-
-  loop {
-    if SHUTDOWN.load(Ordering::SeqCst) {
-      anyhow::bail!("corpus analysis interrupted after {article_count} articles");
+// 덤프 분석: 받아 둔 파일이 있으면 병렬(멀티스트림)·이어서 분석, 아니면 스트리밍 순차 분석.
+// wikipedia_limit > 0이면 앞쪽 N개만 순차로 (빠른 확인용)
+fn analyze_dump(result_path: &Path, config: &Config, corpus_path: &Path) -> anyhow::Result<CorpusStats> {
+  let url = &config.wikipedia_dump_url;
+  let sample = config.wikipedia_sample;
+  let checkpoint = std::path::PathBuf::from(format!("{}.partial", corpus_path.display()));
+  let (fast, counts) = if let Some(dump_path) = config.dump_path(result_path) {
+    if !dump_path.exists() {
+      if url.is_empty() { anyhow::bail!("dump file {} not found and wikipedia_dump_url is empty", dump_path.display()); }
+      if let Some(dir) = dump_path.parent() { fs::create_dir_all(dir)?; }
+      println!("[Download] {url} -> {}", dump_path.display());
+      download_dump(url, &dump_path)?;
     }
-    match reader.read_event_into(&mut buf) {
-      Ok(Event::Start(e)) => match e.name().as_ref() {
-        b"page"  => { is_main_ns = false; }
-        b"ns"    => { in_ns = true; }
-        b"text" if is_main_ns => { in_text = true; }
-        _ => {}
-      },
-      Ok(Event::Text(e)) => {
-        if in_ns {
-          is_main_ns = e.as_ref() as &[u8] == b"0";
-          in_ns = false;
-        } else if in_text {
-          let raw = e.into_inner();
-          if !dump::is_redirect(&raw) {
-            analyze_bytes(cleaner.clean(&raw), &mut stats);
-            article_count += 1;
-            if article_count.is_multiple_of(10_000) {
-              print!("\r[Wikipedia Dump] {article_count} articles          ");
-              let _ = std::io::stdout().flush();
-            }
-            if limit > 0 && article_count >= limit { break; }
-          }
-          in_text = false;
-        }
-      },
-      Ok(Event::End(e)) if e.name().as_ref() == b"text" => { in_text = false; }
-      Ok(Event::Eof) => break,
-      Err(e) => {
-        anyhow::bail!("XML/stream error at {} after {article_count} articles: {e}", reader.buffer_position());
-      }
-      _ => {}
+    println!("[Wikipedia Dump] Reading {}", dump_path.display());
+    if config.wikipedia_limit > 0 {
+      wiki::analyze_sequential(fs::File::open(&dump_path)?, sample, config.wikipedia_limit)?
+    } else {
+      wiki::analyze_file_parallel(&dump_path, sample, &checkpoint)?
     }
-    buf.clear();
-  }
-
-  println!("\r[Wikipedia Dump] done: {article_count} articles          ");
-  Ok(stats.into_stats())
+  } else {
+    println!("[Wikipedia Dump] Connecting... (streaming: single thread, no resume; set wikipedia_download = true for both)");
+    let response = http_client()?.get(url).send()?.error_for_status()?;
+    wiki::analyze_sequential(response, sample, config.wikipedia_limit)?
+  };
+  println!("[Wikipedia Dump] used {} articles; skipped {} redirects, {} list/disambiguation pages, {} outside sample",
+    counts.articles, counts.redirects, counts.lists, counts.sampled_out);
+  let stats = fast.into_stats();
+  stats.save(corpus_path.to_str().context("Invalid corpus path")?, dump::PARSER_VERSION)?;
+  if checkpoint.exists() { fs::remove_file(&checkpoint)?; }
+  Ok(stats)
 }
 
+// 저장된 코퍼스 불러오기 (전체 통계). 예전 파서로 만든 것이면 경고
+fn load_corpus(corpus_path: &Path) -> anyhow::Result<CorpusStats> {
+  println!("[Load Corpus] {}", corpus_path.display());
+  let (stats, parser_version) = CorpusStats::load(corpus_path.to_str().context("Invalid corpus path")?)?;
+  if parser_version != dump::PARSER_VERSION {
+    println!("[Load Corpus] warning: built with parser v{parser_version}, current is v{}; rebuild with `analyze --reset` for the current rules", dump::PARSER_VERSION);
+  }
+  Ok(stats)
+}
+
+// 전체 통계. 코퍼스 파일이 없거나 --reset이면 덤프를 분석해서 저장
 fn load_or_analyze(result_path: &Path, config: &Config, reset: bool) -> anyhow::Result<CorpusStats> {
   let corpus_path = result_path.join(&config.corpus_file);
-  let corpus_path_str = corpus_path.to_str().context("Invalid corpus path")?;
-  if !reset && corpus_path.exists() {
-    println!("[Load Corpus] {}", corpus_path.display());
-    Ok(CorpusStats::load(corpus_path_str)?)
-  } else {
-    let url = &config.wikipedia_dump_url;
-    let mut stats = if let Some(file) = &config.wikipedia_dump_file {
-      let dump_path = result_path.join(file);
-      if !dump_path.exists() {
-        if url.is_empty() { anyhow::bail!("dump file {} not found and wikipedia_dump_url is empty", dump_path.display()); }
-        if let Some(dir) = dump_path.parent() { fs::create_dir_all(dir)?; }
-        println!("[Download] {url} -> {}", dump_path.display());
-        download_dump(url, &dump_path)?;
-      }
-      println!("[Wikipedia Dump] Reading {}", dump_path.display());
-      analyze_wikipedia_dump(fs::File::open(&dump_path)?, config.wikipedia_limit)?
-    } else {
-      println!("[Wikipedia Dump] Connecting...");
-      let response = http_client()?.get(url).send()?.error_for_status()?;
-      analyze_wikipedia_dump(response, config.wikipedia_limit)?
-    };
-    stats.trim_by_coverage();
-    stats.save(corpus_path_str)?;
-    Ok(stats)
-  }
+  if !reset && corpus_path.exists() { load_corpus(&corpus_path) } else { analyze_dump(result_path, config, &corpus_path) }
+}
+
+// 최적화·채점용: 빈도가 낮은 빅/트라이그램을 config 기준으로 잘라 냄
+fn for_scoring(mut stats: CorpusStats, config: &Config) -> CorpusStats {
+  stats.trim_by_coverage(config.bigram_coverage, config.trigram_coverage);
+  stats
 }
 
 fn print_results(results: &[layout::Layout]) {
@@ -272,8 +238,10 @@ fn print_results(results: &[layout::Layout]) {
 
 fn cmd_analyze(result_path: &Path, config: &Config, reset: bool) -> anyhow::Result<()> {
   let stats = load_or_analyze(result_path, config, reset)?;
-  println!("letters: {}, bigrams: {}, trigrams: {}",
-    stats.letters.len(), stats.bigrams.len(), stats.trigrams.len());
+  let used = for_scoring(stats.clone(), config);
+  println!("letters: {}, bigrams: {} (scoring uses {} at {}% coverage), trigrams: {} (scoring uses {} at {}% coverage)",
+    stats.letters.len(), stats.bigrams.len(), used.bigrams.len(), config.bigram_coverage * 100.0,
+    stats.trigrams.len(), used.trigrams.len(), config.trigram_coverage * 100.0);
   stats.print();
   Ok(())
 }
@@ -288,7 +256,7 @@ fn cmd_results(result_path: &Path, config: &Config) -> anyhow::Result<()> {
   let mut results = load_results(result_file_str)?;
   let corpus_path = result_path.join(&config.corpus_file);
   if corpus_path.exists() {
-    let stats = CorpusStats::load(corpus_path.to_str().context("Invalid corpus path")?)?;
+    let stats = for_scoring(load_corpus(&corpus_path)?, config);
     let arrays = stats.to_arrays(false);
     results.retain(|l| l.key_count() == arrays.keys.len());
     let precomp = Precomp::new(&arrays.freq, &config.weights, config.min_hand_usage);
@@ -355,7 +323,7 @@ fn run_optimize(result_path: &Path, config: &Config, stats: &corpus::CorpusStats
 }
 
 fn cmd_run(result_path: &Path, config: &Config, reset: bool) -> anyhow::Result<()> {
-  let stats = load_or_analyze(result_path, config, reset)?;
+  let stats = for_scoring(load_or_analyze(result_path, config, reset)?, config);
   run_optimize(result_path, config, &stats, reset)
 }
 
@@ -386,9 +354,8 @@ fn main() -> anyhow::Result<()> {
   match cmd {
     Some("analyze")  => cmd_analyze(result_path, &config, reset),
     Some("optimize") => {
-      let corpus_path = result_path.join(&config.corpus_file);
-      let corpus_path_str = corpus_path.to_str().context("Invalid corpus path")?;
-      run_optimize(result_path, &config, &CorpusStats::load(corpus_path_str)?, reset)
+      let stats = for_scoring(load_corpus(&result_path.join(&config.corpus_file))?, &config);
+      run_optimize(result_path, &config, &stats, reset)
     },
     Some("run")      => cmd_run(result_path, &config, reset),
     Some("results")  => cmd_results(result_path, &config),

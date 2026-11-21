@@ -288,6 +288,125 @@ pub fn strip_wiki_markup_into(input: &[u8], out: &mut Vec<u8>) {
   }
 }
 
+// 본문 정리·문서 선별 규칙의 버전. 규칙을 바꾸면 올려서, 예전 규칙으로 만든 코퍼스·중간 저장을 알아챌 수 있게 함
+pub const PARSER_VERSION: u32 = 3;
+
+// 문장이 아니라 이름·링크 나열이 대부분인 문서: 목록 문서, 동음이의 문서, 집합 색인 문서
+// title, raw는 덤프 XML 그대로(이스케이프된 상태). 틀 이름 앞뒤 공백·대소문자는 무시
+pub fn is_list_or_disambiguation(title: &[u8], raw: &[u8]) -> bool {
+  let starts_ci = |s: &[u8], p: &[u8]| s.len() >= p.len() && s[..p.len()].eq_ignore_ascii_case(p);
+  if starts_ci(title, b"List of ") || starts_ci(title, b"Lists of ") { return true; }
+  let t = title.trim_ascii_end();
+  if t.len() >= 16 && t[t.len() - 16..].eq_ignore_ascii_case(b"(disambiguation)") { return true; }
+
+  const TEMPLATES: [&[u8]; 16] = [
+    b"disambiguation", b"disambig", b"disamb", b"dab", b"dmbox", b"hndis", b"geodis", b"numberdis",
+    b"set index article", b"sia", b"surname", b"given name", b"ship index", b"shipindex",
+    b"mountainindex", b"roadindex",
+  ];
+  let mut j = 0;
+  while let Some(p) = raw[j..].windows(2).position(|w| w == b"{{") {
+    let start = j + p + 2;
+    let name_end = raw[start..].iter().position(|&b| matches!(b, b'|' | b'}' | b'\n')).map_or(raw.len(), |q| start + q);
+    let name = raw[start..name_end].trim_ascii();
+    if TEMPLATES.iter().any(|t| t.eq_ignore_ascii_case(name)) { return true; }
+    j = start;
+  }
+  false
+}
+
+// 제목 해시로 고르는 결정적 표본. sample = 1이면 전부, 0.1이면 문서의 약 10% (덤프 전체에 고르게)
+pub fn in_sample(title: &[u8], sample: f64) -> bool {
+  if sample >= 1.0 { return true; }
+  // FNV-1a 64비트 후 섞기 (제목이 비슷해도 고르게 퍼지도록)
+  let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+  for &b in title { h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3); }
+  h ^= h >> 33; h = h.wrapping_mul(0xff51_afd7_ed55_8ccd); h ^= h >> 33;
+  #[allow(clippy::cast_precision_loss)]
+  let x = (h >> 11) as f64 / (1u64 << 53) as f64;
+  x < sample
+}
+
+// 문서를 고르는 과정에서 센 수
+#[derive(Default, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct ScanCounts {
+  pub articles: u64,      // 분석에 쓴 본문 문서
+  pub redirects: u64,     // 넘겨주기
+  pub lists: u64,         // 목록·동음이의·집합 색인
+  pub sampled_out: u64,   // 표본에서 빠짐
+}
+
+impl ScanCounts {
+  pub fn add(&mut self, o: &ScanCounts) {
+    self.articles += o.articles;
+    self.redirects += o.redirects;
+    self.lists += o.lists;
+    self.sampled_out += o.sampled_out;
+  }
+}
+
+// 덤프 XML(압축 해제된 것)에서 분석할 본문 문서를 골라 f(title, raw)를 부름. f가 Ok(false)를 돌려주면 멈춤.
+// 본문 이름공간(ns=0)만, 넘겨주기·목록·동음이의 문서와 표본 밖 문서는 건너뜀.
+// 루트 요소 없이 <page>부터 시작하는 조각(멀티스트림 덤프의 일부)도 읽을 수 있음
+pub fn scan_articles<R: std::io::BufRead>(
+  source: R,
+  sample: f64,
+  mut f: impl FnMut(&[u8], &[u8]) -> anyhow::Result<bool>,
+) -> anyhow::Result<ScanCounts> {
+  use quick_xml::events::Event;
+  let mut reader = quick_xml::reader::Reader::from_reader(source);
+  // 조각에는 여는 태그 없는 </mediawiki>가 있을 수 있음 (짝이 맞는 태그끼리의 이름 검사는 그대로 둠)
+  reader.config_mut().allow_unmatched_ends = true;
+
+  let mut counts = ScanCounts::default();
+  let mut buf = Vec::new();
+  let mut title: Vec<u8> = Vec::new();
+  let (mut in_title, mut in_ns, mut in_text, mut is_main_ns) = (false, false, false, false);
+
+  loop {
+    match reader.read_event_into(&mut buf) {
+      Ok(Event::Start(e)) => match e.name().as_ref() {
+        b"page"  => { is_main_ns = false; title.clear(); }
+        b"title" => { in_title = true; }
+        b"ns"    => { in_ns = true; }
+        b"text" if is_main_ns => { in_text = true; }
+        _ => {}
+      },
+      Ok(Event::Text(e)) => {
+        if in_title {
+          title.clear();
+          title.extend_from_slice(&e);
+          in_title = false;
+        } else if in_ns {
+          is_main_ns = &*e == b"0";
+          in_ns = false;
+        } else if in_text {
+          in_text = false;
+          let raw: &[u8] = &e;
+          if is_redirect(raw) { counts.redirects += 1; }
+          else if is_list_or_disambiguation(&title, raw) { counts.lists += 1; }
+          else if !in_sample(&title, sample) { counts.sampled_out += 1; }
+          else {
+            counts.articles += 1;
+            if !f(&title, raw)? { break; }
+          }
+        }
+      },
+      Ok(Event::End(e)) => match e.name().as_ref() {
+        b"title" => { in_title = false; }
+        b"ns"    => { in_ns = false; }
+        b"text"  => { in_text = false; }
+        _ => {}
+      },
+      Ok(Event::Eof) => break,
+      Err(e) => anyhow::bail!("XML error at {} after {} articles: {e}", reader.buffer_position(), counts.articles),
+      _ => {}
+    }
+    buf.clear();
+  }
+  Ok(counts)
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -413,5 +532,63 @@ mod tests {
     assert!(is_redirect(b"  #redirect[[Foo]]"));
     assert!(!is_redirect(b"#Redir"));
     assert!(!is_redirect(b"Normal text"));
+  }
+
+  #[test]
+  fn list_and_disambiguation_pages() {
+    let yes = |t: &str, r: &str| is_list_or_disambiguation(t.as_bytes(), r.as_bytes());
+    assert!(yes("List of rivers of France", "text"));
+    assert!(yes("Lists of cities", "text"));
+    assert!(yes("Mercury (disambiguation)", "text"));
+    assert!(yes("Mercury", "'''Mercury''' may refer to:\n{{Disambiguation|geo}}"));
+    assert!(yes("Smith", "{{ surname }}"));
+    assert!(yes("HMS Hood", "{{shipindex}}"));
+    assert!(yes("X", "{{dab}}"));
+    // 틀 이름이 정확히 같을 때만 (비슷한 이름, 본문 속 단어는 아님)
+    assert!(!yes("Listing", "{{Dabbing technique}} {{Infobox}} a list of things"));
+    assert!(!yes("Paris", "Paris may refer to the city. {{cite web|title=disambiguation}}"));
+    assert!(!yes("Listeria", "text"));
+  }
+
+  #[test]
+  fn sample_is_deterministic_and_roughly_uniform() {
+    let titles: Vec<String> = (0..20_000).map(|i| format!("Article {i}")).collect();
+    let kept = titles.iter().filter(|t| in_sample(t.as_bytes(), 0.1)).count();
+    assert!((1700..2300).contains(&kept), "{kept}");
+    assert!(titles.iter().all(|t| in_sample(t.as_bytes(), 1.0)));
+    let a: Vec<bool> = titles.iter().map(|t| in_sample(t.as_bytes(), 0.3)).collect();
+    let b: Vec<bool> = titles.iter().map(|t| in_sample(t.as_bytes(), 0.3)).collect();
+    assert_eq!(a, b);
+    // 비율을 키우면 기존 표본을 포함 (0.1 표본 ⊂ 0.3 표본)
+    assert!(titles.iter().all(|t| !in_sample(t.as_bytes(), 0.1) || in_sample(t.as_bytes(), 0.3)));
+  }
+
+  #[test]
+  fn scan_articles_selects_main_namespace_prose() {
+    let xml = "<mediawiki><siteinfo><sitename>W</sitename></siteinfo>\n\
+      <page><title>Paris</title><ns>0</ns><revision><text>Paris is a city.</text></revision></page>\n\
+      <page><title>Talk:Paris</title><ns>1</ns><revision><text>talk</text></revision></page>\n\
+      <page><title>Lutetia</title><ns>0</ns><revision><text>#REDIRECT [[Paris]]</text></revision></page>\n\
+      <page><title>List of cities</title><ns>0</ns><revision><text>* [[Paris]]</text></revision></page>\n\
+      <page><title>Empty</title><ns>0</ns><revision><text /></revision></page>\n\
+      <page><title>AT&amp;T</title><ns>0</ns><revision><text>AT&amp;amp;T is a company.</text></revision></page>\n\
+      </mediawiki>";
+    let mut seen = Vec::new();
+    let c = scan_articles(xml.as_bytes(), 1.0, |t, r| {
+      seen.push((String::from_utf8_lossy(t).into_owned(), String::from_utf8_lossy(r).into_owned()));
+      Ok(true)
+    }).unwrap();
+    assert_eq!(seen, vec![("Paris".into(), "Paris is a city.".into()), ("AT&amp;T".into(), "AT&amp;amp;T is a company.".into())]);
+    assert_eq!((c.articles, c.redirects, c.lists, c.sampled_out), (2, 1, 1, 0));
+
+    // 멀티스트림 덤프의 중간·끝 조각: 루트 없이 <page>로 시작하고, 여는 태그 없는 </mediawiki>로 끝남
+    let tail = "  <page><title>A</title><ns>0</ns><revision><text>alpha</text></revision></page>\n</mediawiki>\n";
+    let c = scan_articles(tail.as_bytes(), 1.0, |_, _| Ok(true)).unwrap();
+    assert_eq!(c.articles, 1);
+
+    // 콜백이 false를 돌려주면 멈춤
+    let mut n = 0;
+    scan_articles(xml.as_bytes(), 1.0, |_, _| { n += 1; Ok(false) }).unwrap();
+    assert_eq!(n, 1);
   }
 }

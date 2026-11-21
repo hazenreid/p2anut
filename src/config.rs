@@ -50,6 +50,9 @@ pub struct SaParams {
 }
 
 fn default_cooling() -> f64 { 0.998 }
+fn default_bigram_coverage() -> f64 { 0.99 }
+fn default_trigram_coverage() -> f64 { 0.90 }
+fn default_sample() -> f64 { 1.0 }
 fn default_min_home_diff() -> u32 { 1 }
 
 #[derive(Deserialize, Clone)]
@@ -76,15 +79,29 @@ pub struct Config {
   // 엘리트끼리 홈행(양손 비중심 8칸) 글자가 최소 몇 개 달라야 하는지 (1 = 조합만 다르면 됨)
   #[serde(default = "default_min_home_diff")]
   pub min_home_diff: u32,
-  pub wikipedia_limit: usize,  // 0 = 전체 덤프
+  // 덤프 앞쪽 N개 문서만 분석 (0 = 전체). 앞쪽은 오래된 문서라 편향되므로 빠른 확인용. 고른 표본은 wikipedia_sample
+  #[serde(default)]
+  pub wikipedia_limit: usize,
+  // 문서 표본 비율 (0 초과 1 이하). 제목 해시로 덤프 전체에서 고르게 뽑음. 1(기본) = 전부
+  #[serde(default = "default_sample")]
+  pub wikipedia_sample: f64,
   pub wikipedia_dump_url: String,
+  // true면 덤프를 result_path 아래에 먼저 받아 두고 파일에서 분석. 파일 이름은 URL의 마지막 부분
+  // (날짜판 URL을 바꾸면 파일 이름도 바뀌어서 예전 덤프를 새 것으로 착각하지 않음)
+  #[serde(default)]
+  pub wikipedia_download: bool,
   // 난수 시드. 없으면 실행마다 새로 뽑아 출력하므로, 그 값을 넣으면 같은 실행을 재현할 수 있음
   #[serde(default)]
   pub seed: Option<u64>,
-  // 설정 시 덤프를 이 파일(result_path 기준)로 먼저 받아 두고 파일에서 분석. 끊기면 이어받기.
-  // 이미 있으면 다운로드 없이 바로 사용. 없으면(기본) 예전처럼 스트리밍
+  // 받아 둘 덤프 파일 이름(result_path 기준)을 직접 정할 때만. 설정하면 wikipedia_download와 상관없이 파일로 받음.
+  // 끊기면 이어받기, 이미 있으면 다운로드 없이 사용. 둘 다 없으면 스트리밍(병렬·이어서 분석 불가)
   #[serde(default)]
   pub wikipedia_dump_file: Option<String>,
+  // 최적화에 쓸 빅그램·트라이그램의 누적 빈도 비율 (1.0 = 전부). 코퍼스 파일에는 전체를 저장하고 불러올 때 적용
+  #[serde(default = "default_bigram_coverage")]
+  pub bigram_coverage: f64,
+  #[serde(default = "default_trigram_coverage")]
+  pub trigram_coverage: f64,
   // 코퍼스 빈도 최하위 n글자를 가운데 두 열(검지 안쪽)에 강제 배치. 다른 글자는 절대 센터에 안 옴.
   // 0(기본) = 제약 없음. 2~6 (센터는 6칸, 나머지 24칸에 26-n글자가 들어가야 하므로 2 이상)
   #[serde(default)]
@@ -95,7 +112,22 @@ pub struct Config {
   pub ga: GaParams,
 }
 
+// URL의 마지막 경로 부분 (쿼리·조각 제외)
+fn url_file_name(url: &str) -> Option<&str> {
+  let path = url.split(['?', '#']).next()?;
+  path.rsplit('/').next().filter(|s| !s.is_empty())
+}
+
 impl Config {
+  // 덤프를 받아 둘 로컬 경로. None이면 스트리밍
+  pub fn dump_path(&self, result_path: &Path) -> Option<std::path::PathBuf> {
+    match &self.wikipedia_dump_file {
+      Some(file) => Some(result_path.join(file)),
+      None if self.wikipedia_download => url_file_name(&self.wikipedia_dump_url).map(|f| result_path.join(f)),
+      None => None,
+    }
+  }
+
   pub fn validate(&self) -> anyhow::Result<()> {
     if self.elites == 0 { anyhow::bail!("elites must be > 0"); }
     if !(1..=8).contains(&self.min_home_diff) { anyhow::bail!("min_home_diff must be in 1..=8"); }
@@ -103,6 +135,15 @@ impl Config {
       anyhow::bail!("wikipedia_dump_url must not be empty (unless wikipedia_dump_file is set)");
     }
     if self.wikipedia_dump_file.as_deref() == Some("") { anyhow::bail!("wikipedia_dump_file must not be empty"); }
+    if self.wikipedia_download && self.wikipedia_dump_file.is_none() && url_file_name(&self.wikipedia_dump_url).is_none() {
+      anyhow::bail!("wikipedia_download needs a wikipedia_dump_url that ends with a file name");
+    }
+    if !(self.wikipedia_sample > 0.0 && self.wikipedia_sample <= 1.0) {
+      anyhow::bail!("wikipedia_sample must be in (0.0, 1.0]");
+    }
+    for (name, v) in [("bigram_coverage", self.bigram_coverage), ("trigram_coverage", self.trigram_coverage)] {
+      if !(v > 0.0 && v <= 1.0) { anyhow::bail!("{name} must be in (0.0, 1.0]"); }
+    }
     if self.center_rare != 0 && !(2..=6).contains(&self.center_rare) {
       anyhow::bail!("center_rare must be 0 (off) or 2..=6");
     }
@@ -141,4 +182,44 @@ pub fn load_config(path: &Path) -> anyhow::Result<Config> {
   let config: Config = toml::from_str(&content)?;
   config.validate()?;
   Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn config(extra: &str) -> Config {
+    let base = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/config.toml")).unwrap();
+    // 기본 config.toml에서 덤프 관련 줄을 빼고 테스트할 값만 넣음
+    let base: String = base.lines()
+      .filter(|l| !["wikipedia_", "bigram_coverage", "trigram_coverage"].iter().any(|k| l.starts_with(k)))
+      .map(|l| format!("{l}\n"))
+      .collect();
+    let (top, rest) = base.split_once("[weights]").unwrap();
+    toml::from_str(&format!("{top}{extra}\n[weights]{rest}")).unwrap()
+  }
+
+  #[test]
+  fn dump_path_comes_from_url_or_explicit_file() {
+    let root = Path::new("/r");
+    let c = config("wikipedia_dump_url = \"https://m.org/enwiki/20261001/enwiki-20261001-pages-articles-multistream.xml.bz2?x=1\"\nwikipedia_download = true");
+    assert_eq!(c.dump_path(root), Some(root.join("enwiki-20261001-pages-articles-multistream.xml.bz2")));
+    c.validate().unwrap();
+    let c = config("wikipedia_dump_url = \"https://m.org/a.xml.bz2\"\nwikipedia_dump_file = \"mine.bz2\"");
+    assert_eq!(c.dump_path(root), Some(root.join("mine.bz2")));
+    let c = config("wikipedia_dump_url = \"https://m.org/a.xml.bz2\"");
+    assert_eq!(c.dump_path(root), None);
+    assert_eq!((c.wikipedia_limit, c.wikipedia_sample, c.bigram_coverage, c.trigram_coverage), (0, 1.0, 0.99, 0.90));
+  }
+
+  #[test]
+  fn validate_rejects_bad_sample_and_coverage() {
+    let url = "wikipedia_dump_url = \"https://m.org/a.xml.bz2\"\n";
+    assert!(config(&format!("{url}wikipedia_sample = 0.0")).validate().is_err());
+    assert!(config(&format!("{url}wikipedia_sample = 1.5")).validate().is_err());
+    assert!(config(&format!("{url}wikipedia_sample = 0.1")).validate().is_ok());
+    assert!(config(&format!("{url}trigram_coverage = 0.0")).validate().is_err());
+    assert!(config(&format!("{url}bigram_coverage = 1.0")).validate().is_ok());
+    assert!(config("wikipedia_dump_url = \"https://m.org/\"\nwikipedia_download = true").validate().is_err());
+  }
 }

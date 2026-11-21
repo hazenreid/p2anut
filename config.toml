@@ -4,11 +4,20 @@ elites = 5
 # 각 손(왼손·오른손)이 최소 이 비율 이상 입력을 맡아야 함 (0.5 이하, 0.45 = 45~55%)
 min_hand_usage = 0.45
 min_home_diff = 2
+# 멀티스트림 덤프: 여러 스레드로 나눠 분석하고, 중단해도 이어서 분석 (일반 *-pages-articles.xml.bz2는 한 스레드, 이어서 분석 불가)
+wikipedia_dump_url = "https://mirror.accum.se/mirror/wikimedia.org/dumps/enwiki/20261001/enwiki-20261001-pages-articles-multistream.xml.bz2"
+# 공식(느림, 연결당 제한): https://dumps.wikimedia.org/enwiki/latest/enwiki-latest-pages-articles-multistream.xml.bz2
+# 덤프를 result_path 아래에 먼저 받아 두기 (약 26GB, 끊기면 이어받기). 파일 이름은 URL의 마지막 부분
+wikipedia_download = true
+# 파일 이름을 직접 정하려면 (예: 이미 받아 둔 덤프)
+# wikipedia_dump_file = "enwiki-latest-pages-articles.xml.bz2"
+# 문서 표본 비율 (0 초과 1 이하, 제목 해시로 덤프 전체에서 고르게). 1 = 전부
+wikipedia_sample = 1.0
+# 덤프 앞쪽 N개 문서만 분석 (0 = 전체). 오래된 문서 위주라 편향되므로 빠른 확인용
 wikipedia_limit = 0
-wikipedia_dump_url = "https://mirror.accum.se/mirror/wikimedia.org/dumps/enwiki/20261001/enwiki-20261001-pages-articles.xml.bz2"
-# 공식(느림, 연결당 제한): https://dumps.wikimedia.org/enwiki/latest/enwiki-latest-pages-articles.xml.bz2
-# 덤프를 result_path 아래 파일로 먼저 받아 두기 (약 26GB, 끊기면 이어받기, 이후 재분석 시 재다운로드 없음)
-wikipedia_dump_file = "enwiki-latest-pages-articles.xml.bz2"
+# 최적화에 쓸 빅그램·트라이그램의 누적 빈도 비율 (1.0 = 전부, 낮출수록 빠름). 코퍼스 파일에는 전체를 저장하므로 바꿔도 재분석 불필요
+bigram_coverage = 0.99
+trigram_coverage = 0.90
 # 코퍼스 빈도 최하위 n글자를 가운데 두 열(검지 안쪽)에 강제 배치, 나머지 글자는 센터 금지 (0 = 끔, 2~6)
 center_rare = 4
 # 난수 시드 (없으면 실행 시 출력되는 값을 넣어 재현)

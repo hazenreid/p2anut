@@ -23,14 +23,17 @@ impl CorpusArrays {
   }
 }
 
-#[derive(Serialize, Deserialize)]
+const CORPUS_MAGIC: &[u8] = b"P2ANUT-CORPUS\0";
+const CORPUS_FORMAT: u32 = 1;
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct CorpusStats {
   pub letters: HashMap<char, u64>,
   pub bigrams: HashMap<(char, char), u64>,
   pub trigrams: HashMap<(char, char, char), u64>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct FastCorpus {
   pub letters: Box<[u64; CHARS]>,
   pub bigrams: Box<[u64; CHARS * CHARS]>,
@@ -59,6 +62,28 @@ impl FastCorpus {
   #[inline]
   pub fn add_trigram(&mut self, pp: u8, p: u8, c: u8) {
     self.trigrams[(pp as usize * CHARS + p as usize) * CHARS + c as usize] += 1;
+  }
+
+  // 병렬 분석에서 덩어리별 결과 합치기
+  pub fn merge(&mut self, other: &FastCorpus) {
+    for (a, b) in self.letters.iter_mut().zip(other.letters.iter()) { *a += b; }
+    for (a, b) in self.bigrams.iter_mut().zip(other.bigrams.iter()) { *a += b; }
+    for (a, b) in self.trigrams.iter_mut().zip(other.trigrams.iter()) { *a += b; }
+  }
+
+  // 중간 저장용 (고정 길이 배열은 serde가 직접 못 다뤄서 Vec으로)
+  pub fn to_vecs(&self) -> (Vec<u64>, Vec<u64>, Vec<u64>) {
+    (self.letters.to_vec(), self.bigrams.to_vec(), self.trigrams.to_vec())
+  }
+
+  pub fn from_vecs(letters: &[u64], bigrams: &[u64], trigrams: &[u64]) -> anyhow::Result<Self> {
+    anyhow::ensure!(letters.len() == CHARS && bigrams.len() == CHARS * CHARS && trigrams.len() == CHARS * CHARS * CHARS,
+      "corpus array sizes do not match");
+    let mut f = Self::new();
+    f.letters.copy_from_slice(letters);
+    f.bigrams.copy_from_slice(bigrams);
+    f.trigrams.copy_from_slice(trigrams);
+    Ok(f)
   }
 
   pub fn into_stats(self) -> CorpusStats {
@@ -155,10 +180,11 @@ impl CorpusStats {
     CorpusArrays { keys, freq, nz_bigrams, nz_trigrams, bigram_flat, bigram_offsets, trigram_flat, trigram_offsets }
   }
 
-  // 빅그램은 누적 99%, 트라이그램은 누적 90% 커버리지까지만 보존
-  pub fn trim_by_coverage(&mut self) {
+  // 빈도 상위부터 누적 비율이 bigram/trigram 기준에 닿을 때까지만 보존 (1.0 = 전부)
+  // 최적화 속도를 위해 불러올 때 적용. 파일에는 전체 통계를 저장해서 기준을 바꿔도 재분석이 필요 없음
+  pub fn trim_by_coverage(&mut self, bigram: f64, trigram: f64) {
     fn trim<K: Eq + std::hash::Hash + Clone + Ord>(map: &mut HashMap<K, u64>, threshold: f64) {
-      if map.is_empty() { return; }
+      if map.is_empty() || threshold >= 1.0 { return; }
       let total: u64 = map.values().sum();
       let limit = (total as f64 * threshold) as u64;
       let mut items: Vec<(K, u64)> = map.iter().map(|(k, &v)| (k.clone(), v)).collect();
@@ -175,19 +201,35 @@ impl CorpusStats {
       items.truncate(keep_count);
       *map = items.into_iter().collect();
     }
-    trim(&mut self.bigrams,  0.99);
-    trim(&mut self.trigrams, 0.90);
+    trim(&mut self.bigrams,  bigram);
+    trim(&mut self.trigrams, trigram);
   }
 
-  pub fn save(&self, path: &str) -> anyhow::Result<()> {
-    let bytes = bincode::serialize(self)?;
-    std::fs::write(path, bytes)?;
+  // 파일 형식: CORPUS_MAGIC + 파일 형식 버전(u32) + 파서 버전(u32) + bincode(CorpusStats)
+  pub fn save(&self, path: &str, parser_version: u32) -> anyhow::Result<()> {
+    let mut bytes = CORPUS_MAGIC.to_vec();
+    bytes.extend_from_slice(&CORPUS_FORMAT.to_le_bytes());
+    bytes.extend_from_slice(&parser_version.to_le_bytes());
+    bytes.extend_from_slice(&bincode::serialize(self)?);
+    // 쓰다가 끊겨도 기존 파일이 깨지지 않게 임시 파일에 쓰고 바꿔치기
+    let tmp = format!("{path}.tmp");
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)?;
     Ok(())
   }
 
-  pub fn load(path: &str) -> anyhow::Result<Self> {
+  // (통계, 만들 때의 파서 버전)
+  pub fn load(path: &str) -> anyhow::Result<(Self, u32)> {
     let bytes = std::fs::read(path)?;
-    Ok(bincode::deserialize(&bytes)?)
+    let header = CORPUS_MAGIC.len() + 8;
+    if bytes.len() < header || !bytes.starts_with(CORPUS_MAGIC) {
+      anyhow::bail!("{path} is an old-format corpus (trimmed at save time); rebuild it with `analyze --reset`");
+    }
+    let word = |i: usize| u32::from_le_bytes(bytes[i..i + 4].try_into().expect("4 bytes"));
+    let format = word(CORPUS_MAGIC.len());
+    anyhow::ensure!(format == CORPUS_FORMAT, "{path} has corpus format {format}, expected {CORPUS_FORMAT}; rebuild it with `analyze --reset`");
+    let parser_version = word(CORPUS_MAGIC.len() + 4);
+    Ok((bincode::deserialize(&bytes[header..])?, parser_version))
   }
 
   pub fn print(&self) {
@@ -226,7 +268,7 @@ mod tests {
     for _ in 0..20 {
       let mut s = CorpusStats::new();
       for (i, c) in ('a'..='j').enumerate() { s.bigrams.insert((c, 'z'), 10); s.trigrams.insert((c, 'y', 'z'), 10 + (i as u64 % 2)); }
-      s.trim_by_coverage();
+      s.trim_by_coverage(0.99, 0.90);
       let mut kept: Vec<char> = s.bigrams.keys().map(|k| k.0).collect();
       kept.sort_unstable();
       assert_eq!(kept, ('a'..='j').collect::<Vec<_>>()); // 99% → 10개 모두
@@ -235,6 +277,47 @@ mod tests {
       // 빈도 11인 b,d,f,h,j 먼저, 그다음 빈도 10은 키 순 a,c,e,g
       assert_eq!(tri, vec!['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'j']);
     }
+  }
+
+  #[test]
+  fn trim_full_coverage_keeps_everything() {
+    let mut s = crate::test_util::stats();
+    let before = s.clone();
+    s.trim_by_coverage(1.0, 1.0);
+    assert_eq!(s, before);
+    s.trim_by_coverage(0.99, 0.90);
+    assert!(s.trigrams.len() < before.trigrams.len());
+  }
+
+  #[test]
+  fn save_load_roundtrip_and_rejects_old_format() {
+    let dir = std::env::temp_dir().join(format!("p2anut-corpus-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("c.bin");
+    let path = path.to_str().unwrap();
+    let s = crate::test_util::stats();
+    s.save(path, 7).unwrap();
+    let (loaded, ver) = CorpusStats::load(path).unwrap();
+    assert_eq!((loaded, ver), (s.clone(), 7));
+    // 헤더 없는 예전 형식(bincode만)은 거부
+    std::fs::write(path, bincode::serialize(&s).unwrap()).unwrap();
+    assert!(CorpusStats::load(path).unwrap_err().to_string().contains("old-format"));
+    std::fs::remove_dir_all(&dir).unwrap();
+  }
+
+  #[test]
+  fn fast_corpus_merge_and_vec_roundtrip() {
+    let mut a = FastCorpus::new();
+    let mut b = FastCorpus::new();
+    crate::analyze_bytes(b"hello world", &mut a);
+    crate::analyze_bytes(b"other text", &mut b);
+    let mut both = FastCorpus::new();
+    crate::analyze_bytes(b"hello world other text", &mut both);
+    a.merge(&b);
+    assert_eq!(a, both);
+    let (l, bi, tri) = a.to_vecs();
+    assert_eq!(FastCorpus::from_vecs(&l, &bi, &tri).unwrap(), a);
+    assert!(FastCorpus::from_vecs(&l[..3], &bi, &tri).is_err());
   }
 
   #[test]
