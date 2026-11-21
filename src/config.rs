@@ -34,12 +34,56 @@ impl Weights {
   pub fn roll_row(&self) -> f32 { self.roll_row.unwrap_or(self.row) }
 }
 
+// score_normalization = "iqr"일 때만 씀: 항목별 정규화 점수(무작위 배열 중앙값 대비 IQR 배수)에 곱하는 비중
 #[derive(Deserialize, Clone)]
 pub struct ScoreRates {
   pub effort: f32,
   pub sfb: f32,
   pub rolling: f32,
   pub scissors: f32,
+}
+
+impl Default for ScoreRates {
+  fn default() -> Self { Self { effort: 0.25, sfb: 0.25, rolling: 0.25, scissors: 0.25 } }
+}
+
+// 총점 계산 방식
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Normalization {
+  // 모든 항목을 "검지 홈 행 키 한 번 = 1" 단위의 비용으로 바꿔 그대로 더함 ([costs]). 총점 = -(글자당 비용)
+  #[default]
+  Absolute,
+  // 예전 방식: 무작위 배열 중앙값 대비 IQR 배수로 정규화해 [rates] 비중으로 더함
+  Iqr,
+}
+
+// score_normalization = "absolute"의 기준값. 대표 사건 한 번이 검지 홈 행 키 몇 번을 누르는 만큼인지.
+// 나머지 사건은 [weights]의 세부 배율(행·간격·방향·sfs·redirect 등)로 이 값에서 자동으로 정해짐
+#[derive(Deserialize, Clone, Debug)]
+pub struct Costs {
+  // 키 노력값 배율 (1 = 노력값 표 그대로)
+  #[serde(default = "default_one")]
+  pub effort: f32,
+  // SFB 한 번 (왼손 검지 홈 → 검지 윗줄)
+  #[serde(default = "default_cost_sfb")]
+  pub sfb: f32,
+  // 나쁜 방향 풀 시저스 한 번 (중지 아랫줄 → 검지 윗줄)
+  #[serde(default = "default_cost_full_scissors")]
+  pub full_scissors: f32,
+  // 안쪽 롤 한 번으로 아끼는 양 (중지 홈 → 검지 홈)
+  #[serde(default = "default_cost_inroll")]
+  pub inroll: f32,
+}
+
+fn default_cost_sfb() -> f32 { 2.5 }
+fn default_cost_full_scissors() -> f32 { 8.0 }
+fn default_cost_inroll() -> f32 { 2.0 }
+
+impl Default for Costs {
+  fn default() -> Self {
+    Self { effort: 1.0, sfb: default_cost_sfb(), full_scissors: default_cost_full_scissors(), inroll: default_cost_inroll() }
+  }
 }
 
 #[derive(Deserialize, Clone)]
@@ -116,6 +160,12 @@ pub struct Config {
   #[serde(default)]
   pub center_rare: usize,
   pub weights: Weights,
+  // 총점 계산 방식: "absolute"(기본, [costs]) 또는 "iqr"(예전 방식, [rates])
+  #[serde(default)]
+  pub score_normalization: Normalization,
+  #[serde(default)]
+  pub costs: Costs,
+  #[serde(default)]
   pub rates: ScoreRates,
   pub sa: SaParams,
   pub ga: GaParams,
@@ -135,6 +185,11 @@ fn url_file_name(url: &str) -> Option<&str> {
 }
 
 impl Config {
+  // absolute 방식이면 그 기준값, iqr 방식이면 None
+  pub fn abs_costs(&self) -> Option<&Costs> {
+    (self.score_normalization == Normalization::Absolute).then_some(&self.costs)
+  }
+
   // 비어 있지 않은 덤프 주소들 (적은 순서대로)
   pub fn dump_urls(&self) -> Vec<String> {
     let all = match &self.wikipedia_dump_url {
@@ -186,6 +241,13 @@ impl Config {
     }
     if w.redirect < -5.0 || w.redirect > 5.0 {
       anyhow::bail!("weights.redirect must be in [-5.0, 5.0]");
+    }
+    let c = &self.costs;
+    if c.effort < 0.0 || c.sfb < 0.0 || c.full_scissors < 0.0 || c.inroll < 0.0 {
+      anyhow::bail!("costs.effort, sfb, full_scissors, inroll must be non-negative");
+    }
+    if self.score_normalization == Normalization::Absolute && c.effort + c.sfb + c.full_scissors + c.inroll <= 0.0 {
+      anyhow::bail!("at least one cost must be > 0");
     }
     let r = &self.rates;
     if r.effort < 0.0 || r.sfb < 0.0 || r.rolling < 0.0 || r.scissors < 0.0 {

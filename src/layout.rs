@@ -272,8 +272,16 @@ impl Layout {
     println!("left={left_pct:.1}%  right={right_pct:.1}%");
   }
 
-  // 항목별 정규화 점수 (무작위 배열 중앙값 대비 IQR 배수, 클수록 좋음). 총점은 이 값을 ±Z_CLAMP로 잘라 rates로 가중합한 것
+  // absolute 방식: 글자 100개당 항목별 비용과 무작위 배열 대비 변화율.
+  // iqr 방식: 항목별 정규화 점수 (무작위 배열 중앙값 대비 IQR 배수, 클수록 좋음). 총점은 이 값을 ±Z_CLAMP로 잘라 rates로 가중합한 것
   pub fn print_goodness(&self, norm: &ScoreNorm) {
+    if let Some(c) = norm.cost_breakdown(&self.score) {
+      let total = c.effort + c.sfb + c.rolling + c.scissors;
+      println!("cost per 100 letters (lower is better): total={total:.1}  effort={:.1}  sfb={:.1}  scissors={:.1}  rolling={:.1}", c.effort, c.sfb, c.scissors, c.rolling);
+      let v = norm.vs_random(&self.score);
+      println!("vs random median: effort {:+.1}%  sfb {:+.1}%  scissors {:+.1}%  rolling {:+.1}%", v.effort, v.sfb, v.scissors, v.rolling);
+      return;
+    }
     let g = norm.goodness(&self.score);
     let f = |v: f64| format!("{v:+.2}{}", if v.abs() >= crate::score::Z_CLAMP { " (clamped)" } else { "" });
     println!("normalized (higher is better): effort={}  sfb={}  rolling={}  scissors={}", f(g.effort), f(g.sfb), f(g.rolling), f(g.scissors));
@@ -320,8 +328,9 @@ pub fn load_results(path: &str) -> anyhow::Result<Vec<Layout>> {
   Ok(bincode::deserialize(&bytes)?)
 }
 
-// 정규화 기준: 무작위 배열 표본의 항목별 중앙값·IQR. 실제 탐색과 같은 공간에서 뽑도록 center_mask 제약을 지킴
-pub fn init_score_norm(arrays: &CorpusArrays, precomp: &Precomp, rates: &crate::config::ScoreRates, center_mask: u32) -> ScoreNorm {
+// 정규화 기준: 무작위 배열 표본의 항목별 중앙값·IQR. 실제 탐색과 같은 공간에서 뽑도록 center_mask 제약을 지킴.
+// costs가 있으면 총점은 absolute 방식(대표 사건 비용으로 환산한 글자당 비용), 없으면 iqr 방식(rates). 표본은 둘 다 표시용으로 씀
+pub fn init_score_norm(arrays: &CorpusArrays, precomp: &Precomp, rates: &crate::config::ScoreRates, costs: Option<&crate::config::Costs>, center_mask: u32) -> ScoreNorm {
   const N: usize = 10001;
   let mut effort_vals   = Vec::with_capacity(N);
   let mut sfb_vals      = Vec::with_capacity(N);
@@ -340,7 +349,27 @@ pub fn init_score_norm(arrays: &CorpusArrays, precomp: &Precomp, rates: &crate::
 
   let mut norm = ScoreNorm::from_samples(&effort_vals, &sfb_vals, &rolling_vals, &scissors_vals);
   norm.set_rates(rates);
+  norm.abs = costs.map(|c| abs_weights(arrays, precomp, c));
   norm
+}
+
+// 대표 사건 (왼손): 검지 홈(1,3)·검지 윗줄(0,3)·중지 홈(1,2)·중지 아랫줄(2,2)
+const REF_INDEX_HOME: usize = COLS + 3;
+const REF_INDEX_TOP: usize = 3;
+const REF_MIDDLE_HOME: usize = COLS + 2;
+const REF_MIDDLE_BOTTOM: usize = 2 * COLS + 2;
+
+// [costs]의 대표 사건 비용을 원래 점수 1단위당 비용으로 환산
+pub fn abs_weights(arrays: &CorpusArrays, precomp: &Precomp, c: &crate::config::Costs) -> crate::score::AbsWeights {
+  let per = |cost: f32, base: f32| if base > 0.0 { f64::from(cost) / f64::from(base) } else { 0.0 };
+  let letters: u64 = arrays.freq.iter().sum();
+  crate::score::AbsWeights {
+    effort: f64::from(c.effort),
+    sfb: per(c.sfb, precomp.bigram(REF_INDEX_HOME, REF_INDEX_TOP).sfb_base),
+    scissors: per(c.full_scissors, precomp.bigram(REF_MIDDLE_BOTTOM, REF_INDEX_TOP).scissors_base),
+    rolling: per(c.inroll, precomp.bigram(REF_MIDDLE_HOME, REF_INDEX_HOME).rolling_base),
+    per_letter: if letters > 0 { 1.0 / letters as f64 } else { 0.0 },
+  }
 }
 
 fn layout_key(l: &Layout) -> impl Ord {
@@ -440,6 +469,43 @@ mod tests {
     assert!(Layout::parse("abc").is_err());
     assert!(Layout::parse(".blyx.foup\nmanijzreht\ncgkdq.s.va\n").err().unwrap().to_string().contains("more than once"));
     assert!(Layout::parse(".blyx.foup\nmanijzreht\ncgkdq.s.v\n").is_err());
+  }
+
+  #[test]
+  fn absolute_costs_match_reference_events() {
+    let stats = test_util::stats();
+    let arrays = stats.to_arrays(false);
+    let (precomp, _) = test_util::precomp_norm_for(&arrays);
+    let c = crate::config::Costs::default();
+    let a = abs_weights(&arrays, &precomp, &c);
+    // 대표 사건 하나의 원래 점수 × 환산 배율 = 설정한 비용
+    let sfb = f64::from(precomp.bigram(REF_INDEX_HOME, REF_INDEX_TOP).sfb_base) * a.sfb;
+    let sci = f64::from(precomp.bigram(REF_MIDDLE_BOTTOM, REF_INDEX_TOP).scissors_base) * a.scissors;
+    let roll = f64::from(precomp.bigram(REF_MIDDLE_HOME, REF_INDEX_HOME).rolling_base) * a.rolling;
+    assert!((sfb - 2.5).abs() < 1e-6 && (sci - 8.0).abs() < 1e-6 && (roll - 2.0).abs() < 1e-6, "{sfb} {sci} {roll}");
+    // 대표 사건이 실제로 그 종류인지
+    assert!(precomp.bigram(REF_MIDDLE_BOTTOM, REF_INDEX_TOP).rolling_base == 0.0);
+    assert!(precomp.bigram(REF_MIDDLE_HOME, REF_INDEX_HOME).scissors_base == 0.0);
+    assert!((a.per_letter * arrays.freq.iter().sum::<u64>() as f64 - 1.0).abs() < 1e-12);
+  }
+
+  #[test]
+  fn absolute_mode_ranks_by_lower_cost() {
+    let stats = test_util::stats();
+    let arrays = stats.to_arrays(false);
+    let (precomp, _) = test_util::precomp_norm_for(&arrays);
+    let norm = init_score_norm(&arrays, &precomp, &test_util::rates(), Some(&crate::config::Costs::default()), 0);
+    let mut ls: Vec<Layout> = (0..30).map(|_| {
+      let mut l = Layout::make_random(&arrays.keys, &[], 0);
+      l.calc_scores(&arrays, &precomp); l.calc_total_score(&norm); l
+    }).filter(|l| l.total > PENALTY_SCORE).collect();
+    sort_layouts(&mut ls);
+    let cost = |l: &Layout| { let c = norm.cost_breakdown(&l.score).unwrap(); c.effort + c.sfb + c.rolling + c.scissors };
+    assert!(ls.len() > 5);
+    assert!(ls.windows(2).all(|w| cost(&w[0]) <= cost(&w[1]) + 1e-6));
+    // 총점 = -(글자당 비용) × ABS_SCALE
+    let l = &ls[0];
+    assert!(((-l.total as f64) / crate::score::ABS_SCALE * 100.0 - cost(l)).abs() < 1e-4);
   }
 
   #[test]
