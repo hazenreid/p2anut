@@ -19,7 +19,7 @@ pub fn stats() -> CorpusStats {
 }
 
 pub fn weights() -> Weights {
-  Weights { gap: 0.78, row: 0.97, center: 2.5, outroll: 0.70, redirect: 0.30, roll_row: None, half_scissors: 1.0, full_scissors_good: 0.5, skip_scissors: 0.5 }
+  Weights { gap: 0.78, row: 0.97, center: 2.5, outroll: 0.70, redirect: 0.30, roll_row: None, half_scissors: 1.0, full_scissors_good: 0.5, skip_scissors: 0.5, sfs: 1.0 }
 }
 
 pub fn rates() -> ScoreRates {

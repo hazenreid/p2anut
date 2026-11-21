@@ -22,6 +22,10 @@ pub struct Weights {
   // 스킵 풀 시저스(1·3번 키가 인접 손가락 두 줄 차이) 페널티 배율. 풀 시저스 식에 곱함. 0(기본) = 끔
   #[serde(default)]
   pub skip_scissors: f32,
+  // 같은 손가락 스킵그램(1·3번 키가 같은 손가락, 가운데는 다른 손가락) 페널티 배율. SFB와 같은 식에 곱해 sfb 항목에 더함.
+  // 1(기본) = SFB와 같은 무게 (예전 동작)
+  #[serde(default = "default_one")]
+  pub sfs: f32,
 }
 
 fn default_one() -> f32 { 1.0 }
@@ -177,8 +181,8 @@ impl Config {
       anyhow::bail!("center_rare must be 0 (off) or 2..=6");
     }
     let w = &self.weights;
-    if w.gap < 0.0 || w.row < 0.0 || w.center < 0.0 || w.outroll < 0.0 || w.roll_row() < 0.0 || w.half_scissors < 0.0 || w.full_scissors_good < 0.0 || w.skip_scissors < 0.0 {
-      anyhow::bail!("weights.gap, row, roll_row, center, outroll, half_scissors, full_scissors_good, skip_scissors must be non-negative (redirect may be negative)");
+    if w.gap < 0.0 || w.row < 0.0 || w.center < 0.0 || w.outroll < 0.0 || w.roll_row() < 0.0 || w.half_scissors < 0.0 || w.full_scissors_good < 0.0 || w.skip_scissors < 0.0 || w.sfs < 0.0 {
+      anyhow::bail!("weights.gap, row, roll_row, center, outroll, half_scissors, full_scissors_good, skip_scissors, sfs must be non-negative (redirect may be negative)");
     }
     if w.redirect < -5.0 || w.redirect > 5.0 {
       anyhow::bail!("weights.redirect must be in [-5.0, 5.0]");

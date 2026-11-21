@@ -138,7 +138,7 @@ impl Precomp {
           if f1 == f3 && f1 != f2 {
             let row_dist = r1.abs_diff(r3);
             let row_mult = 1.0 + (weights.row * row_dist as f32);
-            entry.sfs_base = (e1 + e3)
+            entry.sfs_base = weights.sfs * (e1 + e3)
               * (if ic1 || ic3 { weights.center } else { 1.0 })
               * row_mult;
           } else if il1 == il2 && il2 == il3 {
@@ -196,6 +196,24 @@ mod tests {
     assert!(!is_bad_half_scissor(1, 0, 3, 1));
     // 오른손 검지(5) 윗줄 + 중지(6) 홈 → 나쁨
     assert!(is_bad_half_scissor(5, 0, 6, 1));
+  }
+
+  #[test]
+  fn sfs_weight_scales_skipgrams_only() {
+    let mut w = crate::test_util::weights();
+    w.sfs = 1.0;
+    let full = Precomp::new(&[1; crate::layout::CHARS], &w, 0.45);
+    w.sfs = 0.5;
+    let half = Precomp::new(&[1; crate::layout::CHARS], &w, 0.45);
+    // 왼손 중지 윗줄(0,2) → 다른 손가락 → 중지 아랫줄(2,2): 스킵그램
+    let (a, b, c) = (2, COLS + 3, 2 * COLS + 2);
+    assert!(full.trigram(a, b, c).sfs_base > 0.0);
+    assert!((half.trigram(a, b, c).sfs_base - 0.5 * full.trigram(a, b, c).sfs_base).abs() < 1e-6);
+    // 같은 조합의 SFB는 그대로
+    assert_eq!(half.bigram(a, c).sfb_base, full.bigram(a, c).sfb_base);
+    assert!(half.bigram(a, c).sfb_base > 0.0);
+    // 1이면 스킵그램과 SFB가 같은 무게 (예전 동작)
+    assert!((full.trigram(a, b, c).sfs_base - full.bigram(a, c).sfb_base).abs() < 1e-6);
   }
 
   #[test]
