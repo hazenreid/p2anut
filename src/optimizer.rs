@@ -104,6 +104,7 @@ impl<'a> Optimizer<'a> {
       save_results(&all_elites, result_file).ok();
       println!("\n[Elite {}/{}] total={}", i + 1, elites_len, fmt_num(elite.total));
       elite.print();
+      elite.print_goodness(self.norm);
       println!();
       if crate::SHUTDOWN.load(std::sync::atomic::Ordering::SeqCst) { break; }
     }

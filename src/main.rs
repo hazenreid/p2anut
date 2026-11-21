@@ -115,10 +115,11 @@ fn for_scoring(mut stats: CorpusStats, config: &Config) -> CorpusStats {
   stats
 }
 
-fn print_results(results: &[layout::Layout]) {
+fn print_results(results: &[layout::Layout], norm: Option<&score::ScoreNorm>) {
   for (i, l) in results.iter().enumerate() {
     println!("[{}]", i + 1);
     l.print();
+    if let Some(n) = norm { l.print_goodness(n); }
     println!();
   }
 }
@@ -142,19 +143,21 @@ fn cmd_results(result_path: &Path, config: &Config) -> anyhow::Result<()> {
   }
   let mut results = load_results(result_file_str)?;
   let corpus_path = result_path.join(&config.corpus_file);
+  let mut norm = None;
   if corpus_path.exists() {
     let stats = for_scoring(load_corpus(&corpus_path)?, config);
     let arrays = stats.to_arrays(false);
     results.retain(|l| l.key_count() == arrays.keys.len());
     let precomp = Precomp::new(&arrays.freq, &config.weights, config.min_hand_usage);
-    let norm = init_score_norm(&arrays, &precomp, &config.rates);
+    let n = init_score_norm(&arrays, &precomp, &config.rates);
     for l in &mut results {
       l.calc_scores(&arrays, &precomp);
-      l.calc_total_score(&norm);
+      l.calc_total_score(&n);
     }
     layout::sort_layouts(&mut results);
+    norm = Some(n);
   }
-  print_results(&results);
+  print_results(&results, norm.as_ref());
   Ok(())
 }
 
@@ -205,7 +208,7 @@ fn run_optimize(result_path: &Path, config: &Config, stats: &corpus::CorpusStats
     round += 1;
   }
   println!("\n[Results]");
-  print_results(&best);
+  print_results(&best, Some(&norm));
   Ok(())
 }
 

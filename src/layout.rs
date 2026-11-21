@@ -214,6 +214,13 @@ impl Layout {
     println!("left={left_pct:.1}%  right={right_pct:.1}%");
   }
 
+  // 항목별 정규화 점수 (무작위 배열 중앙값 대비 IQR 배수, 클수록 좋음). 총점은 이 값을 ±Z_CLAMP로 잘라 rates로 가중합한 것
+  pub fn print_goodness(&self, norm: &ScoreNorm) {
+    let g = norm.goodness(&self.score);
+    let f = |v: f64| format!("{v:+.2}{}", if v.abs() >= crate::score::Z_CLAMP { " (clamped)" } else { "" });
+    println!("normalized (higher is better): effort={}  sfb={}  rolling={}  scissors={}", f(g.effort), f(g.sfb), f(g.rolling), f(g.scissors));
+  }
+
   pub fn calc_total_score(&mut self, norm: &ScoreNorm) {
     if self.total <= PENALTY_SCORE {
       return; // Hand usage penalty already applied

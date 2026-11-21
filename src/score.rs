@@ -9,6 +9,9 @@ pub struct Score {
   pub scissors: f64,
 }
 
+// 항목별 정규화 점수를 자르는 한계 (한 항목이 총점을 독차지하지 않도록)
+pub const Z_CLAMP: f64 = 20.0;
+
 #[derive(Default)]
 pub struct ScoreNorm {
   pub median:  Score,
@@ -55,8 +58,18 @@ impl ScoreNorm {
     }
   }
 
+  // 항목별 정규화 점수: 무작위 배열의 중앙값에서 IQR 몇 배만큼 좋은지 (클수록 좋음, 자르기 전 값)
+  pub fn goodness(&self, s: &Score) -> Score {
+    Score {
+      effort:   -(s.effort   - self.median.effort)   / self.iqr.effort,
+      sfb:      -(s.sfb      - self.median.sfb)      / self.iqr.sfb,
+      rolling:   (s.rolling  - self.median.rolling)  / self.iqr.rolling,
+      scissors: -(s.scissors - self.median.scissors) / self.iqr.scissors,
+    }
+  }
+
   pub fn total_score(&self, eff: f64, sfb: f64, roll: f64, sciss: f64) -> i64 {
-    let n = |v: f64, m: f64, d: f64| ((v - m) / d).clamp(-20.0, 20.0);
+    let n = |v: f64, m: f64, d: f64| ((v - m) / d).clamp(-Z_CLAMP, Z_CLAMP);
     let ne = n(eff,   self.median.effort,   self.iqr.effort);
     let ns = n(sfb,   self.median.sfb,      self.iqr.sfb);
     let nr = n(roll,  self.median.rolling,  self.iqr.rolling);
