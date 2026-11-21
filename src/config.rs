@@ -51,7 +51,7 @@ pub struct SaParams {
 
 fn default_cooling() -> f64 { 0.998 }
 fn default_bigram_coverage() -> f64 { 0.99 }
-fn default_trigram_coverage() -> f64 { 0.90 }
+fn default_trigram_coverage() -> f64 { 0.97 }
 fn default_sample() -> f64 { 1.0 }
 fn default_true() -> bool { true }
 fn default_min_home_diff() -> u32 { 1 }
@@ -236,7 +236,7 @@ mod tests {
     assert_eq!(c.dump_path(root), Some(root.join("mine.bz2")));
     let c = config("wikipedia_dump_url = \"https://m.org/a.xml.bz2\"");
     assert_eq!(c.dump_path(root), None);
-    assert_eq!((c.wikipedia_limit, c.wikipedia_sample, c.bigram_coverage, c.trigram_coverage), (0, 1.0, 0.99, 0.90));
+    assert_eq!((c.wikipedia_limit, c.wikipedia_sample, c.bigram_coverage, c.trigram_coverage), (0, 1.0, 0.99, 0.97));
   }
 
   #[test]

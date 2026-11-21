@@ -149,7 +149,7 @@ fn cmd_results(result_path: &Path, config: &Config) -> anyhow::Result<()> {
     let arrays = stats.to_arrays(false);
     results.retain(|l| l.key_count() == arrays.keys.len());
     let precomp = Precomp::new(&arrays.freq, &config.weights, config.min_hand_usage);
-    let n = init_score_norm(&arrays, &precomp, &config.rates);
+    let n = init_score_norm(&arrays, &precomp, &config.rates, arrays.rare_mask(config.center_rare));
     for l in &mut results {
       l.calc_scores(&arrays, &precomp);
       l.calc_total_score(&n);
@@ -166,10 +166,10 @@ fn run_optimize(result_path: &Path, config: &Config, stats: &corpus::CorpusStats
   print!("[Precomp] ..."); let _ = std::io::stdout().flush();
   let precomp = Precomp::new(&arrays.freq, &config.weights, config.min_hand_usage);
   println!(" done");
-  print!("[Score Norm] ..."); let _ = std::io::stdout().flush();
-  let norm = init_score_norm(&arrays, &precomp, &config.rates);
-  println!(" done");
   let center_mask = arrays.rare_mask(config.center_rare);
+  print!("[Score Norm] ..."); let _ = std::io::stdout().flush();
+  let norm = init_score_norm(&arrays, &precomp, &config.rates, center_mask);
+  println!(" done");
   if center_mask != 0 {
     let letters: String = (0..arrays.keys.len()).filter(|&i| center_mask >> i & 1 == 1).map(|i| arrays.keys[i]).collect();
     println!("[Center] least frequent {} letters forced into the center columns: {letters}", config.center_rare);

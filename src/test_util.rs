@@ -40,6 +40,6 @@ pub fn precomp_norm(stats: &CorpusStats) -> (Precomp, ScoreNorm) {
 
 pub fn precomp_norm_for(arrays: &CorpusArrays) -> (Precomp, ScoreNorm) {
   let precomp = Precomp::new(&arrays.freq, &weights(), 0.45);
-  let norm = crate::layout::init_score_norm(arrays, &precomp, &rates());
+  let norm = crate::layout::init_score_norm(arrays, &precomp, &rates(), 0);
   (precomp, norm)
 }

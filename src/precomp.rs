@@ -10,6 +10,16 @@ const EFFORT_GRID: [[f32; COLS]; ROWS] = [
   [2.2, 1.5, 1.3, 1.1, 4.0, 4.0, 1.1, 1.3, 1.5, 2.2],  // bottom
 ];
 
+// 리다이렉트 페널티의 기준 노력값 합: 홈 행 세 키 정도. 이 값에서 페널티 크기가 보너스 식(1/노력값 합)과 같아짐
+const REDIRECT_REF_EFFORT: f32 = 3.0;
+
+// 트라이그램 롤·리다이렉트 값. 보너스(w ≥ 0)는 쉬울수록(노력값 합이 작고, 간격·행 이동 배율 m이 클수록) 크고,
+// 페널티(w < 0)는 반대로 어려울수록 커야 함. 그래서 페널티는 노력값 합에 비례하고 m으로 나눔.
+// 노력값 합이 REDIRECT_REF_EFFORT이고 m = 1이면 두 식의 크기가 같음
+fn trigram_roll_value(w: f32, effort_sum: f32, m: f32) -> f32 {
+  if w >= 0.0 { w * m / effort_sum } else { w * effort_sum / (REDIRECT_REF_EFFORT * REDIRECT_REF_EFFORT) / m }
+}
+
 // 손가락 길이 순위 (클수록 김): 중지 > 약지 > 검지 > 새끼. FINGER_GRID 번호(1~8)로 인덱스
 const FINGER_LEN: [u8; 9] = [0, 2, 4, 3, 1, 2, 4, 3, 1];
 
@@ -145,7 +155,7 @@ impl Precomp {
               let gap_mult2 = if gap_dist2 > 1 { weights.gap.powf(f32::from(gap_dist2 - 1)) } else { 1.0 };
               let total_row_dist = (row_delta1 + row_delta2) as f32;
               let row_mult = weights.roll_row().powf(total_row_dist);
-              entry.roll_base = w * gap_mult1 * gap_mult2 * row_mult / effort_sum;
+              entry.roll_base = trigram_roll_value(w, effort_sum, gap_mult1 * gap_mult2 * row_mult);
             }
           }
         }
@@ -186,6 +196,30 @@ mod tests {
     assert!(!is_bad_half_scissor(1, 0, 3, 1));
     // 오른손 검지(5) 윗줄 + 중지(6) 홈 → 나쁨
     assert!(is_bad_half_scissor(5, 0, 6, 1));
+  }
+
+  #[test]
+  fn redirect_penalty_grows_on_harder_keys() {
+    let mut w = crate::test_util::weights();
+    w.redirect = -1.5;
+    let pc = Precomp::new(&[1; crate::layout::CHARS], &w, 0.45);
+    // 왼손 약지 → 검지 → 중지 (방향이 바뀌는 리다이렉트)
+    let home = pc.trigram(COLS + 1, COLS + 3, COLS + 2).roll_base;
+    let top = pc.trigram(1, 3, 2).roll_base;
+    let mixed = pc.trigram(1, COLS + 3, 2).roll_base; // 윗줄 → 홈 → 윗줄 (행 이동 두 번)
+    assert!(home < 0.0 && top < home && mixed < home, "home {home}, top {top}, mixed {mixed}");
+    // 홈 행 기준값: -1.5 × 노력값 합(1.1+1.0+1.0) / 9 / 간격 배율(약지→검지 gap)
+    assert!((home - (-1.5 * 3.1 / 9.0 / w.gap)).abs() < 1e-5, "{home}");
+
+    // 양수면 보너스: 쉬운 키일수록 큼 (롤과 같은 식)
+    w.redirect = 0.5;
+    let pc = Precomp::new(&[1; crate::layout::CHARS], &w, 0.45);
+    let home = pc.trigram(COLS + 1, COLS + 3, COLS + 2).roll_base;
+    let top = pc.trigram(1, 3, 2).roll_base;
+    assert!(home > top && top > 0.0);
+    // 롤 보너스(안쪽 롤)는 그대로: 약지 → 중지 → 검지 홈
+    let roll = pc.trigram(COLS + 1, COLS + 2, COLS + 3).roll_base;
+    assert!((roll - 1.0 / 3.1).abs() < 1e-5, "{roll}");
   }
 
   #[test]

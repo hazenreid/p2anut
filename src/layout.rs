@@ -248,9 +248,12 @@ impl Layout {
   }
 }
 
+// 쓰는 도중에 강제 종료돼도 기존 결과가 깨지지 않게 임시 파일에 쓰고 바꿔치기
 pub fn save_results(layouts: &[Layout], path: &str) -> anyhow::Result<()> {
   let bytes = bincode::serialize(layouts)?;
-  std::fs::write(path, bytes)?;
+  let tmp = format!("{path}.tmp");
+  std::fs::write(&tmp, bytes)?;
+  std::fs::rename(&tmp, path)?;
   Ok(())
 }
 
@@ -259,7 +262,8 @@ pub fn load_results(path: &str) -> anyhow::Result<Vec<Layout>> {
   Ok(bincode::deserialize(&bytes)?)
 }
 
-pub fn init_score_norm(arrays: &CorpusArrays, precomp: &Precomp, rates: &crate::config::ScoreRates) -> ScoreNorm {
+// 정규화 기준: 무작위 배열 표본의 항목별 중앙값·IQR. 실제 탐색과 같은 공간에서 뽑도록 center_mask 제약을 지킴
+pub fn init_score_norm(arrays: &CorpusArrays, precomp: &Precomp, rates: &crate::config::ScoreRates, center_mask: u32) -> ScoreNorm {
   const N: usize = 10001;
   let mut effort_vals   = Vec::with_capacity(N);
   let mut sfb_vals      = Vec::with_capacity(N);
@@ -267,7 +271,7 @@ pub fn init_score_norm(arrays: &CorpusArrays, precomp: &Precomp, rates: &crate::
   let mut scissors_vals = Vec::with_capacity(N);
 
   while effort_vals.len() < N {
-    let mut l = Layout::make_random(&arrays.keys, &[], 0);
+    let mut l = Layout::make_random_centered(&arrays.keys, center_mask, &[], 0);
     l.calc_scores(arrays, precomp);
     if l.total <= PENALTY_SCORE { continue; }
     effort_vals.push(l.score.effort as f32);
@@ -362,6 +366,20 @@ mod tests {
       assert!(home_diff(home_row_keys(&kept[i]), home_row_keys(&kept[j])) >= 3);
     }}
     assert!(kept.windows(2).all(|w| w[0].total >= w[1].total));
+  }
+
+  #[test]
+  fn save_results_roundtrip_leaves_no_temp_file() {
+    let dir = std::env::temp_dir().join(format!("p2anut-results-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("result.bin");
+    let path = path.to_str().unwrap();
+    let ls = vec![Layout::make_random(&test_util::stats().to_arrays(false).keys, &[], 0); 2];
+    save_results(&ls, path).unwrap();
+    save_results(&ls[..1], path).unwrap();
+    assert_eq!(load_results(path).unwrap().len(), 1);
+    assert!(!std::path::Path::new(&format!("{path}.tmp")).exists());
+    std::fs::remove_dir_all(&dir).unwrap();
   }
 
   #[test]
