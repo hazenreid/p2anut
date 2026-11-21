@@ -1,4 +1,51 @@
+// 위키 덤프 본문 정리 순서:
+//   1) XML 엔티티 해제 (덤프 XML이 위키 원문을 한 번 더 이스케이프함: 원문 `<ref>` → `&lt;ref&gt;`, 원문 `&nbsp;` → `&amp;nbsp;`)
+//   2) 위키 마크업 제거
+//   3) 위키 원문 자체의 HTML 엔티티 해제 (`&nbsp;`, `&ndash;` 등). 모르는 엔티티는 공백으로 바꿔 글자로 세지 않음
+// 3)을 2) 뒤에 해야 원문의 `&lt;`(글자 그대로의 <)가 태그로 오인되지 않음
+
+// 위키 본문 텍스트 정리기 (버퍼 재사용)
+pub struct ArticleCleaner {
+  decoded: Vec<u8>,
+  stripped: Vec<u8>,
+  text: Vec<u8>,
+}
+
+impl ArticleCleaner {
+  pub fn new() -> Self {
+    Self {
+      decoded: Vec::with_capacity(128 * 1024),
+      stripped: Vec::with_capacity(128 * 1024),
+      text: Vec::with_capacity(128 * 1024),
+    }
+  }
+
+  // raw: 덤프 XML의 <text> 내용 (XML 이스케이프된 상태 그대로)
+  pub fn clean(&mut self, raw: &[u8]) -> &[u8] {
+    decode_html_entities_into(raw, &mut self.decoded);
+    strip_wiki_markup_into(&self.decoded, &mut self.stripped);
+    decode_wiki_entities_into(&self.stripped, &mut self.text);
+    &self.text
+  }
+}
+
+// 넘겨주기 문서인지 (#REDIRECT, #Redirect 등 대소문자 무관, 앞 공백 허용)
+pub fn is_redirect(raw: &[u8]) -> bool {
+  let t = raw.trim_ascii_start();
+  t.len() >= 9 && t[..9].eq_ignore_ascii_case(b"#redirect")
+}
+
+// XML 단계 엔티티 해제. 모르는 엔티티는 글자 그대로 둠
 pub fn decode_html_entities_into(input: &[u8], out: &mut Vec<u8>) {
+  decode_entities_into(input, out, false);
+}
+
+// 위키 원문 단계 엔티티 해제. 모르는 이름 엔티티(&ndash; 등)는 공백으로 바꿔 연속을 끊음
+pub fn decode_wiki_entities_into(input: &[u8], out: &mut Vec<u8>) {
+  decode_entities_into(input, out, true);
+}
+
+fn decode_entities_into(input: &[u8], out: &mut Vec<u8>, unknown_as_space: bool) {
   out.clear();
   let mut i = 0;
   while i < input.len() {
@@ -27,6 +74,13 @@ pub fn decode_html_entities_into(input: &[u8], out: &mut Vec<u8>) {
             continue;
           }
         }
+        _ if unknown_as_space
+          && entity.first().is_some_and(u8::is_ascii_alphabetic)
+          && entity.iter().all(u8::is_ascii_alphanumeric) => {
+          out.push(b' ');
+          i += end + 2;
+          continue;
+        }
         _ => {}
       }
     }
@@ -46,6 +100,47 @@ fn matching_link_end(rest: &[u8]) -> Option<usize> {
       if depth == 0 { return Some(j); }
       j += 2;
     } else { j += 1; }
+  }
+  None
+}
+
+// 화면에 글자가 보이지 않는 링크인지: 파일·분류 링크, 그리고 언어 간 링크([[fr:Paris]])
+// 그 밖의 콜론 링크([[Star Trek: The Next Generation]], [[wikt:hello|hello]])는 보이는 글자를 남김
+fn is_hidden_link(target: &[u8], has_pipe: bool) -> bool {
+  let Some(colon) = target.iter().position(|&b| b == b':') else { return false; };
+  let prefix = target[..colon].trim_ascii();
+  const HIDDEN_NS: [&[u8]; 4] = [b"file", b"image", b"media", b"category"];
+  if HIDDEN_NS.iter().any(|ns| ns.eq_ignore_ascii_case(prefix)) { return true; }
+  // 언어 코드: 소문자 2~3자, 뒤에 "-yue" 같은 소문자 꼬리가 붙을 수 있음 (zh-yue, be-tarask)
+  let lower = |p: &[u8]| !p.is_empty() && p.iter().all(u8::is_ascii_lowercase);
+  let mut parts = prefix.split(|&b| b == b'-');
+  !has_pipe
+    && parts.next().is_some_and(|p| (2..=3).contains(&p.len()) && lower(p))
+    && parts.all(lower)
+}
+
+// 내용까지 통째로 지우는 태그 (각주, 수식, 코드, 화학식, 갤러리 등 본문 문장이 아닌 것)
+const DROP_TAGS: [&[u8]; 18] = [
+  b"ref", b"references", b"math", b"chem", b"ce", b"syntaxhighlight", b"source", b"pre", b"code",
+  b"gallery", b"timeline", b"score", b"hiero", b"graph", b"mapframe", b"maplink", b"templatedata", b"imagemap",
+];
+
+// "<name" 다음 글자가 태그 이름의 끝인지
+fn is_tag_name_end(b: Option<&u8>) -> bool {
+  b.is_none_or(|&b| b == b'>' || b == b'/' || b.is_ascii_whitespace())
+}
+
+// hay에서 닫는 태그 </name ...> 를 찾아 그 '>' 바로 뒤 위치를 돌려줌 (대소문자 무관)
+fn find_closing_tag(hay: &[u8], name: &[u8]) -> Option<usize> {
+  let mut j = 0;
+  while j + 2 + name.len() <= hay.len() {
+    if hay[j] == b'<' && hay[j + 1] == b'/'
+      && hay[j + 2..j + 2 + name.len()].eq_ignore_ascii_case(name)
+      && is_tag_name_end(hay.get(j + 2 + name.len())) {
+      let gt = hay[j..].iter().position(|&b| b == b'>')?;
+      return Some(j + gt + 1);
+    }
+    j += 1;
   }
   None
 }
@@ -81,38 +176,63 @@ pub fn strip_wiki_markup_into(input: &[u8], out: &mut Vec<u8>) {
       continue;
     }
 
+    // 매직 워드 (__NOTOC__, __TOC__ 등)
+    if rest.starts_with(b"__") {
+      let n = rest[2..].iter().take_while(|b| b.is_ascii_uppercase()).count();
+      if n >= 2 && rest[2 + n..].starts_with(b"__") {
+        i += n + 4;
+        continue;
+      }
+    }
+
     if rest.starts_with(b"<!--") {
       i += rest.windows(3).position(|w| w == b"-->").map_or(rest.len(), |p| p + 3);
       continue;
     }
 
-    // <ref>, <ref name=...>, <ref .../> 만 처리 (<references> 등은 아래 일반 태그 처리)
-    if rest.starts_with(b"<ref") && rest.get(4).is_some_and(|&b| b == b'>' || b == b'/' || b.is_ascii_whitespace()) {
-      let Some(gt) = rest.iter().position(|&b| b == b'>') else { i += 4; continue; };
-      if rest[gt - 1] == b'/' {
-        i += gt + 1;
-      } else if let Some(p) = rest[gt + 1..].windows(6).position(|w| w == b"</ref>") {
-        i += gt + 1 + p + 6;
-      } else {
-        i += gt + 1;
-      }
-      continue;
-    }
-
     if rest.starts_with(b"<") {
-      i += rest.iter().position(|&b| b == b'>').map_or(1, |p| p + 1);
-      continue;
+      let name_len = rest[1..].iter().take_while(|b| b.is_ascii_alphanumeric()).count();
+      let name = &rest[1..1 + name_len];
+
+      // 내용까지 지우는 태그: <math>...</math>, <ref name=x/>, <ref>...</ref> 등
+      if name_len > 0 && is_tag_name_end(rest.get(1 + name_len))
+        && DROP_TAGS.iter().any(|t| t.eq_ignore_ascii_case(name)) {
+        let Some(gt) = rest.iter().position(|&b| b == b'>') else { i += 1 + name_len; continue; };
+        if rest[gt - 1] == b'/' {
+          i += gt + 1;
+        } else if let Some(p) = find_closing_tag(&rest[gt + 1..], name) {
+          i += gt + 1 + p;
+        } else {
+          i += gt + 1;
+        }
+        continue;
+      }
+
+      // 그 밖의 태그는 태그 자체만 지우고 내용은 남김 (<br>, </div>, <span ...>, <nowiki> 등)
+      // "<" 뒤가 영문자·'/'·'!'이고 같은 줄에서 '>'로 닫힐 때만 태그로 봄 ("x < 5" 같은 부등호는 글자 그대로)
+      if rest.get(1).is_some_and(|&b| b.is_ascii_alphabetic() || b == b'/' || b == b'!')
+        && let Some(gt) = rest[1..].iter().position(|&b| matches!(b, b'>' | b'<' | b'\n')).filter(|&p| rest[1 + p] == b'>') {
+        i += gt + 2;
+        continue;
+      }
     }
 
     if rest.starts_with(b"[[") {
       if let Some(end) = matching_link_end(rest) {
         let content = &rest[2..end];
-        if content.iter().take(40).any(|&b| b == b':') {
-          // namespace link (File:, Category:, etc.) — 캡션 안의 중첩 링크까지 통째로 제외
+        // [[:Category:X]] 처럼 앞에 콜론이 붙으면 분류·파일이 아니라 보이는 링크
+        let (forced_visible, content) = match content.strip_prefix(b":") {
+          Some(c) => (true, c),
+          None => (false, content),
+        };
+        let pipe = content.iter().position(|&b| b == b'|');
+        let target = &content[..pipe.unwrap_or(content.len())];
+        if !forced_visible && is_hidden_link(target, pipe.is_some()) {
+          // 파일·분류·언어 간 링크 — 캡션 안의 중첩 링크까지 통째로 제외
         } else {
-          let shown = content.iter().position(|&b| b == b'|').map_or(content, |pipe| &content[pipe + 1..]);
+          let shown = pipe.map_or(content, |p| &content[p + 1..]);
           // 표시 텍스트 안에 다시 마크업(중첩 링크, 굵게 등)이 있을 때만 재귀 처리
-          if shown.iter().any(|&b| matches!(b, b'[' | b'\'' | b'{' | b'<')) {
+          if shown.iter().any(|&b| matches!(b, b'[' | b'\'' | b'{' | b'<' | b'_')) {
             let mut inner = Vec::new();
             strip_wiki_markup_into(shown, &mut inner);
             out.extend_from_slice(&inner);
@@ -147,12 +267,20 @@ mod tests {
     String::from_utf8(out).unwrap()
   }
 
+  // 덤프 XML 원문(이스케이프된 상태)을 전체 파이프라인으로 정리
+  fn clean(xml: &str) -> String {
+    let mut c = ArticleCleaner::new();
+    String::from_utf8(c.clean(xml.as_bytes()).to_vec()).unwrap()
+  }
+
   #[test]
   fn ref_tags_are_removed_without_eating_text() {
     // 뒤쪽 self-closing ref 때문에 사이 본문이 사라지면 안 됨
     assert_eq!(strip("aa<ref>cite</ref>bb cc<ref name=\"x\"/>dd"), "aabb ccdd");
     assert_eq!(strip("x<ref name=a>c</ref>y"), "xy");
     assert_eq!(strip("p<references/>q"), "pq");
+    assert_eq!(strip("p<references>\n<ref name=a>c</ref>\n</references>q"), "pq");
+    assert_eq!(strip("x<REF>c</REF>y"), "xy");
   }
 
   #[test]
@@ -184,5 +312,55 @@ mod tests {
     let mut out = Vec::new();
     decode_html_entities_into(b"a&lt;b&gt;&amp;&#65;&#x42;&nbsp;&bogus;", &mut out);
     assert_eq!(out, b"a<b>&AB &bogus;");
+    // 위키 원문 단계에서는 모르는 이름 엔티티를 공백으로
+    decode_wiki_entities_into(b"1990&ndash;2000 &bogus; AT&T &#;", &mut out);
+    assert_eq!(out, b"1990 2000   AT&T &#;");
+  }
+
+  #[test]
+  fn wiki_source_entities_are_not_counted_as_letters() {
+    // 원문 &nbsp; 는 덤프에서 &amp;nbsp; 로 이중 이스케이프됨
+    assert_eq!(clean("10&amp;nbsp;km, 1990&amp;ndash;2000 &amp;minus;5"), "10 km, 1990 2000  5");
+    // 원문의 &lt; 는 글자 그대로의 < 이므로 태그로 오인해 뒤 본문을 지우면 안 됨
+    assert_eq!(clean("a &amp;lt;b and c&amp;gt; d"), "a <b and c> d");
+  }
+
+  #[test]
+  fn content_tags_are_dropped() {
+    assert_eq!(clean("where &lt;math&gt;\\frac{a}{b}&lt;/math&gt; holds"), "where  holds");
+    assert_eq!(strip("use <syntaxhighlight lang=\"python\">print(value)</syntaxhighlight> here"), "use  here");
+    assert_eq!(strip("a <code>foo_bar</code> b <pre>x</pre> c"), "a  b  c");
+    assert_eq!(strip("<gallery>\nFile:A.jpg|Caption one\n</gallery> after"), " after");
+    assert_eq!(strip("H<chem>H2O</chem> <ce>NaCl</ce>."), "H .");
+    assert_eq!(strip("x<math display=block/>y"), "xy");
+    // 이름이 비슷한 다른 태그(<code>와 <codex>, <ref>와 <refx>)는 내용을 남김
+    assert_eq!(strip("<codex>keep</codex> <refx>keep</refx>"), "keep keep");
+  }
+
+  #[test]
+  fn less_than_sign_is_not_a_tag() {
+    assert_eq!(strip("if x < 5 then the result is large <br> next"), "if x < 5 then the result is large  next");
+    assert_eq!(strip("a <b>bold</b> c"), "a bold c");
+    assert_eq!(strip("x <y\nz> w"), "x <y\nz> w");
+    assert_eq!(strip("a<nowiki/>b <nowiki>kept</nowiki>"), "ab kept");
+  }
+
+  #[test]
+  fn colon_links_keep_visible_text() {
+    assert_eq!(strip("[[Star Trek: The Next Generation]] aired"), "Star Trek: The Next Generation aired");
+    assert_eq!(strip("[[wikt:hello|hello]] there"), "hello there");
+    assert_eq!(strip("[[:Category:Foo|foo list]]"), "foo list");
+    assert_eq!(strip("a[[Category:People]]b[[image:x.png]]c[[ fr :Paris]]d[[zh-yue:X]]e"), "abcde");
+    assert_eq!(strip("[[Media:Sound.ogg|listen]]."), ".");
+  }
+
+  #[test]
+  fn magic_words_and_redirects() {
+    assert_eq!(strip("__NOTOC__ Text __TOC__ snake_case __x__"), " Text  snake_case __x__");
+    assert!(is_redirect(b"#REDIRECT [[Foo]]"));
+    assert!(is_redirect(b"#Redirect [[Foo]]"));
+    assert!(is_redirect(b"  #redirect[[Foo]]"));
+    assert!(!is_redirect(b"#Redir"));
+    assert!(!is_redirect(b"Normal text"));
   }
 }

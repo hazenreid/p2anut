@@ -183,8 +183,7 @@ fn analyze_wikipedia_dump(source: impl std::io::Read, limit: usize) -> anyhow::R
   let mut reader = Reader::from_reader(BufReader::with_capacity(1024 * 1024, decoder));
 
   let mut stats = corpus::FastCorpus::new();
-  let mut decode_buf: Vec<u8> = Vec::with_capacity(128 * 1024);
-  let mut strip_buf:  Vec<u8> = Vec::with_capacity(128 * 1024);
+  let mut cleaner = dump::ArticleCleaner::new();
   let mut buf = Vec::new();
   let mut in_text = false;
   let mut in_ns = false;
@@ -208,10 +207,8 @@ fn analyze_wikipedia_dump(source: impl std::io::Read, limit: usize) -> anyhow::R
           in_ns = false;
         } else if in_text {
           let raw = e.into_inner();
-          if !raw.starts_with(b"#REDIRECT") && !raw.starts_with(b"#redirect") {
-            dump::decode_html_entities_into(&raw, &mut decode_buf);
-            dump::strip_wiki_markup_into(&decode_buf, &mut strip_buf);
-            analyze_bytes(&strip_buf, &mut stats);
+          if !dump::is_redirect(&raw) {
+            analyze_bytes(cleaner.clean(&raw), &mut stats);
             article_count += 1;
             if article_count.is_multiple_of(10_000) {
               print!("\r[Wikipedia Dump] {article_count} articles          ");

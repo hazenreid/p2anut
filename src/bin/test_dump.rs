@@ -41,8 +41,7 @@ fn main() -> anyhow::Result<()> {
   let mut reader = Reader::from_reader(BufReader::new(decoder));
 
   let mut buf = Vec::new();
-  let mut decode_buf = Vec::new();
-  let mut strip_buf = Vec::new();
+  let mut cleaner = dump::ArticleCleaner::new();
   let mut in_text = false;
   let mut in_ns = false;
   let mut in_title = false;
@@ -67,7 +66,7 @@ fn main() -> anyhow::Result<()> {
           in_title = false;
         } else if in_text {
           let raw = e.into_inner();
-          if raw.starts_with(b"#REDIRECT") || raw.starts_with(b"#redirect") {
+          if dump::is_redirect(&raw) {
             in_text = false;
             buf.clear(); // continue로 루프 끝의 clear를 건너뛰면 buf가 계속 커짐
             continue;
@@ -78,9 +77,8 @@ fn main() -> anyhow::Result<()> {
           let raw_preview = String::from_utf8_lossy(&raw[..raw.len().min(1000)]); // 글자 중간에서 잘려도 표시되도록 lossy
           println!("--- RAW (first 1000 chars) ---\n{raw_preview}\n");
 
-          dump::decode_html_entities_into(&raw, &mut decode_buf);
-          dump::strip_wiki_markup_into(&decode_buf, &mut strip_buf);
-          let stripped_preview = String::from_utf8_lossy(&strip_buf[..strip_buf.len().min(2000)]);
+          let text = cleaner.clean(&raw);
+          let stripped_preview = String::from_utf8_lossy(&text[..text.len().min(2000)]);
           println!("--- STRIPPED (first 2000 chars) ---\n{stripped_preview}\n");
 
           break;

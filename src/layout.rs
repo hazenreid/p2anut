@@ -368,7 +368,7 @@ mod tests {
       l.calc_scores(&arrays, &precomp); l.calc_total_score(&norm);
       let share = l.left_usage as f32 / (l.left_usage + l.right_usage) as f32;
       // 양손 대칭 제약: 어느 쪽이든 45% 미만이면 페널티
-      assert_eq!(l.total <= PENALTY_SCORE, share < 0.45 || share > 0.55, "left share {share}");
+      assert_eq!(l.total <= PENALTY_SCORE, !(0.45..=0.55).contains(&share), "left share {share}");
       if l.total > PENALTY_SCORE {
         // 이전 PENALTY 값이 남아 있어도 다시 계산하면 풀려야 함
         let mut m = l;
