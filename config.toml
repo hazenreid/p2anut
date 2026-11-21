@@ -61,11 +61,8 @@ skip_scissors = 0.5
 # 사이에 한 번 치는 동안 손가락이 미리 움직일 수 있어 SFB보다 덜 불편하므로 낮춰 둠
 sfs = 0.5
 
-# 총점 계산 방식. "absolute": 모든 항목을 "검지 홈 행 키 한 번 = 1" 단위 비용으로 바꿔 그대로 더함 ([costs]).
-# "iqr": 예전 방식, 무작위 배열 대비 IQR 배수로 정규화해 [rates] 비중으로 더함 (비중이 직관과 다르게 작동해서 바꿈)
-score_normalization = "absolute"
-
 [costs]
+# 총점 = 모든 항목을 "검지 홈 행 키 한 번 = 1" 단위의 비용으로 바꿔 더한 값 (결과에 글자 100개당 비용으로 표시).
 # 대표 사건 한 번이 검지 홈 행 키를 몇 번 누르는 만큼인지. 나머지 사건은 [weights] 세부 배율로 자동 결정
 # 키 노력값 배율 (1 = 노력값 표 그대로)
 effort = 1.0
@@ -75,13 +72,6 @@ sfb = 2.5
 full_scissors = 8.0
 # 안쪽 롤 한 번으로 아끼는 양 (중지 홈 → 검지 홈). 바깥쪽 롤은 outroll 배, 리다이렉트는 redirect 배
 inroll = 3.0
-
-[rates]
-# score_normalization = "iqr"일 때만 씀
-effort = 0.13
-sfb = 0.12
-rolling = 0.30
-scissors = 0.45
 
 [sa]
 max_no_improve = 1500

@@ -34,31 +34,8 @@ impl Weights {
   pub fn roll_row(&self) -> f32 { self.roll_row.unwrap_or(self.row) }
 }
 
-// score_normalization = "iqr"일 때만 씀: 항목별 정규화 점수(무작위 배열 중앙값 대비 IQR 배수)에 곱하는 비중
-#[derive(Deserialize, Clone)]
-pub struct ScoreRates {
-  pub effort: f32,
-  pub sfb: f32,
-  pub rolling: f32,
-  pub scissors: f32,
-}
-
-impl Default for ScoreRates {
-  fn default() -> Self { Self { effort: 0.25, sfb: 0.25, rolling: 0.25, scissors: 0.25 } }
-}
-
-// 총점 계산 방식
-#[derive(Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum Normalization {
-  // 모든 항목을 "검지 홈 행 키 한 번 = 1" 단위의 비용으로 바꿔 그대로 더함 ([costs]). 총점 = -(글자당 비용)
-  #[default]
-  Absolute,
-  // 예전 방식: 무작위 배열 중앙값 대비 IQR 배수로 정규화해 [rates] 비중으로 더함
-  Iqr,
-}
-
-// score_normalization = "absolute"의 기준값. 대표 사건 한 번이 검지 홈 행 키 몇 번을 누르는 만큼인지.
+// 총점의 기준값: 모든 항목을 "검지 홈 행 키 한 번 = 1" 단위의 비용으로 바꿔 그대로 더함.
+// 대표 사건 한 번이 검지 홈 행 키 몇 번을 누르는 만큼인지.
 // 나머지 사건은 [weights]의 세부 배율(행·간격·방향·sfs·redirect 등)로 이 값에서 자동으로 정해짐
 #[derive(Deserialize, Clone, Debug)]
 pub struct Costs {
@@ -160,13 +137,9 @@ pub struct Config {
   #[serde(default)]
   pub center_rare: usize,
   pub weights: Weights,
-  // 총점 계산 방식: "absolute"(기본, [costs]) 또는 "iqr"(예전 방식, [rates])
-  #[serde(default)]
-  pub score_normalization: Normalization,
+  // 예전 설정의 score_normalization, [rates]는 더 이상 쓰지 않으며 남아 있어도 무시됨
   #[serde(default)]
   pub costs: Costs,
-  #[serde(default)]
-  pub rates: ScoreRates,
   pub sa: SaParams,
   pub ga: GaParams,
 }
@@ -185,11 +158,6 @@ fn url_file_name(url: &str) -> Option<&str> {
 }
 
 impl Config {
-  // absolute 방식이면 그 기준값, iqr 방식이면 None
-  pub fn abs_costs(&self) -> Option<&Costs> {
-    (self.score_normalization == Normalization::Absolute).then_some(&self.costs)
-  }
-
   // 비어 있지 않은 덤프 주소들 (적은 순서대로)
   pub fn dump_urls(&self) -> Vec<String> {
     let all = match &self.wikipedia_dump_url {
@@ -246,15 +214,8 @@ impl Config {
     if c.effort < 0.0 || c.sfb < 0.0 || c.full_scissors < 0.0 || c.inroll < 0.0 {
       anyhow::bail!("costs.effort, sfb, full_scissors, inroll must be non-negative");
     }
-    if self.score_normalization == Normalization::Absolute && c.effort + c.sfb + c.full_scissors + c.inroll <= 0.0 {
+    if c.effort + c.sfb + c.full_scissors + c.inroll <= 0.0 {
       anyhow::bail!("at least one cost must be > 0");
-    }
-    let r = &self.rates;
-    if r.effort < 0.0 || r.sfb < 0.0 || r.rolling < 0.0 || r.scissors < 0.0 {
-      anyhow::bail!("rates must be non-negative");
-    }
-    if r.effort + r.sfb + r.rolling + r.scissors <= 0.0 {
-      anyhow::bail!("at least one rate must be > 0");
     }
     let sa = &self.sa;
     if !(0.0..=0.5).contains(&self.min_hand_usage) {
@@ -315,6 +276,18 @@ mod tests {
     let c = config("wikipedia_dump_url = [\"https://a.org/d/x.xml.bz2\", \"https://b.org/d/y.xml.bz2\"]");
     assert!(c.validate().unwrap_err().to_string().contains("same file name"));
     assert!(config("wikipedia_dump_url = []").validate().is_err());
+  }
+
+  #[test]
+  fn old_scoring_settings_are_ignored() {
+    // 예전 설정 파일의 score_normalization, [rates]가 남아 있어도 읽히고 [costs] 기본값을 씀
+    let url = "wikipedia_dump_url = \"https://m.org/a.xml.bz2\"\n";
+    let mut table: toml::Table = toml::from_str(&std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/config.toml")).unwrap()).unwrap();
+    table.remove("costs");
+    table.extend(toml::from_str::<toml::Table>(&format!("{url}score_normalization = \"iqr\"\n[rates]\neffort = 0.2\nsfb = 0.2\nrolling = 0.3\nscissors = 0.3\n")).unwrap());
+    let c: Config = toml::Value::Table(table).try_into().unwrap();
+    c.validate().unwrap();
+    assert_eq!((c.costs.sfb, c.costs.full_scissors, c.costs.inroll, c.costs.effort), (2.5, 8.0, 2.0, 1.0));
   }
 
   #[test]

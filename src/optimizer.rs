@@ -769,13 +769,12 @@ mod tests {
 
   #[test]
   fn delta_moves_match_full_recompute() {
-    for space in [true, false] { for abs in [false, true] { check_delta_moves(space, abs); } }
+    for space in [true, false] { check_delta_moves(space); }
   }
 
-  fn check_delta_moves(space_on_grid: bool, absolute: bool) {
+  fn check_delta_moves(space_on_grid: bool) {
     let arrays = test_util::stats().to_arrays(space_on_grid);
-    let (precomp, mut norm) = test_util::precomp_norm_for(&arrays);
-    if absolute { norm.abs = Some(crate::layout::abs_weights(&arrays, &precomp, &crate::config::Costs::default())); }
+    let (precomp, norm) = test_util::precomp_norm_for(&arrays);
     let o = Optimizer::new(arrays, &precomp, &norm, 1, 1, test_util::sa(), test_util::ga(), 0);
     let mut ws = SaWorkspace::new(o.corpus_arrays.nz_bigrams.len(), o.corpus_arrays.nz_trigrams.len());
     let mut cur = o.make_scored_excl(&[]);

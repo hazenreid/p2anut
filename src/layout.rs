@@ -272,22 +272,16 @@ impl Layout {
     println!("left={left_pct:.1}%  right={right_pct:.1}%");
   }
 
-  // absolute 방식: 글자 100개당 항목별 비용과 무작위 배열 대비 변화율.
-  // iqr 방식: 항목별 정규화 점수 (무작위 배열 중앙값 대비 IQR 배수, 클수록 좋음). 총점은 이 값을 ±Z_CLAMP로 잘라 rates로 가중합한 것
+  // 글자 100개당 항목별 비용과 무작위 배열 대비 변화율
   pub fn print_goodness(&self, norm: &ScoreNorm) {
     if self.total <= PENALTY_SCORE {
       println!("DISQUALIFIED: one hand types less than min_hand_usage (scores below are for reference only)");
     }
-    if let Some(c) = norm.cost_breakdown(&self.score) {
-      let total = c.effort + c.sfb + c.rolling + c.scissors;
-      println!("cost per 100 letters (lower is better): total={total:.1}  effort={:.1}  sfb={:.1}  scissors={:.1}  rolling={:.1}", c.effort, c.sfb, c.scissors, c.rolling);
-      let v = norm.vs_random(&self.score);
-      println!("vs random median: effort {:+.1}%  sfb {:+.1}%  scissors {:+.1}%  rolling {:+.1}%", v.effort, v.sfb, v.scissors, v.rolling);
-      return;
-    }
-    let g = norm.goodness(&self.score);
-    let f = |v: f64| format!("{v:+.2}{}", if v.abs() >= crate::score::Z_CLAMP { " (clamped)" } else { "" });
-    println!("normalized (higher is better): effort={}  sfb={}  rolling={}  scissors={}", f(g.effort), f(g.sfb), f(g.rolling), f(g.scissors));
+    let c = norm.cost_breakdown(&self.score);
+    let total = c.effort + c.sfb + c.rolling + c.scissors;
+    println!("cost per 100 letters (lower is better): total={total:.1}  effort={:.1}  sfb={:.1}  scissors={:.1}  rolling={:.1}", c.effort, c.sfb, c.scissors, c.rolling);
+    let v = norm.vs_random(&self.score);
+    println!("vs random median: effort {:+.1}%  sfb {:+.1}%  scissors {:+.1}%  rolling {:+.1}%", v.effort, v.sfb, v.scissors, v.rolling);
   }
 
   pub fn calc_total_score(&mut self, norm: &ScoreNorm) {
@@ -331,9 +325,9 @@ pub fn load_results(path: &str) -> anyhow::Result<Vec<Layout>> {
   Ok(bincode::deserialize(&bytes)?)
 }
 
-// 정규화 기준: 무작위 배열 표본의 항목별 중앙값·IQR. 실제 탐색과 같은 공간에서 뽑도록 center_mask 제약을 지킴.
-// costs가 있으면 총점은 absolute 방식(대표 사건 비용으로 환산한 글자당 비용), 없으면 iqr 방식(rates). 표본은 둘 다 표시용으로 씀
-pub fn init_score_norm(arrays: &CorpusArrays, precomp: &Precomp, rates: &crate::config::ScoreRates, costs: Option<&crate::config::Costs>, center_mask: u32) -> ScoreNorm {
+// 총점 기준: [costs]의 대표 사건 비용을 환산한 배율. 무작위 배열 표본(center_mask 제약을 지킴)의 항목별 중앙값은
+// "무작위 배열 대비" 표시에만 씀
+pub fn init_score_norm(arrays: &CorpusArrays, precomp: &Precomp, costs: &crate::config::Costs, center_mask: u32) -> ScoreNorm {
   const N: usize = 10001;
   let mut effort_vals   = Vec::with_capacity(N);
   let mut sfb_vals      = Vec::with_capacity(N);
@@ -350,10 +344,10 @@ pub fn init_score_norm(arrays: &CorpusArrays, precomp: &Precomp, rates: &crate::
     scissors_vals.push(l.score.scissors as f32);
   }
 
-  let mut norm = ScoreNorm::from_samples(&effort_vals, &sfb_vals, &rolling_vals, &scissors_vals);
-  norm.set_rates(rates);
-  norm.abs = costs.map(|c| abs_weights(arrays, precomp, c));
-  norm
+  ScoreNorm {
+    median: ScoreNorm::medians(&effort_vals, &sfb_vals, &rolling_vals, &scissors_vals),
+    abs: abs_weights(arrays, precomp, costs),
+  }
 }
 
 // 대표 사건 (왼손): 검지 홈(1,3)·검지 윗줄(0,3)·중지 홈(1,2)·중지 아랫줄(2,2)
@@ -497,13 +491,13 @@ mod tests {
     let stats = test_util::stats();
     let arrays = stats.to_arrays(false);
     let (precomp, _) = test_util::precomp_norm_for(&arrays);
-    let norm = init_score_norm(&arrays, &precomp, &test_util::rates(), Some(&crate::config::Costs::default()), 0);
+    let norm = init_score_norm(&arrays, &precomp, &crate::config::Costs::default(), 0);
     let mut ls: Vec<Layout> = (0..30).map(|_| {
       let mut l = Layout::make_random(&arrays.keys, &[], 0);
       l.calc_scores(&arrays, &precomp); l.calc_total_score(&norm); l
     }).filter(|l| l.total > PENALTY_SCORE).collect();
     sort_layouts(&mut ls);
-    let cost = |l: &Layout| { let c = norm.cost_breakdown(&l.score).unwrap(); c.effort + c.sfb + c.rolling + c.scissors };
+    let cost = |l: &Layout| { let c = norm.cost_breakdown(&l.score); c.effort + c.sfb + c.rolling + c.scissors };
     assert!(ls.len() > 5);
     assert!(ls.windows(2).all(|w| cost(&w[0]) <= cost(&w[1]) + 1e-6));
     // 총점 = -(글자당 비용) × ABS_SCALE

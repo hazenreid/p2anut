@@ -1,5 +1,5 @@
 // 테스트 전용: 고정 영문 텍스트로 만든 작은 코퍼스와 기본 설정값
-use crate::config::{GaParams, SaParams, ScoreRates, Weights};
+use crate::config::{GaParams, SaParams, Weights};
 use crate::corpus::{CorpusArrays, CorpusStats, FastCorpus};
 use crate::precomp::Precomp;
 use crate::score::ScoreNorm;
@@ -22,10 +22,6 @@ pub fn weights() -> Weights {
   Weights { gap: 0.78, row: 0.97, center: 2.5, outroll: 0.70, redirect: 0.30, roll_row: None, half_scissors: 1.0, full_scissors_good: 0.5, skip_scissors: 0.5, sfs: 1.0 }
 }
 
-pub fn rates() -> ScoreRates {
-  ScoreRates { effort: 0.20, sfb: 0.25, rolling: 0.30, scissors: 0.25 }
-}
-
 pub fn sa() -> SaParams {
   SaParams { max_no_improve: 300, accept_start: 0.3, cooling: 0.98 }
 }
@@ -40,6 +36,6 @@ pub fn precomp_norm(stats: &CorpusStats) -> (Precomp, ScoreNorm) {
 
 pub fn precomp_norm_for(arrays: &CorpusArrays) -> (Precomp, ScoreNorm) {
   let precomp = Precomp::new(&arrays.freq, &weights(), 0.45);
-  let norm = crate::layout::init_score_norm(arrays, &precomp, &rates(), None, 0);
+  let norm = crate::layout::init_score_norm(arrays, &precomp, &crate::config::Costs::default(), 0);
   (precomp, norm)
 }
