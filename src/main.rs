@@ -25,11 +25,17 @@ use precomp::Precomp;
 use layout::{init_score_norm, save_results, load_results, sort_unique_layouts};
 use optimizer::Optimizer;
 
-// a-z만 셈. 공백은 엄지 키라 배치 대상이 아니므로 세지 않고, 문장부호·숫자·줄바꿈처럼 연속을 끊음
-// (단어 경계를 넘는 빅/트라이그램은 만들지 않음: "ab cd"에서 bc는 세지 않음)
+// a-z를 세고, 글자 사이에 공백이 정확히 하나 있으면 그 공백도 엄지 키(id 26)로 함께 셈.
+// 예: "the end"는 the, he_, e_e, _en, end. 문장부호·숫자·줄바꿈과 연속 공백은 연속을 끊고,
+// 그 옆의 공백은 세지 않음 (". The"의 공백, "a  b"의 공백). 공백 두 칸은 대개 마크업이 지워진 자리라 끊음.
+// 같은 글자 연속(ll)은 빅그램으로 세지 않고, 그 쌍이 낀 트라이그램도 세지 않음
+pub const SPACE_ID: u8 = 26;
+
 fn analyze_bytes(bytes: &[u8], stats: &mut corpus::FastCorpus) {
   let mut hist = [255u8; 3];
   let mut valid_len = 0usize;
+  // 글자 뒤에 공백 하나를 봤고, 다음이 글자인지 아직 모름
+  let mut pending_space = false;
 
   macro_rules! commit {
     ($id:expr) => {
@@ -48,9 +54,12 @@ fn analyze_bytes(bytes: &[u8], stats: &mut corpus::FastCorpus) {
   for &b in bytes {
     let lch = b.to_ascii_lowercase();
     if lch.is_ascii_lowercase() {
+      if pending_space { commit!(SPACE_ID); pending_space = false; }
       commit!(lch - b'a');
+    } else if b == b' ' && valid_len > 0 && !pending_space {
+      pending_space = true;
     } else {
-      valid_len = 0; hist = [255, 255, 255];
+      valid_len = 0; hist = [255, 255, 255]; pending_space = false;
     }
   }
 }
@@ -133,9 +142,16 @@ fn print_results(results: &[layout::Layout], norm: Option<&score::ScoreNorm>) {
 fn cmd_analyze(result_path: &Path, config: &Config, reset: bool) -> anyhow::Result<()> {
   let stats = load_or_analyze(result_path, config, reset)?;
   let used = for_scoring(stats.clone(), config);
-  println!("letters: {}, bigrams: {} (scoring uses {} at {}% coverage), trigrams: {} (scoring uses {} at {}% coverage)",
-    stats.letters.len(), stats.bigrams.len(), used.bigrams.len(), config.bigram_coverage * 100.0,
-    stats.trigrams.len(), used.trigrams.len(), config.trigram_coverage * 100.0);
+  // (글자끼리, 공백이 낀 것) 개수
+  let split = |s: &CorpusStats| {
+    let b = s.bigrams.keys().filter(|k| k.0 == ' ' || k.1 == ' ').count();
+    let t = s.trigrams.keys().filter(|k| k.0 == ' ' || k.1 == ' ' || k.2 == ' ').count();
+    ((s.bigrams.len() - b, b), (s.trigrams.len() - t, t))
+  };
+  let ((b, bs), (t, ts)) = split(&stats);
+  let ((ub, ubs), (ut, uts)) = split(&used);
+  println!("letters: {}, bigrams: {b} letters-only + {bs} with space (scoring uses {ub} + {ubs} at {}% coverage), trigrams: {t} + {ts} (scoring uses {ut} + {uts} at {}% coverage)",
+    stats.letters.keys().filter(|&&c| c != ' ').count(), config.bigram_coverage * 100.0, config.trigram_coverage * 100.0);
   stats.print();
   Ok(())
 }
@@ -345,15 +361,58 @@ mod tests {
     f.trigrams[(id(c[0]) * CHARS + id(c[1])) * CHARS + id(c[2])]
   }
 
+  const SP: char = ' ';
+  fn idc(c: char) -> usize { if c == SP { 26 } else { id(c) } }
+  fn bi_s(f: &FastCorpus, a: char, b: char) -> u64 { f.bigrams[idc(a) * CHARS + idc(b)] }
+  fn tri_s(f: &FastCorpus, a: char, b: char, c: char) -> u64 { f.trigrams[(idc(a) * CHARS + idc(b)) * CHARS + idc(c)] }
+
   #[test]
-  fn spaces_break_sequences_and_are_not_counted() {
+  fn one_space_between_letters_is_a_thumb_key() {
+    let f = run("ab Cd");
+    assert_eq!(f.letters[26], 1);
+    assert_eq!((bi_s(&f, 'b', SP), bi_s(&f, SP, 'c')), (1, 1));
+    assert_eq!((tri_s(&f, 'a', 'b', SP), tri_s(&f, 'b', SP, 'c'), tri_s(&f, SP, 'c', 'd')), (1, 1, 1));
+    // 공백을 건너뛴 글자끼리는 이어지지 않음, 대문자는 소문자로
+    assert_eq!((bi(&f, "bc"), tri(&f, "abc"), tri(&f, "bcd"), bi(&f, "cd")), (0, 0, 0, 1));
+    assert_eq!(f.letters.iter().take(26).sum::<u64>(), 4);
+    // 한 글자 단어: 공백-글자-공백 트라이그램
+    let f = run("x a y");
+    assert_eq!((tri_s(&f, 'x', SP, 'a'), tri_s(&f, SP, 'a', SP), tri_s(&f, 'a', SP, 'y')), (1, 1, 1));
+    assert_eq!(f.letters[26], 2);
+  }
+
+  #[test]
+  fn double_spaces_punctuation_and_edges_break_without_counting_space() {
+    for text in ["abc  De", "ab, cd", "ab ,cd", " ab ", "ab\tcd", "ab \ncd", "ab 1 cd"] {
+      let f = run(text);
+      assert_eq!(f.letters[26], 0, "{text:?}");
+      assert!(f.bigrams.iter().skip(26).step_by(CHARS).all(|&c| c == 0), "{text:?}");
+      assert!(f.bigrams[26 * CHARS..27 * CHARS].iter().all(|&c| c == 0), "{text:?}");
+    }
     let f = run("abc  De");
-    assert_eq!(f.letters[26], 0);
-    assert!(f.bigrams.iter().skip(26).step_by(CHARS).all(|&c| c == 0));
-    assert_eq!((bi(&f, "ab"), bi(&f, "bc"), tri(&f, "abc")), (1, 1, 1));
-    // 단어 경계를 넘지 않음, 대문자는 소문자로
-    assert_eq!((bi(&f, "cd"), tri(&f, "bcd"), bi(&f, "de")), (0, 0, 1));
-    assert_eq!(f.letters.iter().sum::<u64>(), 5);
+    assert_eq!((bi(&f, "ab"), bi(&f, "bc"), tri(&f, "abc"), bi(&f, "cd"), bi(&f, "de")), (1, 1, 1, 0, 1));
+  }
+
+  #[test]
+  fn repeated_letters_next_to_a_space_follow_the_old_rule() {
+    // ll은 세지 않고 ll이 낀 트라이그램도 세지 않음. l_, l_i는 셈
+    let f = run("all in");
+    assert_eq!((bi(&f, "ll"), tri(&f, "all"), tri_s(&f, 'l', 'l', SP)), (0, 0, 0));
+    assert_eq!((bi_s(&f, 'l', SP), tri_s(&f, 'l', SP, 'i'), tri_s(&f, SP, 'i', 'n')), (1, 1, 1));
+  }
+
+  #[test]
+  fn letter_only_counts_match_the_old_space_breaking_rule() {
+    let text = crate::test_util::TEXT.repeat(3) + " A few, odd  spaces; and an I here. x y z";
+    let new = run(&text);
+    // 예전 규칙: 공백도 연속을 끊음 (줄바꿈으로 바꿔 세면 같음)
+    let old = run(&text.replace(' ', "\n"));
+    for i in 0..26 { assert_eq!(new.letters[i], old.letters[i]); }
+    for a in 0..26 { for b in 0..26 {
+      assert_eq!(new.bigrams[a * CHARS + b], old.bigrams[a * CHARS + b]);
+      for c in 0..26 { let k = (a * CHARS + b) * CHARS + c; assert_eq!(new.trigrams[k], old.trigrams[k]); }
+    }}
+    assert!(new.letters[26] > 0 && old.letters[26] == 0);
   }
 
   // 문서 몇 개짜리 bz2 덤프

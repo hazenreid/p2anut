@@ -4,7 +4,7 @@ use crate::corpus::{CorpusArrays, CorpusStats, FastCorpus};
 use crate::precomp::Precomp;
 use crate::score::ScoreNorm;
 
-const TEXT: &str = "the quick brown fox jumps over the lazy dog while seven wizards quietly judge \
+pub const TEXT: &str = "the quick brown fox jumps over the lazy dog while seven wizards quietly judge \
 boxing matches in the old town square people often think about what happens when nobody is \
 watching and they write long letters to friends who live far away from the coast every morning \
 the baker opens his shop before sunrise and the smell of fresh bread fills the narrow streets \

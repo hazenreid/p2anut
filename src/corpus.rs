@@ -182,7 +182,8 @@ impl CorpusStats {
   }
 
   // 빈도 상위부터 누적 비율이 bigram/trigram 기준에 닿을 때까지만 보존 (1.0 = 전부)
-  // 최적화 속도를 위해 불러올 때 적용. 파일에는 전체 통계를 저장해서 기준을 바꿔도 재분석이 필요 없음
+  // 최적화 속도를 위해 불러올 때 적용. 파일에는 전체 통계를 저장해서 기준을 바꿔도 재분석이 필요 없음.
+  // 공백 없는 것과 공백이 낀 것은 따로 자름: 빈도가 큰 공백 n-gram이 섞여도 글자끼리의 n-gram은 예전과 똑같이 남음
   pub fn trim_by_coverage(&mut self, bigram: f64, trigram: f64) {
     fn trim<K: Eq + std::hash::Hash + Clone + Ord>(map: &mut HashMap<K, u64>, threshold: f64) {
       if map.is_empty() || threshold >= 1.0 { return; }
@@ -202,8 +203,15 @@ impl CorpusStats {
       items.truncate(keep_count);
       *map = items.into_iter().collect();
     }
-    trim(&mut self.bigrams,  bigram);
-    trim(&mut self.trigrams, trigram);
+    fn trim_split<K: Eq + std::hash::Hash + Clone + Ord>(map: &mut HashMap<K, u64>, threshold: f64, has_space: impl Fn(&K) -> bool) {
+      let (mut spaced, mut plain): (HashMap<K, u64>, HashMap<K, u64>) = map.drain().partition(|(k, _)| has_space(k));
+      trim(&mut plain, threshold);
+      trim(&mut spaced, threshold);
+      plain.extend(spaced);
+      *map = plain;
+    }
+    trim_split(&mut self.bigrams, bigram, |&(a, b)| a == ' ' || b == ' ');
+    trim_split(&mut self.trigrams, trigram, |&(a, b, c)| a == ' ' || b == ' ' || c == ' ');
   }
 
   // 파일 형식: CORPUS_MAGIC + 파일 형식 버전(u32) + 파서 버전(u32) + bincode(CorpusStats)
@@ -233,28 +241,35 @@ impl CorpusStats {
     Ok((bincode::deserialize(&bytes[header..])?, parser_version))
   }
 
+  // 글자 비율은 a-z끼리, 공백(엄지)은 글자 100개당 횟수로 따로. n-gram은 공백 없는 것과 공백이 낀 것을 따로 (공백은 _로 표시)
   pub fn print(&self) {
-    let total_letters: u64 = self.letters.values().sum();
-
-    let mut letters: Vec<_> = self.letters.iter().collect();
-    letters.sort_by(|a, b| b.1.cmp(a.1));
+    let show = |c: char| if c == ' ' { '_' } else { c };
+    let total_letters: u64 = self.letters.iter().filter(|(c, _)| **c != ' ').map(|(_, n)| n).sum();
+    let mut letters: Vec<_> = self.letters.iter().filter(|(c, _)| **c != ' ').collect();
+    letters.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
     println!("\n[Letters]");
     for (ch, count) in &letters {
       println!("  {}: {:>12}  ({:.2}%)", ch, count, **count as f64 / total_letters as f64 * 100.0);
     }
+    let spaces = self.letters.get(&' ').copied().unwrap_or(0);
+    println!("  space between letters (thumb): {spaces:>12}  ({:.1} per 100 letters)", spaces as f64 / total_letters.max(1) as f64 * 100.0);
 
-    let mut bigrams: Vec<_> = self.bigrams.iter().collect();
-    bigrams.sort_by(|a, b| b.1.cmp(a.1));
-    println!("\n[Bigrams] top 20");
-    for ((c1, c2), count) in bigrams.iter().take(20) {
-      println!("  {c1}{c2}: {count:>12}");
+    fn top<K: Ord + Clone>(map: &HashMap<K, u64>, pick: impl Fn(&K) -> bool) -> Vec<(K, u64)> {
+      let mut v: Vec<(K, u64)> = map.iter().filter(|(k, _)| pick(k)).map(|(k, &n)| (k.clone(), n)).collect();
+      v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+      v.truncate(20);
+      v
     }
-
-    let mut trigrams: Vec<_> = self.trigrams.iter().collect();
-    trigrams.sort_by(|a, b| b.1.cmp(a.1));
-    println!("\n[Trigrams] top 20");
-    for ((c1, c2, c3), count) in trigrams.iter().take(20) {
-      println!("  {c1}{c2}{c3}: {count:>12}");
+    for spaced in [false, true] {
+      let label = if spaced { "with space" } else { "letters only" };
+      println!("\n[Bigrams] top 20, {label}");
+      for ((c1, c2), count) in top(&self.bigrams, |&(a, b)| (a == ' ' || b == ' ') == spaced) {
+        println!("  {}{}: {count:>12}", show(c1), show(c2));
+      }
+      println!("\n[Trigrams] top 20, {label}");
+      for ((c1, c2, c3), count) in top(&self.trigrams, |&(a, b, c)| (a == ' ' || b == ' ' || c == ' ') == spaced) {
+        println!("  {}{}{}: {count:>12}", show(c1), show(c2), show(c3));
+      }
     }
   }
 }
@@ -278,6 +293,26 @@ mod tests {
       // 빈도 11인 b,d,f,h,j 먼저, 그다음 빈도 10은 키 순 a,c,e,g
       assert_eq!(tri, vec!['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'j']);
     }
+  }
+
+  #[test]
+  fn space_ngrams_do_not_change_letter_only_trimming() {
+    let with = crate::test_util::stats();
+    assert!(with.letters[&' '] > 0 && with.trigrams.keys().any(|k| k.1 == ' '));
+    let letters_only = |s: &CorpusStats| {
+      let mut o = s.clone();
+      o.bigrams.retain(|k, _| k.0 != ' ' && k.1 != ' ');
+      o.trigrams.retain(|k, _| k.0 != ' ' && k.1 != ' ' && k.2 != ' ');
+      o
+    };
+    let mut a = with.clone();
+    a.trim_by_coverage(0.95, 0.80);
+    let mut b = letters_only(&with);
+    b.trim_by_coverage(0.95, 0.80);
+    assert_eq!(letters_only(&a), b);
+    // 공백이 낀 것도 자기들끼리 같은 기준으로 잘림
+    assert!(a.trigrams.keys().any(|k| k.1 == ' '));
+    assert!(a.trigrams.len() < with.trigrams.len());
   }
 
   #[test]
@@ -313,7 +348,8 @@ mod tests {
     crate::analyze_bytes(b"hello world", &mut a);
     crate::analyze_bytes(b"other text", &mut b);
     let mut both = FastCorpus::new();
-    crate::analyze_bytes(b"hello world other text", &mut both);
+    // 줄바꿈은 연속을 끊으므로 두 덩어리를 따로 센 것과 같음
+    crate::analyze_bytes(b"hello world\nother text", &mut both);
     a.merge(&b);
     assert_eq!(a, both);
     let (l, bi, tri) = a.to_vecs();
