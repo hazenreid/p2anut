@@ -79,7 +79,7 @@ fn analyze_dump(result_path: &Path, config: &Config, corpus_path: &Path) -> anyh
       if urls.is_empty() { anyhow::bail!("dump file {} not found and wikipedia_dump_url is empty", dump_path.display()); }
       if let Some(dir) = dump_path.parent() { fs::create_dir_all(dir)?; }
       println!("[Download] -> {}", dump_path.display());
-      let opts = download::DownloadOpts { verify: config.wikipedia_verify, ..Default::default() };
+      let opts = download::DownloadOpts { verify: config.wikipedia_verify, parallel: config.wikipedia_parallel_download, ..Default::default() };
       download::download_dump(&download::http_client()?, &urls, &dump_path, &opts)?;
     }
     println!("[Wikipedia Dump] Reading {}", dump_path.display());
@@ -94,7 +94,7 @@ fn analyze_dump(result_path: &Path, config: &Config, corpus_path: &Path) -> anyh
     let client = download::http_client()?;
     let url = if urls.len() > 1 {
       let opts = download::DownloadOpts::default();
-      download::rank_mirrors(&client, &urls, opts.probe_bytes, opts.probe_timeout)?.remove(0).url
+      download::rank_mirrors(&client, &urls, &opts)?.remove(0).url
     } else { urls[0].clone() };
     println!("[Wikipedia Dump] Connecting to {url}");
     let response = client.get(&url).send()?.error_for_status()?;

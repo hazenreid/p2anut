@@ -181,6 +181,10 @@ pub struct Config {
   // 다 받은 덤프를 Wikimedia가 공개하는 SHA-1(<wiki>-<날짜>-sha1sums.txt)과 비교. 기본 true
   #[serde(default = "default_true")]
   pub wikipedia_verify: bool,
+  // 여러 미러에서 덩어리를 나눠 동시에 받기 (미러마다 연결 하나, 같은 서버의 여러 주소는 하나만,
+  // 가장 빠른 곳의 20% 미만은 예비). false면 가장 빠른 한 곳에서 받다가 계속 실패하면 다음 곳으로. 기본 true
+  #[serde(default = "default_true")]
+  pub wikipedia_parallel_download: bool,
   // 난수 시드. 없으면 실행마다 새로 뽑아 출력하므로, 그 값을 넣으면 같은 실행을 재현할 수 있음
   #[serde(default)]
   pub seed: Option<u64>,

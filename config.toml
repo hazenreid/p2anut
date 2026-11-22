@@ -9,8 +9,8 @@ hand_penalty = 1.0
 hand_hard_limit = 0.40
 min_home_diff = 2
 # 멀티스트림 덤프: 여러 스레드로 나눠 분석하고, 중단해도 이어서 분석 (일반 *-pages-articles.xml.bz2는 한 스레드, 이어서 분석 불가)
-# 주소를 여러 개 적으면 받기 전에 각 주소에서 앞부분 4MiB를 받아 속도를 재고 빠른 곳부터 씀.
-# 응답이 없거나 파일 크기가 다른 주소(그 날짜판이 없는 미러 등)는 빠지고, 받다가 계속 실패하면 다음 주소로 넘어가 이어받음.
+# 주소를 여러 개 적으면 받기 전에 하나씩 차례로 속도를 잼 (곳마다 최대 8초·32MiB, 연결 초반을 뺀 뒤쪽 절반의 속도).
+# 응답이 없거나 파일 크기가 다른 주소(그 날짜판이 없는 미러 등)는 빠짐. 받는 방식은 아래 wikipedia_parallel_download
 # 모든 주소는 파일 이름이 같아야 함. 날짜판을 바꿀 때는 모든 주소의 날짜(두 군데씩)를 함께 바꾸기.
 # 미러 목록: https://meta.wikimedia.org/wiki/Mirroring_Wikimedia_project_XML_dumps
 # (2026-11 확인: Scatter는 최신이 2026-05-01판, Clarkson은 enwiki가 없고, aerotechnet은 응답이 없어서 뺌. 미러는 최근 2~5개 날짜판만 보관)
@@ -31,6 +31,10 @@ wikipedia_dump_url = [
 ]
 # 덤프를 result_path 아래에 먼저 받아 두기 (약 27GB, 끊기면 이어받기). 파일 이름은 URL의 마지막 부분
 wikipedia_download = true
+# 여러 미러에서 8MiB 덩어리를 나눠 동시에 받기: 미러마다 연결 하나, 같은 서버(같은 IP)의 여러 주소는 하나만,
+# 가장 빠른 곳의 20% 미만은 예비 (쓰던 미러가 계속 실패하면 그 연결이 넘겨받음). 받은 덩어리는 <파일>.part.state에
+# 기록해서 중단해도 남은 것만 이어받음. false면 가장 빠른 한 곳에서 받다가 계속 실패하면 다음 곳으로
+wikipedia_parallel_download = true
 # 다 받은 덤프를 Wikimedia가 공개하는 SHA-1과 비교 (여러 미러에서 섞어 받을 수 있으므로 켜 두기를 권장).
 # 다르면 파일을 <이름>.bad로 옮기고 멈춤. 체크섬 파일을 못 구하면 경고만 하고 진행
 wikipedia_verify = true
