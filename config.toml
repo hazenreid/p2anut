@@ -13,13 +13,15 @@ min_home_diff = 2
 # 응답이 없거나 파일 크기가 다른 주소(그 날짜판이 없는 미러 등)는 빠지고, 받다가 계속 실패하면 다음 주소로 넘어가 이어받음.
 # 모든 주소는 파일 이름이 같아야 함. 날짜판을 바꿀 때는 모든 주소의 날짜(두 군데씩)를 함께 바꾸기.
 # 미러 목록: https://meta.wikimedia.org/wiki/Mirroring_Wikimedia_project_XML_dumps
-# (2026-11 확인: Scatter·Clarkson은 날짜판이 오래돼서, aerotechnet은 응답이 없어서 뺌. 미러는 최근 2~5개 날짜판만 보관)
+# (2026-11 확인: Scatter는 최신이 2026-05-01판, Clarkson은 enwiki가 없고, aerotechnet은 응답이 없어서 뺌. 미러는 최근 2~5개 날짜판만 보관)
 wikipedia_dump_url = [
   # 공식 (IP당 연결 수 제한)
   "https://dumps.wikimedia.org/enwiki/20261101/enwiki-20261101-pages-articles-multistream.xml.bz2",
   # 스웨덴 Umeå 대학 ACC (같은 기관의 두 주소)
   "https://mirror.accum.se/mirror/wikimedia.org/dumps/enwiki/20261101/enwiki-20261101-pages-articles-multistream.xml.bz2",
   "https://ftp.acc.umu.se/mirror/wikimedia.org/dumps/enwiki/20261101/enwiki-20261101-pages-articles-multistream.xml.bz2",
+  # Debian 서버의 Wikimedia 미러 (경로가 ACC와 같아 같은 기관의 세 번째 주소로 보임. 공식 목록에는 없음)
+  "https://cdimage.debian.org/mirror/wikimedia.org/dumps/enwiki/20261101/enwiki-20261101-pages-articles-multistream.xml.bz2",
   # 미국 Your.org
   "https://dumps.wikimedia.your.org/enwiki/20261101/enwiki-20261101-pages-articles-multistream.xml.bz2",
   # 브라질 C3SL
