@@ -189,6 +189,7 @@ fn cmd_score(result_path: &Path, config: &Config, files: &[String]) -> anyhow::R
   let corpus_path = result_path.join(&config.corpus_file);
   let full = load_corpus(&corpus_path)?;
   let full_arrays = full.to_arrays(false);
+  let windows = full.windows();
   let arrays = for_scoring(full, config).to_arrays(false);
   let precomp = Precomp::new(&arrays.freq, &config.weights, &config.costs, &config.effort, config.hand_hard_limit());
   let center_mask = arrays.rare_mask(config.center_rare);
@@ -216,7 +217,7 @@ fn cmd_score(result_path: &Path, config: &Config, files: &[String]) -> anyhow::R
     println!("[{name}]");
     l.print();
     l.print_goodness(&norm);
-    l.print_stats(&full_arrays, &precomp);
+    l.print_stats(&full_arrays, &precomp, &windows);
     println!();
   }
   Ok(())

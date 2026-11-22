@@ -13,6 +13,29 @@ pub struct CorpusArrays {
   pub bigram_offsets: [usize; CHARS + 1],
   pub trigram_flat: Vec<usize>,
   pub trigram_offsets: [usize; CHARS + 1],
+  // 공백 건너 쌍: "a _ c" 창 (a, c, 횟수). 엄지 자리는 고정이라 값이 a, c 위치로만 정해짐 (공백 너머 스킵그램·스킵 시저스).
+  // 공백을 그리드에 두는 예전 방식(include_space)에서는 비어 있음 (그때는 이 창이 nz_trigrams에 그대로 들어감)
+  pub nz_cross: Vec<(u8, u8, u64)>,
+  pub cross_flat: Vec<usize>,
+  pub cross_offsets: [usize; CHARS + 1],
+}
+
+// 글자 id마다 그 글자가 들어간 n-gram 번호 목록을 이어 붙인 것과 시작 위치 (최적화의 점수 차이 계산용)
+fn index_lists(members: impl Iterator<Item = Vec<u8>>) -> (Vec<usize>, [usize; CHARS + 1]) {
+  let mut lists: Vec<Vec<usize>> = vec![Vec::new(); CHARS];
+  for (i, mut ids) in members.enumerate() {
+    ids.sort_unstable();
+    ids.dedup();
+    for id in ids { lists[id as usize].push(i); }
+  }
+  let mut flat = Vec::new();
+  let mut offsets = [0usize; CHARS + 1];
+  for id in 0..CHARS {
+    offsets[id] = flat.len();
+    flat.extend_from_slice(&lists[id]);
+  }
+  offsets[CHARS] = flat.len();
+  (flat, offsets)
 }
 
 impl CorpusArrays {
@@ -149,36 +172,26 @@ impl CorpusStats {
       .collect();
     nz_trigrams.sort_unstable_by_key(|&(a, b, c, _)| (a, b, c));
 
-    let mut bg_lists: Vec<Vec<usize>> = vec![Vec::new(); CHARS];
-    for (i, &(a, b, _)) in nz_bigrams.iter().enumerate() {
-      let (a, b) = (a as usize, b as usize);
-      bg_lists[a].push(i);
-      if b != a { bg_lists[b].push(i); }
-    }
-    let mut bigram_flat = Vec::new();
-    let mut bigram_offsets = [0usize; CHARS + 1];
-    for id in 0..CHARS {
-      bigram_offsets[id] = bigram_flat.len();
-      bigram_flat.extend_from_slice(&bg_lists[id]);
-    }
-    bigram_offsets[CHARS] = bigram_flat.len();
+    let (bigram_flat, bigram_offsets) = index_lists(nz_bigrams.iter().map(|&(a, b, _)| vec![a, b]));
+    let (trigram_flat, trigram_offsets) = index_lists(nz_trigrams.iter().map(|&(a, b, c, _)| vec![a, b, c]));
 
-    let mut tg_lists: Vec<Vec<usize>> = vec![Vec::new(); CHARS];
-    for (i, &(a, b, c, _)) in nz_trigrams.iter().enumerate() {
-      let (a, b, c) = (a as usize, b as usize, c as usize);
-      tg_lists[a].push(i);
-      if b != a { tg_lists[b].push(i); }
-      if c != a && c != b { tg_lists[c].push(i); }
-    }
-    let mut trigram_flat = Vec::new();
-    let mut trigram_offsets = [0usize; CHARS + 1];
-    for id in 0..CHARS {
-      trigram_offsets[id] = trigram_flat.len();
-      trigram_flat.extend_from_slice(&tg_lists[id]);
-    }
-    trigram_offsets[CHARS] = trigram_flat.len();
+    let letter = |ch: char| ch.is_ascii_lowercase().then(|| ch as u8 - b'a');
+    let mut nz_cross: Vec<(u8, u8, u64)> = if include_space { Vec::new() } else {
+      self.trigrams.iter()
+        .filter(|&(&(_, b, _), _)| b == ' ')
+        .filter_map(|(&(a, _, c), &cnt)| Some((letter(a)?, letter(c)?, cnt)))
+        .collect()
+    };
+    nz_cross.sort_unstable_by_key(|&(a, c, _)| (a, c));
+    let (cross_flat, cross_offsets) = index_lists(nz_cross.iter().map(|&(a, c, _)| vec![a, c]));
 
-    CorpusArrays { keys, freq, nz_bigrams, nz_trigrams, bigram_flat, bigram_offsets, trigram_flat, trigram_offsets }
+    CorpusArrays { keys, freq, nz_bigrams, nz_trigrams, bigram_flat, bigram_offsets, trigram_flat, trigram_offsets, nz_cross, cross_flat, cross_offsets }
+  }
+
+  // 모든 트라이그램 창 (공백 = id 26). 결과의 창 기준 통계 표시용
+  pub fn windows(&self) -> Vec<(u8, u8, u8, u64)> {
+    let id = |ch: char| if ch == ' ' { Some(26u8) } else { ch.is_ascii_lowercase().then(|| ch as u8 - b'a') };
+    self.trigrams.iter().filter_map(|(&(a, b, c), &n)| Some((id(a)?, id(b)?, id(c)?, n))).collect()
   }
 
   // 빈도 상위부터 누적 비율이 bigram/trigram 기준에 닿을 때까지만 보존 (1.0 = 전부)
@@ -355,6 +368,26 @@ mod tests {
     let (l, bi, tri) = a.to_vecs();
     assert_eq!(FastCorpus::from_vecs(&l, &bi, &tri).unwrap(), a);
     assert!(FastCorpus::from_vecs(&l[..3], &bi, &tri).is_err());
+  }
+
+  #[test]
+  fn cross_space_pairs_come_from_letter_space_letter_windows() {
+    let mut f = FastCorpus::new();
+    crate::analyze_bytes(b"the end. a cat at sea", &mut f);
+    let a = f.into_stats().to_arrays(false);
+    let id = |c: char| c as u8 - b'a';
+    let get = |x: char, y: char| a.nz_cross.iter().find(|&&(p, q, _)| (p, q) == (id(x), id(y))).map_or(0, |e| e.2);
+    // e_e, a_c, t_a(cat at), t_s(at sea). 마침표 뒤 공백은 세지 않음 (d_a 없음)
+    assert_eq!((get('e', 'e'), get('a', 'c'), get('t', 'a'), get('t', 's'), get('d', 'a')), (1, 1, 1, 1, 0));
+    assert_eq!(a.nz_cross.len(), 4);
+    // 점수 차이 계산용 목록: 글자마다 그 글자가 든 쌍 (같은 글자 쌍은 한 번만)
+    let list = |c: char| &a.cross_flat[a.cross_offsets[id(c) as usize]..a.cross_offsets[id(c) as usize + 1]];
+    assert_eq!(list('e').len(), 1);
+    assert_eq!(list('t').len(), 2);
+    assert!(list('z').is_empty());
+    // 공백을 그리드에 두는 예전 방식에서는 비어 있음
+    assert!(crate::test_util::stats().to_arrays(true).nz_cross.is_empty());
+    assert!(!crate::test_util::stats().to_arrays(false).nz_cross.is_empty());
   }
 
   #[test]

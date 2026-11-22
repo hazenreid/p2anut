@@ -49,9 +49,35 @@ pub struct TrigramEntry {
   pub skip_scissors_base: f32,
 }
 
+// 공백 건너 쌍 "a _ c" (엄지가 가운데): 1·3번 키만 보는 공백 너머 스킵그램·스킵 시저스. 트라이그램과 같은 식
+#[derive(Clone, Copy, Default)]
+pub struct CrossEntry {
+  pub sfs_base: f32,
+  pub skip_scissors_base: f32,
+}
+
+// 트라이그램 창 하나의 분류 (결과 통계 표시용). 엄지(공백)는 어느 손도 아니라 교차를 만듦
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Window {
+  Alternate,
+  Roll2In,
+  Roll2Out,
+  Roll3In,
+  Roll3Out,
+  Redirect,
+  BadRedirect,
+  // 같은 손 연속에 SFB·시저스·가운데 열이 끼어 롤로 치지 않는 창
+  SameHandOther,
+}
+
+// 손가락 번호 (왼손 검지 1 … 새끼 4, 오른손 검지 5 … 새끼 8). 가운데 열은 검지
+pub fn finger(p: usize) -> u8 { FINGER_GRID[p / COLS][p % COLS] }
+fn is_left(p: usize) -> bool { p % COLS < COLS / 2 }
+
 pub struct Precomp {
   pub bigrams: Box<[BigramEntry]>,
   pub trigrams: Box<[TrigramEntry]>,
+  pub cross: Box<[CrossEntry]>,
   pub alphabet_effort: Box<[f64]>, // Flattened: [pos_idx * CHARS + char_idx]
   pub min_hand_usage: f32,
 }
@@ -98,6 +124,27 @@ impl Precomp {
       (e1 + e2 + e3) / m
     };
     let ref_redirect = redirect_shape(REF_RING_HOME, REF_INDEX_HOME, REF_MIDDLE_HOME);
+    // 1·3번 키만 보는 값 (가운데가 다른 손가락이거나 엄지일 때 공통)
+    // 스킵 풀 시저스: 같은 손 인접 손가락, 두 줄 차이. 센터는 바이그램에서 이미 감점하므로 제외.
+    // 방향은 풀 시저스와 같음 (긴 손가락이 아래면 1.0, 위면 full_scissors_good)
+    let skip_scissors_of = |p1: usize, p3: usize| {
+      let (r1, f1, e1, ic1, il1) = pos_info[p1]; let (r3, f3, e3, ic3, il3) = pos_info[p3];
+      if il1 == il3 && f1.abs_diff(f3) == 1 && r1.abs_diff(r3) == 2 && !ic1 && !ic3 {
+        let dir = if long_finger_lower(f1, r1, f3, r3) { 1.0 } else { weights.full_scissors_good };
+        weights.skip_scissors * dir * (e1 + e3) * (1.0 + weights.row * 2.0)
+      } else { 0.0 }
+    };
+    // 같은 손가락 스킵그램 (같은 키면 sfs_same_key)
+    let sfs_of = |p1: usize, p3: usize| {
+      let (r1, f1, e1, ic1, _) = pos_info[p1]; let (r3, f3, e3, ic3, _) = pos_info[p3];
+      if f1 != f3 { return 0.0; }
+      let w = if p1 == p3 { weights.sfs_same_key() } else { weights.sfs };
+      w * (e1 + e3) * (if ic1 || ic3 { weights.center } else { 1.0 }) * (1.0 + weights.row * r1.abs_diff(r3) as f32)
+    };
+    let mut cross = vec![CrossEntry::default(); N * N].into_boxed_slice();
+    for p1 in 0..N { for p3 in 0..N {
+      cross[p1 * N + p3] = CrossEntry { sfs_base: sfs_of(p1, p3), skip_scissors_base: skip_scissors_of(p1, p3) };
+    }}
 
     for p1 in 0..N {
       let (r1, f1, e1, ic1, il1) = pos_info[p1];
@@ -140,19 +187,9 @@ impl Precomp {
           if p2 == p3 { continue; }
           let (r3, f3, e3, ic3, il3) = pos_info[p3];
           let entry = &mut trigrams[p1 * N * N + p2 * N + p3];
-          // 스킵 풀 시저스: 가운데 키와 상관없이 1·3번만 봄. 센터는 바이그램에서 이미 감점하므로 제외.
-          // 방향은 풀 시저스와 같음 (긴 손가락이 아래면 1.0, 위면 full_scissors_good)
-          if il1 == il3 && f1.abs_diff(f3) == 1 && r1.abs_diff(r3) == 2 && !ic1 && !ic3 {
-            let dir = if long_finger_lower(f1, r1, f3, r3) { 1.0 } else { weights.full_scissors_good };
-            entry.skip_scissors_base = weights.skip_scissors * dir * (e1 + e3) * (1.0 + weights.row * 2.0);
-          }
+          entry.skip_scissors_base = skip_scissors_of(p1, p3);
           if f1 == f3 && f1 != f2 {
-            let row_dist = r1.abs_diff(r3);
-            let row_mult = 1.0 + (weights.row * row_dist as f32);
-            let w = if p1 == p3 { weights.sfs_same_key() } else { weights.sfs };
-            entry.sfs_base = w * (e1 + e3)
-              * (if ic1 || ic3 { weights.center } else { 1.0 })
-              * row_mult;
+            entry.sfs_base = sfs_of(p1, p3);
           } else if il1 == il2 && il2 == il3 {
             let is_center = ic1 || ic2 || ic3;
             let row_delta1 = r1.abs_diff(r2); let row_delta2 = r2.abs_diff(r3);
@@ -177,7 +214,7 @@ impl Precomp {
         }
       }
     }
-    Self { bigrams, trigrams, alphabet_effort, min_hand_usage }
+    Self { bigrams, trigrams, cross, alphabet_effort, min_hand_usage }
   }
 
   // 왼손·오른손 중 한쪽이라도 min_hand_usage(여기서는 실격 기준 hand_hard_limit을 받음) 미만이면 실격
@@ -190,6 +227,29 @@ impl Precomp {
   #[inline] pub fn bigram(&self, p1: usize, p2: usize) -> &BigramEntry { &self.bigrams[p1 * N + p2] }
   #[inline] pub fn trigram(&self, p1: usize, p2: usize, p3: usize) -> &TrigramEntry { &self.trigrams[p1 * N * N + p2 * N + p3] }
   #[inline] pub fn effort(&self, pos: usize, char_idx: usize) -> f64 { self.alphabet_effort[pos * crate::layout::CHARS + char_idx] }
+  #[inline] pub fn cross(&self, p1: usize, p3: usize) -> &CrossEntry { &self.cross[p1 * N + p3] }
+
+  // 창 하나의 분류. None = 엄지(공백). 같은 손 두 키가 붙어 있고 나머지 하나가 다른 손이나 엄지면 2키 롤,
+  // 같은 손 세 키면 세 글자 롤·리다이렉트 (점수 계산과 같은 기준: 롤 값이 있는 쌍·창만 롤)
+  pub fn window(&self, p1: Option<usize>, p2: Option<usize>, p3: Option<usize>) -> Window {
+    let same = |a: Option<usize>, b: Option<usize>| matches!((a, b), (Some(a), Some(b)) if is_left(a) == is_left(b));
+    let pair = |a: usize, b: usize| {
+      if self.bigram(a, b).rolling_base <= 0.0 { Window::SameHandOther }
+      else if finger(a) > finger(b) { Window::Roll2In } else { Window::Roll2Out }
+    };
+    match (p1, p2, p3) {
+      (Some(a), Some(b), Some(c)) if same(p1, p2) && same(p2, p3) => {
+        let t = self.trigram(a, b, c).roll_base;
+        if t > 0.0 { if finger(a) > finger(b) { Window::Roll3In } else { Window::Roll3Out } }
+        else if t < 0.0 {
+          if [a, b, c].iter().any(|&p| matches!(finger(p), 1 | 5)) { Window::Redirect } else { Window::BadRedirect }
+        } else { Window::SameHandOther }
+      }
+      (Some(a), Some(b), _) if same(p1, p2) => pair(a, b),
+      (_, Some(b), Some(c)) if same(p2, p3) => pair(b, c),
+      _ => Window::Alternate,
+    }
+  }
 }
 
 #[cfg(test)]
@@ -290,6 +350,52 @@ mod tests {
     // 세 글자 롤 전체는 두 쌍의 롤 + 추가 보너스 (리다이렉트처럼 되돌리지 않음)
     let total = whole3(&pc, REF_RING_HOME, REF_MIDDLE_HOME, REF_INDEX_HOME);
     assert!(total > pc.bigram(REF_RING_HOME, REF_MIDDLE_HOME).rolling_base + pc.bigram(REF_MIDDLE_HOME, REF_INDEX_HOME).rolling_base);
+  }
+
+  #[test]
+  fn cross_space_values_match_the_trigram_formulas() {
+    let mut w = crate::test_util::weights();
+    w.sfs = 0.5;
+    w.sfs_same_key = Some(0.0);
+    let pc = Precomp::new(&[1; crate::layout::CHARS], &w, &Costs::default(), &EffortGrid::default(), 0.45);
+    let mut sfs = 0;
+    let mut skip = 0;
+    for p1 in 0..N { for p3 in 0..N {
+      let x = pc.cross(p1, p3);
+      if p1 == p3 { assert_eq!(x.sfs_base, 0.0); continue; } // 같은 키(e_e)는 sfs_same_key = 0
+      // 가운데를 다른 손 키로 둔 트라이그램과 같은 값
+      let other = if is_left(p1) { COLS + 7 } else { COLS + 2 };
+      let t = pc.trigram(p1, other, p3);
+      assert_eq!((x.sfs_base, x.skip_scissors_base), (t.sfs_base, t.skip_scissors_base), "{p1} _ {p3}");
+      if x.sfs_base > 0.0 { sfs += 1; }
+      if x.skip_scissors_base > 0.0 { skip += 1; }
+    }}
+    assert!(sfs > 0 && skip > 0);
+    // 같은 키 배율을 주면 같은 키도 감점
+    w.sfs_same_key = Some(0.5);
+    let pc = Precomp::new(&[1; crate::layout::CHARS], &w, &Costs::default(), &EffortGrid::default(), 0.45);
+    assert!(pc.cross(COLS + 2, COLS + 2).sfs_base > 0.0);
+  }
+
+  #[test]
+  fn windows_are_classified_like_the_score() {
+    let pc = Precomp::new(&[1; crate::layout::CHARS], &crate::test_util::weights(), &Costs::default(), &EffortGrid::default(), 0.45);
+    let (pinky, ring, middle, index) = (Some(COLS), Some(REF_RING_HOME), Some(REF_MIDDLE_HOME), Some(REF_INDEX_HOME));
+    let right = Some(COLS + 7);
+    // 엄지나 다른 손이 끼면 교차 / 2키 롤
+    assert_eq!(pc.window(middle, None, index), Window::Alternate);
+    assert_eq!(pc.window(middle, right, index), Window::Alternate);
+    assert_eq!(pc.window(None, middle, None), Window::Alternate);
+    assert_eq!(pc.window(middle, index, None), Window::Roll2In);
+    assert_eq!(pc.window(right, index, middle), Window::Roll2Out);
+    // 같은 손 세 키
+    assert_eq!(pc.window(ring, middle, index), Window::Roll3In);
+    assert_eq!(pc.window(index, middle, ring), Window::Roll3Out);
+    assert_eq!(pc.window(ring, index, middle), Window::Redirect);
+    assert_eq!(pc.window(ring, pinky, middle), Window::BadRedirect);
+    // SFB(검지 홈 → 검지 윗줄)가 낀 창은 롤이 아님
+    assert_eq!(pc.window(index, Some(3), None), Window::SameHandOther);
+    assert_eq!(pc.window(middle, index, Some(3)), Window::SameHandOther);
   }
 
   #[test]

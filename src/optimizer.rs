@@ -46,18 +46,22 @@ fn task_seeds(n: usize) -> Vec<u64> {
 struct SaWorkspace {
   aff_bg_indices: Vec<usize>,
   aff_tg_indices: Vec<usize>,
+  aff_cross_indices: Vec<usize>,
   bg_mark: Vec<u32>,
   tg_mark: Vec<u32>,
+  cross_mark: Vec<u32>,
   session: u32,
 }
 
 impl SaWorkspace {
-  fn new(bg_len: usize, tg_len: usize) -> Self {
+  fn new(arrays: &CorpusArrays) -> Self {
     Self {
       aff_bg_indices: Vec::with_capacity(1024),
       aff_tg_indices: Vec::with_capacity(8192),
-      bg_mark: vec![0; bg_len],
-      tg_mark: vec![0; tg_len],
+      aff_cross_indices: Vec::with_capacity(1024),
+      bg_mark: vec![0; arrays.nz_bigrams.len()],
+      tg_mark: vec![0; arrays.nz_trigrams.len()],
+      cross_mark: vec![0; arrays.nz_cross.len()],
       session: 0,
     }
   }
@@ -272,7 +276,7 @@ impl<'a> Optimizer<'a> {
     let mut cur = base;
     let mut best = base;
     let mut no_improve = 0usize;
-    let mut ws = SaWorkspace::new(self.corpus_arrays.nz_bigrams.len(), self.corpus_arrays.nz_trigrams.len());
+    let mut ws = SaWorkspace::new(&self.corpus_arrays);
     let mut run_descent = true;
     let mut temp = -1.0f64; // 음수 = 아직 미정
     let mut t0 = 0.0f64;
@@ -374,7 +378,7 @@ impl<'a> Optimizer<'a> {
     const N: usize = ROWS * COLS;
     let rescore = |l: &mut Layout| { l.calc_scores(&self.corpus_arrays, self.precomp); l.calc_total_score(self.norm); };
     rescore(&mut cur);
-    let mut ws = SaWorkspace::new(self.corpus_arrays.nz_bigrams.len(), self.corpus_arrays.nz_trigrams.len());
+    let mut ws = SaWorkspace::new(&self.corpus_arrays);
     for _ in 0..MAX_STEPS {
       let mut best = cur;
       for &(p1, p2) in &PAIR_LIST {
@@ -503,10 +507,12 @@ impl<'a> Optimizer<'a> {
       new_tg.2 += cnt as f64 * f64::from(e.skip_scissors_base);
     }
 
+    let (old_cs, old_ck) = self.cross_sum(&base.pos, ws);
+    let (new_cs, new_ck) = self.cross_sum(&temp_pos, ws);
     let pe = part_effort   + new_effort;
-    let ps = part_sfb      + new_bg.0 + new_tg.0;
+    let ps = part_sfb      + new_bg.0 + new_tg.0 + new_cs - old_cs;
     let pr = part_rolling  + new_bg.1 + new_tg.1;
-    let pc = part_scissors + new_bg.2 + new_tg.2;
+    let pc = part_scissors + new_bg.2 + new_tg.2 + new_ck - old_ck;
     result.total = self.norm.total_score(pe, ps, pr, pc, cur_l, cur_r);
     result.score = Score { effort: pe, sfb: ps, rolling: pr, scissors: pc };
     result.slots[p1] = v2;
@@ -602,10 +608,12 @@ impl<'a> Optimizer<'a> {
       new_tg.2 += cnt as f64 * f64::from(e.skip_scissors_base);
     }
 
+    let (old_cs, old_ck) = self.cross_sum(&base.pos, ws);
+    let (new_cs, new_ck) = self.cross_sum(&temp_pos, ws);
     let pe = part_effort   + new_effort;
-    let ps = part_sfb      + new_bg.0 + new_tg.0;
+    let ps = part_sfb      + new_bg.0 + new_tg.0 + new_cs - old_cs;
     let pr = part_rolling  + new_bg.1 + new_tg.1;
-    let pc = part_scissors + new_bg.2 + new_tg.2;
+    let pc = part_scissors + new_bg.2 + new_tg.2 + new_ck - old_ck;
     result.total = self.norm.total_score(pe, ps, pr, pc, cur_l, cur_r);
     result.score = Score { effort: pe, sfb: ps, rolling: pr, scissors: pc };
     result.slots[p1] = n1; result.slots[p2] = n2; result.slots[p3] = n3;
@@ -727,10 +735,12 @@ impl<'a> Optimizer<'a> {
       new_troll += cnt as f64 * f64::from(e.roll_base);
       new_tsciss += cnt as f64 * f64::from(e.skip_scissors_base);
     }
+    let (old_cs, old_ck) = self.cross_sum(&base.pos, ws);
+    let (new_cs, new_ck) = self.cross_sum(&temp_pos, ws);
     let pe = part_effort + new_effort;
-    let ps = part_sfb   + new_sfb + new_sfs;
+    let ps = part_sfb   + new_sfb + new_sfs + new_cs - old_cs;
     let pr = part_rolling + new_roll + new_troll;
-    let pc = part_scissors + new_sciss + new_tsciss;
+    let pc = part_scissors + new_sciss + new_tsciss + new_ck - old_ck;
     result.total = self.norm.total_score(pe, ps, pr, pc, cur_l, cur_r);
     result.score = Score { effort: pe, sfb: ps, rolling: pr, scissors: pc };
 
@@ -747,8 +757,9 @@ impl<'a> Optimizer<'a> {
   fn collect_affected(&self, ids: &[u8], ws: &mut SaWorkspace) {
     ws.aff_bg_indices.clear();
     ws.aff_tg_indices.clear();
+    ws.aff_cross_indices.clear();
     ws.session = ws.session.wrapping_add(1);
-    if ws.session == 0 { ws.bg_mark.fill(0); ws.tg_mark.fill(0); ws.session = 1; }
+    if ws.session == 0 { ws.bg_mark.fill(0); ws.tg_mark.fill(0); ws.cross_mark.fill(0); ws.session = 1; }
     let sess = ws.session;
     for &id in ids {
       if id < CHARS as u8 {
@@ -762,8 +773,25 @@ impl<'a> Optimizer<'a> {
         for &idx in &self.corpus_arrays.trigram_flat[start_t..end_t] {
           if ws.tg_mark[idx] != sess { ws.tg_mark[idx] = sess; ws.aff_tg_indices.push(idx); }
         }
+        let start_c = self.corpus_arrays.cross_offsets[id as usize];
+        let end_c   = self.corpus_arrays.cross_offsets[id as usize + 1];
+        for &idx in &self.corpus_arrays.cross_flat[start_c..end_c] {
+          if ws.cross_mark[idx] != sess { ws.cross_mark[idx] = sess; ws.aff_cross_indices.push(idx); }
+        }
       }
     }
+  }
+
+  // 영향받는 공백 건너 쌍들의 (스킵그램, 스킵 시저스) 합. pos: 글자 → 칸
+  fn cross_sum(&self, pos: &[u8; CHARS], ws: &SaWorkspace) -> (f64, f64) {
+    let mut sum = (0.0f64, 0.0f64);
+    for &idx in &ws.aff_cross_indices {
+      let (a, c, cnt) = self.corpus_arrays.nz_cross[idx];
+      let e = self.precomp.cross(pos[a as usize] as usize, pos[c as usize] as usize);
+      sum.0 += cnt as f64 * f64::from(e.sfs_base);
+      sum.1 += cnt as f64 * f64::from(e.skip_scissors_base);
+    }
+    sum
   }
 
   fn violates_hand_usage(&self, cur_l: u64, cur_r: u64) -> bool {
@@ -809,7 +837,7 @@ mod tests {
     let arrays = test_util::stats().to_arrays(space_on_grid);
     let (precomp, norm) = if soft_hand { test_util::precomp_norm_soft_hand(&arrays) } else { test_util::precomp_norm_for(&arrays) };
     let o = Optimizer::new(arrays, &precomp, &norm, 1, 1, test_util::sa(), test_util::ga(), 0);
-    let mut ws = SaWorkspace::new(o.corpus_arrays.nz_bigrams.len(), o.corpus_arrays.nz_trigrams.len());
+    let mut ws = SaWorkspace::new(&o.corpus_arrays);
     let mut cur = o.make_scored_excl(&[]);
     let mut checked = 0;
     for step in 0..3000 {
@@ -838,7 +866,7 @@ mod tests {
     let mask = arrays.rare_mask(4);
     assert_eq!(mask.count_ones(), 4);
     let o = Optimizer::new(arrays, &precomp, &norm, 1, 1, test_util::sa(), test_util::ga(), mask);
-    let mut ws = SaWorkspace::new(o.corpus_arrays.nz_bigrams.len(), o.corpus_arrays.nz_trigrams.len());
+    let mut ws = SaWorkspace::new(&o.corpus_arrays);
     let mut cur = o.make_scored_excl(&[]);
     assert!(cur.center_ok(mask));
     for _ in 0..2000 {
@@ -861,7 +889,7 @@ mod tests {
     let (precomp, norm) = test_util::precomp_norm_soft_hand(&arrays);
     let mask = arrays.rare_mask(4);
     let o = Optimizer::new(arrays, &precomp, &norm, 1, 1, test_util::sa(), test_util::ga(), mask);
-    let mut ws = SaWorkspace::new(o.corpus_arrays.nz_bigrams.len(), o.corpus_arrays.nz_trigrams.len());
+    let mut ws = SaWorkspace::new(&o.corpus_arrays);
     for _ in 0..3 {
       let start = o.make_scored_excl(&[]);
       let out = o.descend(start);

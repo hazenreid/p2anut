@@ -143,8 +143,9 @@ impl Layout {
     Ok(l)
   }
 
-  // 사람이 읽기 쉬운 비율 지표 (corpus 기준, 0~100%). 분모는 각각 전체 글자·바이그램·트라이그램 빈도
-  pub fn print_stats(&self, corpus: &CorpusArrays, precomp: &Precomp) {
+  // 사람이 읽기 쉬운 비율 지표 (corpus 기준, 0~100%). 분모는 각각 전체 글자·바이그램·트라이그램 빈도.
+  // windows: 공백(id 26, 엄지)까지 포함한 모든 트라이그램 창 (CorpusStats::windows). 커뮤니티 분석기식 창 기준 통계에 씀
+  pub fn print_stats(&self, corpus: &CorpusArrays, precomp: &Precomp, windows: &[(u8, u8, u8, u64)]) {
     let pct = |a: u64, b: u64| if b == 0 { 0.0 } else { a as f64 * 100.0 / b as f64 };
     let mut rows = [0u64; ROWS];
     let mut letters = 0u64;
@@ -174,6 +175,38 @@ impl Layout {
     println!("rows: top={:.1}%  home={:.1}%  bottom={:.1}%", pct(rows[0], letters), pct(rows[1], letters), pct(rows[2], letters));
     println!("bigrams: sfb={:.2}%  roll={:.1}%  scissors={:.2}%   trigrams: skipgram(other key)={:.2}%  one-hand-roll={:.1}%  redirect={:.2}%",
       pct(sfb, bg), pct(roll, bg), pct(sciss, bg), pct(sfs, tg), pct(roll3, tg), pct(redirect, tg));
+    self.print_window_stats(precomp, windows);
+  }
+
+  // 창 기준 통계: 세 키(공백은 엄지)를 하나씩 밀며 나눈 분류의 비율. 스킵그램은 다른 분류와 겹쳐서 따로 셈
+  fn print_window_stats(&self, precomp: &Precomp, windows: &[(u8, u8, u8, u64)]) {
+    use crate::precomp::{finger, Window};
+    let at = |id: u8| -> Option<Option<usize>> {
+      if id as usize == crate::SPACE_ID as usize { return Some(None); } // 엄지
+      let p = self.pos[id as usize];
+      (p != EMPTY).then_some(Some(p as usize))
+    };
+    let kinds = [Window::Alternate, Window::Roll2In, Window::Roll2Out, Window::Roll3In, Window::Roll3Out,
+      Window::Redirect, Window::BadRedirect, Window::SameHandOther];
+    let mut counts = [0u64; 8];
+    let (mut total, mut skip, mut skip_space) = (0u64, 0u64, 0u64);
+    for &(a, b, c, n) in windows {
+      let (Some(p1), Some(p2), Some(p3)) = (at(a), at(b), at(c)) else { continue };
+      total += n;
+      let w = precomp.window(p1, p2, p3);
+      counts[kinds.iter().position(|&k| k == w).unwrap_or(0)] += n;
+      // 1·3번이 같은 손가락의 다른 키 (가운데는 다른 손가락이나 엄지)
+      if let (Some(x), Some(z)) = (p1, p3) {
+        if x != z && finger(x) == finger(z) && p2.is_none_or(|y| finger(y) != finger(x)) {
+          skip += n;
+          if p2.is_none() { skip_space += n; }
+        }
+      }
+    }
+    let pct = |a: u64| if total == 0 { 0.0 } else { a as f64 * 100.0 / total as f64 };
+    println!("windows (space = thumb): alternate={:.1}%  roll2 in={:.1}% out={:.1}%  roll3 in={:.1}% out={:.1}%  redirect={:.2}%  bad-redirect={:.2}%  same-hand-other={:.1}%  skipgram={:.2}% (across space {:.2}%)",
+      pct(counts[0]), pct(counts[1]), pct(counts[2]), pct(counts[3]), pct(counts[4]), pct(counts[5]), pct(counts[6]), pct(counts[7]),
+      pct(skip), pct(skip_space));
   }
 
   pub fn key_count(&self) -> usize {
@@ -229,6 +262,16 @@ impl Layout {
       let e = precomp.trigram(p1 as usize, p2 as usize, p3 as usize);
       sfb      += count as f64 * f64::from(e.sfs_base);
       rolling  += count as f64 * f64::from(e.roll_base);
+      scissors += count as f64 * f64::from(e.skip_scissors_base);
+    }
+
+    // 공백 건너 쌍 (a _ c): 공백 너머 스킵그램·스킵 시저스
+    for &(a, c, count) in &corpus.nz_cross {
+      let p1 = self.pos[a as usize];
+      let p3 = self.pos[c as usize];
+      if p1 == EMPTY || p3 == EMPTY { continue; }
+      let e = precomp.cross(p1 as usize, p3 as usize);
+      sfb      += count as f64 * f64::from(e.sfs_base);
       scissors += count as f64 * f64::from(e.skip_scissors_base);
     }
 
@@ -442,6 +485,30 @@ mod tests {
     assert_eq!(home_diff(0b0011, 0b1100), 2);
     assert!(is_home_distinct(0b0011, &[0b1100, 0b0111_0000], 2));
     assert!(!is_home_distinct(0b0011, &[0b0110], 2));
+  }
+
+  #[test]
+  fn cross_space_pairs_add_to_sfb_and_scissors_only() {
+    let arrays = test_util::stats().to_arrays(false);
+    assert!(!arrays.nz_cross.is_empty());
+    let mut no_cross = arrays.clone();
+    no_cross.nz_cross.clear();
+    let (precomp, _) = test_util::precomp_norm_for(&arrays);
+    for _ in 0..20 {
+      let base = Layout::make_random(&arrays.keys, &[], 0);
+      let (mut with, mut without) = (base, base);
+      with.calc_scores(&arrays, &precomp);
+      without.calc_scores(&no_cross, &precomp);
+      let (mut s, mut k) = (0.0, 0.0);
+      for &(a, c, n) in &arrays.nz_cross {
+        let e = precomp.cross(base.pos[a as usize] as usize, base.pos[c as usize] as usize);
+        s += n as f64 * f64::from(e.sfs_base);
+        k += n as f64 * f64::from(e.skip_scissors_base);
+      }
+      assert!((with.score.sfb - without.score.sfb - s).abs() < 1e-6);
+      assert!((with.score.scissors - without.score.scissors - k).abs() < 1e-6);
+      assert_eq!((with.score.effort, with.score.rolling), (without.score.effort, without.score.rolling));
+    }
   }
 
   #[test]
