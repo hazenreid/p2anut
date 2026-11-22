@@ -10,6 +10,10 @@ const N: usize = ROWS * COLS; // 30
 const REF_RING_HOME: usize = COLS + 1;
 const REF_MIDDLE_HOME: usize = COLS + 2;
 const REF_INDEX_HOME: usize = COLS + 3;
+// [costs]의 lateral(중지 홈 → 가운데 홈)과 full_scissors(중지 아랫줄 → 검지 윗줄)가 가리키는 사건
+const REF_CENTER_HOME: usize = COLS + 4;
+const REF_MIDDLE_BOTTOM: usize = 2 * COLS + 2;
+const REF_INDEX_TOP: usize = 3;
 
 // 손가락 길이 순위 (클수록 김): 중지 > 약지 > 검지 > 새끼. FINGER_GRID 번호(1~8)로 인덱스
 const FINGER_LEN: [u8; 9] = [0, 2, 4, 3, 1, 2, 4, 3, 1];
@@ -124,6 +128,24 @@ impl Precomp {
       (e1 + e2 + e3) / m
     };
     let ref_redirect = redirect_shape(REF_RING_HOME, REF_INDEX_HOME, REF_MIDDLE_HOME);
+    // 가운데 열로 뻗기(LSB): 가운데 열 키와 같은 손 다른 손가락 키. scissors 항목에 시저스 단위로 들어감.
+    // lateral이 있으면 대표 LSB 한 번이 비용 lateral이 되도록 맞춤 (다른 LSB는 노력값 합 × 행 배율에 비례, center 배율은 안 씀).
+    // 없으면 예전 동작: 노력값 합 × center × 행 배율을 그대로 시저스 단위로
+    let lsb_shape = |p1: usize, p2: usize| {
+      let (r1, _, e1, _, _) = pos_info[p1]; let (r2, _, e2, _, _) = pos_info[p2];
+      (e1 + e2) * (1.0 + weights.row * r1.abs_diff(r2) as f32)
+    };
+    let lsb_scale = match costs.lateral {
+      None => weights.center,
+      Some(lateral) => {
+        // 시저스 단위: 대표 풀 시저스(나쁜 방향) 한 번 = costs.full_scissors
+        let (rb, _, eb, _, _) = pos_info[REF_MIDDLE_BOTTOM]; let (rt, _, et, _, _) = pos_info[REF_INDEX_TOP];
+        let full_ref = (eb + et) * (1.0 + weights.row * rb.abs_diff(rt) as f32);
+        let per_unit = if full_ref > 0.0 { costs.full_scissors / full_ref } else { 0.0 };
+        let ref_shape = lsb_shape(REF_MIDDLE_HOME, REF_CENTER_HOME);
+        if per_unit > 0.0 && ref_shape > 0.0 { lateral / per_unit / ref_shape } else { 0.0 }
+      }
+    };
     // 1·3번 키만 보는 값 (가운데가 다른 손가락이거나 엄지일 때 공통)
     // 스킵 풀 시저스: 같은 손 인접 손가락, 두 줄 차이. 센터는 바이그램에서 이미 감점하므로 제외.
     // 방향은 풀 시저스와 같음 (긴 손가락이 아래면 1.0, 위면 full_scissors_good)
@@ -162,8 +184,7 @@ impl Precomp {
         } else {
           let gap_dist = f1.abs_diff(f2);
           if is_center {
-            let row_mult = 1.0 + (weights.row * row_dist as f32);
-            entry.scissors_base = effort_sum * weights.center * row_mult;
+            entry.scissors_base = lsb_scale * lsb_shape(p1, p2);
           } else if gap_dist <= 1 && row_dist == 2 {
             // 풀 시저스: 긴 손가락이 아래면 1.0, 위(편한 방향)면 full_scissors_good 배
             let dir = if long_finger_lower(f1, r1, f2, r2) { 1.0 } else { weights.full_scissors_good };
@@ -396,6 +417,33 @@ mod tests {
     // SFB(검지 홈 → 검지 윗줄)가 낀 창은 롤이 아님
     assert_eq!(pc.window(index, Some(3), None), Window::SameHandOther);
     assert_eq!(pc.window(middle, index, Some(3)), Window::SameHandOther);
+  }
+
+  #[test]
+  fn lateral_sets_the_cost_of_one_center_stretch() {
+    let w = crate::test_util::weights();
+    let costs = Costs { lateral: Some(9.6), ..Costs::default() };
+    let pc = Precomp::new(&[1; crate::layout::CHARS], &w, &costs, &EffortGrid::default(), 0.45);
+    // 시저스 단위 → 비용: 대표 풀 시저스 = costs.full_scissors
+    let per_unit = f64::from(costs.full_scissors) / f64::from(pc.bigram(REF_MIDDLE_BOTTOM, REF_INDEX_TOP).scissors_base);
+    let cost = |p1: usize, p2: usize| f64::from(pc.bigram(p1, p2).scissors_base) * per_unit;
+    // 대표 LSB(중지 홈 → 가운데 홈) 한 번 = lateral
+    assert!((cost(REF_MIDDLE_HOME, REF_CENTER_HOME) - 9.6).abs() < 1e-4);
+    assert!((cost(REF_CENTER_HOME, REF_MIDDLE_HOME) - 9.6).abs() < 1e-4);
+    // 다른 LSB는 노력값 합 × 행 배율에 비례 (새끼 홈 1.6 → 가운데 홈 3.0, 중지 홈 1.0 → 가운데 윗줄 3.5)
+    assert!((cost(COLS, REF_CENTER_HOME) - 9.6 * 4.6 / 4.0).abs() < 1e-4);
+    assert!((cost(REF_MIDDLE_HOME, 4) - 9.6 * 4.5 * (1.0 + f64::from(w.row)) / 4.0).abs() < 1e-3);
+    // 가운데 SFB(검지 홈 → 가운데 홈)는 SFB 식 그대로, center 배율은 LSB에 영향 없음
+    let none = Precomp::new(&[1; crate::layout::CHARS], &w, &Costs::default(), &EffortGrid::default(), 0.45);
+    assert_eq!(pc.bigram(REF_INDEX_HOME, REF_CENTER_HOME).sfb_base, none.bigram(REF_INDEX_HOME, REF_CENTER_HOME).sfb_base);
+    let w2 = Weights { center: 5.0, ..w.clone() };
+    let pc2 = Precomp::new(&[1; crate::layout::CHARS], &w2, &costs, &EffortGrid::default(), 0.45);
+    assert_eq!(pc2.bigram(REF_MIDDLE_HOME, REF_CENTER_HOME).scissors_base, pc.bigram(REF_MIDDLE_HOME, REF_CENTER_HOME).scissors_base);
+    // 없으면 예전 동작: 노력값 합 × center × 행 배율 (시저스 단위)
+    let old = none.bigram(REF_MIDDLE_HOME, REF_CENTER_HOME).scissors_base;
+    assert!((old - 4.0 * w.center).abs() < 1e-5, "{old}");
+    // 다른 손 키는 LSB가 아님
+    assert_eq!(pc.bigram(COLS + 7, REF_CENTER_HOME).scissors_base, 0.0);
   }
 
   #[test]

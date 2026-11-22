@@ -63,6 +63,11 @@ pub struct Costs {
   // 이 비용만 매김. 노력값이 큰 키·손가락 간격·행 이동이 있을수록 커지고, 검지가 없으면 bad_redirect 배
   #[serde(default = "default_cost_redirect")]
   pub redirect: f32,
+  // 가운데 열로 옆으로 뻗기(LSB) 한 번 (중지 홈 → 가운데 홈). 같은 손에서 가운데 열 키와 다른 손가락 키를 잇따라 치는 경우.
+  // 다른 LSB는 두 키의 노력값 합과 행 이동(1 + row × 행 차이)에 비례. scissors 항목에 들어감.
+  // 없으면 예전 동작 (노력값 합 × center × 행 배율을 시저스와 같은 단위로: 지금 설정이면 약 12.6)
+  #[serde(default)]
+  pub lateral: Option<f32>,
 }
 
 fn default_cost_sfb() -> f32 { 2.5 }
@@ -107,7 +112,7 @@ impl Default for Costs {
   fn default() -> Self {
     Self {
       effort: 1.0, sfb: default_cost_sfb(), full_scissors: default_cost_full_scissors(),
-      inroll: default_cost_inroll(), redirect: default_cost_redirect(),
+      inroll: default_cost_inroll(), redirect: default_cost_redirect(), lateral: None,
     }
   }
 }
@@ -268,8 +273,12 @@ impl Config {
       anyhow::bail!("weights.gap, row, roll_row, center, outroll, half_scissors, full_scissors_good, skip_scissors, sfs, sfs_same_key, bad_redirect must be non-negative");
     }
     let c = &self.costs;
-    if c.effort < 0.0 || c.sfb < 0.0 || c.full_scissors < 0.0 || c.inroll < 0.0 || c.redirect < 0.0 {
-      anyhow::bail!("costs.effort, sfb, full_scissors, inroll, redirect must be non-negative");
+    if c.effort < 0.0 || c.sfb < 0.0 || c.full_scissors < 0.0 || c.inroll < 0.0 || c.redirect < 0.0 || c.lateral.is_some_and(|v| v < 0.0) {
+      anyhow::bail!("costs.effort, sfb, full_scissors, inroll, redirect, lateral must be non-negative");
+    }
+    // LSB는 scissors 항목에 시저스 단위로 들어가므로, 시저스 기준값이 0이면 lateral을 나타낼 수 없음
+    if c.lateral.is_some_and(|v| v > 0.0) && c.full_scissors <= 0.0 {
+      anyhow::bail!("costs.lateral needs costs.full_scissors > 0 (lateral stretches are counted in scissors units)");
     }
     if self.effort.grid().iter().flatten().any(|&v| !(v > 0.0 && v.is_finite())) {
       anyhow::bail!("every [effort] value must be a positive number");
@@ -414,5 +423,20 @@ mod tests {
     assert!(config(&format!("{url}trigram_coverage = 0.0")).validate().is_err());
     assert!(config(&format!("{url}bigram_coverage = 1.0")).validate().is_ok());
     assert!(config("wikipedia_dump_url = \"https://m.org/\"\nwikipedia_download = true").validate().is_err());
+  }
+
+  #[test]
+  fn lateral_needs_a_scissors_unit() {
+    let mut c = config("wikipedia_dump_url = \"https://m.org/a.xml.bz2\"\n");
+    c.costs.lateral = Some(9.6);
+    c.validate().unwrap();
+    c.costs.full_scissors = 0.0;
+    assert!(c.validate().unwrap_err().to_string().contains("costs.lateral"));
+    c.costs.lateral = Some(0.0);
+    c.validate().unwrap();
+    c.costs.lateral = Some(-1.0);
+    assert!(c.validate().is_err());
+    c.costs.lateral = None;
+    c.validate().unwrap();
   }
 }

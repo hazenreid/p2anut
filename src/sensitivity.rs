@@ -56,6 +56,9 @@ pub fn knobs() -> Vec<Knob> {
     field!("costs.full_scissors", costs.full_scissors),
     field!("costs.inroll", costs.inroll),
     field!("costs.redirect", costs.redirect),
+    // 설정에 없으면(예전 동작) 흔들 값이 없음
+    Knob { name: "costs.lateral", show: |c| c.costs.lateral.map_or("(unset)".to_string(), |v| format!("{v:.2}")),
+      apply: |c, f| c.costs.lateral = c.costs.lateral.map(|v| v * f) },
     field!("weights.outroll", weights.outroll),
     field!("weights.bad_redirect", weights.bad_redirect),
     // 같은 키 스킵그램 배율이 비어 있으면 sfs를 따라가므로, sfs만 흔들리게 지금 값으로 고정

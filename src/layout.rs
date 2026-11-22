@@ -152,15 +152,19 @@ impl Layout {
     for (p, &id) in self.slots.iter().enumerate() {
       if id < CHARS as u8 { rows[p / COLS] += corpus.freq[id as usize]; letters += corpus.freq[id as usize]; }
     }
-    let (mut bg, mut sfb, mut roll, mut sciss) = (0u64, 0u64, 0u64, 0u64);
+    let (mut bg, mut sfb, mut roll, mut sciss, mut lsb) = (0u64, 0u64, 0u64, 0u64, 0u64);
     for &(a, b, n) in &corpus.nz_bigrams {
       let (p1, p2) = (self.pos[a as usize], self.pos[b as usize]);
       bg += n;
       if p1 == EMPTY || p2 == EMPTY { continue; }
-      let e = precomp.bigram(p1 as usize, p2 as usize);
+      let (p1, p2) = (p1 as usize, p2 as usize);
+      let e = precomp.bigram(p1, p2);
       if e.sfb_base > 0.0 { sfb += n; }
       if e.rolling_base > 0.0 { roll += n; }
       if e.scissors_base > 0.0 { sciss += n; }
+      // 가운데 열로 뻗기(LSB): 가운데 열 키 + 같은 손 다른 손가락 (scissors에 포함)
+      let same_hand = (p1 % COLS < COLS / 2) == (p2 % COLS < COLS / 2);
+      if same_hand && (is_center_slot(p1) || is_center_slot(p2)) && crate::precomp::finger(p1) != crate::precomp::finger(p2) { lsb += n; }
     }
     let (mut tg, mut sfs, mut redirect, mut roll3) = (0u64, 0u64, 0u64, 0u64);
     for &(a, b, c, n) in &corpus.nz_trigrams {
@@ -173,8 +177,8 @@ impl Layout {
       if e.roll_base > 0.0 { roll3 += n; } // 세 글자 롤
     }
     println!("rows: top={:.1}%  home={:.1}%  bottom={:.1}%", pct(rows[0], letters), pct(rows[1], letters), pct(rows[2], letters));
-    println!("bigrams: sfb={:.2}%  roll={:.1}%  scissors={:.2}%   trigrams: skipgram(other key)={:.2}%  one-hand-roll={:.1}%  redirect={:.2}%",
-      pct(sfb, bg), pct(roll, bg), pct(sciss, bg), pct(sfs, tg), pct(roll3, tg), pct(redirect, tg));
+    println!("bigrams: sfb={:.2}%  roll={:.1}%  scissors={:.2}% (lateral stretch {:.2}%)   trigrams: skipgram(other key)={:.2}%  one-hand-roll={:.1}%  redirect={:.2}%",
+      pct(sfb, bg), pct(roll, bg), pct(sciss, bg), pct(lsb, bg), pct(sfs, tg), pct(roll3, tg), pct(redirect, tg));
     self.print_window_stats(precomp, windows);
   }
 
