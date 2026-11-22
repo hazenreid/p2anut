@@ -70,6 +70,39 @@ fn default_cost_full_scissors() -> f32 { 8.0 }
 fn default_cost_inroll() -> f32 { 2.0 }
 fn default_cost_redirect() -> f32 { 1.0 }
 
+// 키마다의 노력값 (검지 홈 = 1.0 기준). 왼손 새끼 → 약지 → 중지 → 검지 → 가운데 열 순서로 5칸씩, 오른손은 좌우 대칭.
+// 노력값 비용(글자 빈도 × 노력값)에 쓰이고, SFB·시저스·롤·리다이렉트의 크기도 키 노력값 합에 따라 달라짐.
+// [costs]의 대표 사건 비용은 이 표를 바꿔도 그대로 유지됨 (대표 사건 기준으로 다시 맞추므로)
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+pub struct EffortGrid {
+  #[serde(default = "default_effort_top")]
+  pub top: [f32; 5],
+  #[serde(default = "default_effort_home")]
+  pub home: [f32; 5],
+  #[serde(default = "default_effort_bottom")]
+  pub bottom: [f32; 5],
+}
+
+fn default_effort_top() -> [f32; 5] { [2.4, 1.3, 1.1, 1.3, 3.5] }
+fn default_effort_home() -> [f32; 5] { [1.6, 1.1, 1.0, 1.0, 3.0] }
+fn default_effort_bottom() -> [f32; 5] { [2.2, 1.5, 1.3, 1.1, 4.0] }
+
+impl Default for EffortGrid {
+  fn default() -> Self { Self { top: default_effort_top(), home: default_effort_home(), bottom: default_effort_bottom() } }
+}
+
+impl EffortGrid {
+  // 3행 × 10열 전체 (오른손은 왼손을 좌우로 뒤집어 채움)
+  pub fn grid(&self) -> [[f32; 10]; 3] {
+    let row = |half: &[f32; 5]| {
+      let mut r = [0.0f32; 10];
+      for (c, &v) in half.iter().enumerate() { r[c] = v; r[9 - c] = v; }
+      r
+    };
+    [row(&self.top), row(&self.home), row(&self.bottom)]
+  }
+}
+
 impl Default for Costs {
   fn default() -> Self {
     Self {
@@ -163,6 +196,8 @@ pub struct Config {
   // 예전 설정의 score_normalization, [rates]는 더 이상 쓰지 않으며 남아 있어도 무시됨
   #[serde(default)]
   pub costs: Costs,
+  #[serde(default)]
+  pub effort: EffortGrid,
   pub sa: SaParams,
   pub ga: GaParams,
 }
@@ -235,6 +270,9 @@ impl Config {
     let c = &self.costs;
     if c.effort < 0.0 || c.sfb < 0.0 || c.full_scissors < 0.0 || c.inroll < 0.0 || c.redirect < 0.0 {
       anyhow::bail!("costs.effort, sfb, full_scissors, inroll, redirect must be non-negative");
+    }
+    if self.effort.grid().iter().flatten().any(|&v| !(v > 0.0 && v.is_finite())) {
+      anyhow::bail!("every [effort] value must be a positive number");
     }
     if c.effort + c.sfb + c.full_scissors + c.inroll <= 0.0 {
       anyhow::bail!("at least one cost must be > 0");
@@ -338,6 +376,33 @@ mod tests {
     // 실격 기준은 감점 기준보다 클 수 없음
     assert!(with("hand_hard_limit = 0.47").validate().is_err());
     assert!(with("hand_penalty = -1.0").validate().is_err());
+  }
+
+  #[test]
+  fn effort_grid_defaults_and_mirroring() {
+    // 기본값은 예전 고정값과 같음
+    let g = EffortGrid::default().grid();
+    assert_eq!(g, [
+      [2.4, 1.3, 1.1, 1.3, 3.5, 3.5, 1.3, 1.1, 1.3, 2.4],
+      [1.6, 1.1, 1.0, 1.0, 3.0, 3.0, 1.0, 1.0, 1.1, 1.6],
+      [2.2, 1.5, 1.3, 1.1, 4.0, 4.0, 1.1, 1.3, 1.5, 2.2],
+    ]);
+    // [effort]가 없으면 기본값, 일부 행만 있으면 그 행만 바뀜
+    let base: toml::Table = toml::from_str(&std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/config.toml")).unwrap()).unwrap();
+    let with = |extra: &str| -> Result<Config, toml::de::Error> {
+      let mut t = base.clone();
+      t.remove("effort");
+      t.extend(toml::from_str::<toml::Table>(extra).unwrap());
+      toml::Value::Table(t).try_into()
+    };
+    assert_eq!(with("").unwrap().effort, EffortGrid::default());
+    let c = with("[effort]\nhome = [2.0, 1.2, 1.0, 1.0, 2.5]").unwrap();
+    assert_eq!(c.effort.grid()[1], [2.0, 1.2, 1.0, 1.0, 2.5, 2.5, 1.0, 1.0, 1.2, 2.0]);
+    assert_eq!(c.effort.top, default_effort_top());
+    c.validate().unwrap();
+    // 0 이하는 거부, 5칸이 아니면 읽기 실패
+    assert!(with("[effort]\ntop = [2.4, 1.3, 0.0, 1.3, 3.5]").unwrap().validate().is_err());
+    assert!(with("[effort]\ntop = [2.4, 1.3, 1.1, 1.3]").is_err());
   }
 
   #[test]

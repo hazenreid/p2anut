@@ -153,7 +153,7 @@ fn cmd_results(result_path: &Path, config: &Config) -> anyhow::Result<()> {
     let stats = for_scoring(load_corpus(&corpus_path)?, config);
     let arrays = stats.to_arrays(false);
     results.retain(|l| l.key_count() == arrays.keys.len());
-    let precomp = Precomp::new(&arrays.freq, &config.weights, &config.costs, config.hand_hard_limit());
+    let precomp = Precomp::new(&arrays.freq, &config.weights, &config.costs, &config.effort, config.hand_hard_limit());
     let n = init_score_norm(&arrays, &precomp, &config.costs, score::HandRule::from_config(config), arrays.rare_mask(config.center_rare));
     for l in &mut results {
       l.calc_scores(&arrays, &precomp);
@@ -173,7 +173,7 @@ fn cmd_score(result_path: &Path, config: &Config, files: &[String]) -> anyhow::R
   let full = load_corpus(&corpus_path)?;
   let full_arrays = full.to_arrays(false);
   let arrays = for_scoring(full, config).to_arrays(false);
-  let precomp = Precomp::new(&arrays.freq, &config.weights, &config.costs, config.hand_hard_limit());
+  let precomp = Precomp::new(&arrays.freq, &config.weights, &config.costs, &config.effort, config.hand_hard_limit());
   let center_mask = arrays.rare_mask(config.center_rare);
   let norm = init_score_norm(&arrays, &precomp, &config.costs, score::HandRule::from_config(config), center_mask);
 
@@ -208,7 +208,7 @@ fn cmd_score(result_path: &Path, config: &Config, files: &[String]) -> anyhow::R
 fn run_optimize(result_path: &Path, config: &Config, stats: &corpus::CorpusStats, reset: bool) -> anyhow::Result<()> {
   let arrays = stats.to_arrays(false);
   print!("[Precomp] ..."); let _ = std::io::stdout().flush();
-  let precomp = Precomp::new(&arrays.freq, &config.weights, &config.costs, config.hand_hard_limit());
+  let precomp = Precomp::new(&arrays.freq, &config.weights, &config.costs, &config.effort, config.hand_hard_limit());
   println!(" done");
   let center_mask = arrays.rare_mask(config.center_rare);
   print!("[Score Norm] ..."); let _ = std::io::stdout().flush();

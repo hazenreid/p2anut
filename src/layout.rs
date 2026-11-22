@@ -495,6 +495,31 @@ mod tests {
   }
 
   #[test]
+  fn changing_effort_keeps_reference_event_costs() {
+    let stats = test_util::stats();
+    let arrays = stats.to_arrays(false);
+    let costs = crate::config::Costs::default();
+    let mut effort = crate::config::EffortGrid::default();
+    let base = Precomp::new(&arrays.freq, &test_util::weights(), &costs, &effort, 0.45);
+    // 검지 윗줄과 중지 홈을 더 힘들게
+    effort.top[3] = 2.0;
+    effort.home[2] = 1.4;
+    let pc = Precomp::new(&arrays.freq, &test_util::weights(), &costs, &effort, 0.45);
+    let a = abs_weights(&arrays, &pc, &costs);
+    // 대표 사건 비용은 그대로
+    let sfb = f64::from(pc.bigram(REF_INDEX_HOME, REF_INDEX_TOP).sfb_base) * a.sfb;
+    let sci = f64::from(pc.bigram(REF_MIDDLE_BOTTOM, REF_INDEX_TOP).scissors_base) * a.scissors;
+    let roll = f64::from(pc.bigram(REF_MIDDLE_HOME, REF_INDEX_HOME).rolling_base) * a.rolling;
+    assert!((sfb - f64::from(costs.sfb)).abs() < 1e-5 && (sci - f64::from(costs.full_scissors)).abs() < 1e-5 && (roll - f64::from(costs.inroll)).abs() < 1e-5, "{sfb} {sci} {roll}");
+    // 노력값 비용은 바뀜 (왼손·오른손 모두)
+    let e = b'e' - b'a';
+    assert!((pc.effort(3, e as usize) / base.effort(3, e as usize) - 2.0 / 1.3).abs() < 1e-6);
+    assert!((pc.effort(COLS + 7, e as usize) / base.effort(COLS + 7, e as usize) - 1.4).abs() < 1e-6);
+    // 대표 사건이 아닌 사건은 노력값 합에 따라 상대적으로 바뀜 (검지 윗줄 → 중지 홈 하프 시저스)
+    assert!(pc.bigram(REF_INDEX_TOP, REF_MIDDLE_HOME).scissors_base > base.bigram(REF_INDEX_TOP, REF_MIDDLE_HOME).scissors_base);
+  }
+
+  #[test]
   fn absolute_mode_ranks_by_lower_cost() {
     let stats = test_util::stats();
     let arrays = stats.to_arrays(false);
