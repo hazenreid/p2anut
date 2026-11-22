@@ -115,9 +115,16 @@ pub struct Config {
   pub corpus_file: String,
   pub result_file: String,
   pub elites: usize,
-  // 각 손이 맡아야 할 최소 입력 비율. 예전 이름 min_left_usage(왼손 하한만)도 받지만 이제 양손에 적용됨
+  // 각 손이 맡아야 할 최소 입력 비율. 이 위면 감점 없음, 아래면 hand_penalty로 감점 (hand_hard_limit 아래는 실격).
+  // 예전 이름 min_left_usage(왼손 하한만)도 받지만 이제 양손에 적용됨
   #[serde(alias = "min_left_usage")]
   pub min_hand_usage: f32,
+  // 이 비율보다 적게 치는 손이 있으면 실격. 없으면 min_hand_usage와 같음 (예전 동작: 기준 아래는 바로 실격)
+  #[serde(default)]
+  pub hand_hard_limit: Option<f32>,
+  // min_hand_usage보다 모자란 손에 매기는 감점: 글자 100개당 hand_penalty × (모자란 %p)²
+  #[serde(default = "default_one")]
+  pub hand_penalty: f32,
   // 엘리트끼리 홈행(양손 비중심 8칸) 글자가 최소 몇 개 달라야 하는지 (1 = 조합만 다르면 됨)
   #[serde(default = "default_min_home_diff")]
   pub min_home_diff: u32,
@@ -174,6 +181,8 @@ fn url_file_name(url: &str) -> Option<&str> {
 }
 
 impl Config {
+  pub fn hand_hard_limit(&self) -> f32 { self.hand_hard_limit.unwrap_or(self.min_hand_usage) }
+
   // 비어 있지 않은 덤프 주소들 (적은 순서대로)
   pub fn dump_urls(&self) -> Vec<String> {
     let all = match &self.wikipedia_dump_url {
@@ -234,6 +243,10 @@ impl Config {
     if !(0.0..=0.5).contains(&self.min_hand_usage) {
       anyhow::bail!("min_hand_usage must be between 0.0 and 0.5 (applies to each hand)");
     }
+    if !(0.0..=self.min_hand_usage).contains(&self.hand_hard_limit()) {
+      anyhow::bail!("hand_hard_limit must be between 0.0 and min_hand_usage");
+    }
+    if self.hand_penalty < 0.0 { anyhow::bail!("hand_penalty must be non-negative"); }
     if sa.max_no_improve == 0 { anyhow::bail!("sa.max_no_improve must be > 0"); }
     if !(0.0..1.0).contains(&sa.accept_start) { anyhow::bail!("sa.accept_start must be in [0.0, 1.0)"); }
     if !(sa.cooling > 0.0 && sa.cooling <= 1.0) { anyhow::bail!("sa.cooling must be in (0.0, 1.0]"); }
@@ -303,6 +316,28 @@ mod tests {
     let c: Config = toml::Value::Table(table).try_into().unwrap();
     c.validate().unwrap();
     assert_eq!((c.costs.sfb, c.costs.full_scissors, c.costs.inroll, c.costs.effort, c.costs.redirect), (2.5, 8.0, 2.0, 1.0, 1.0));
+  }
+
+  #[test]
+  fn hand_limits_default_to_old_behavior() {
+    let url = "wikipedia_dump_url = \"https://m.org/a.xml.bz2\"\n";
+    let mut base: toml::Table = toml::from_str(&std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/config.toml")).unwrap()).unwrap();
+    base.retain(|k, _| !k.starts_with("wikipedia_") && !k.starts_with("hand_"));
+    let with = |extra: &str| -> Config {
+      let mut t = base.clone();
+      t.extend(toml::from_str::<toml::Table>(&format!("{url}{extra}")).unwrap());
+      toml::Value::Table(t).try_into().unwrap()
+    };
+    // 지정하지 않으면 실격 기준 = min_hand_usage (예전 동작)
+    let c = with("");
+    assert_eq!(c.hand_hard_limit(), c.min_hand_usage);
+    c.validate().unwrap();
+    let c = with("hand_hard_limit = 0.40\nhand_penalty = 2.0");
+    assert_eq!((c.hand_hard_limit(), c.hand_penalty), (0.40, 2.0));
+    c.validate().unwrap();
+    // 실격 기준은 감점 기준보다 클 수 없음
+    assert!(with("hand_hard_limit = 0.47").validate().is_err());
+    assert!(with("hand_penalty = -1.0").validate().is_err());
   }
 
   #[test]

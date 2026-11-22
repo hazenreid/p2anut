@@ -475,7 +475,7 @@ impl<'a> Optimizer<'a> {
     let ps = part_sfb      + new_bg.0 + new_tg.0;
     let pr = part_rolling  + new_bg.1 + new_tg.1;
     let pc = part_scissors + new_bg.2 + new_tg.2;
-    result.total = self.norm.total_score(pe, ps, pr, pc);
+    result.total = self.norm.total_score(pe, ps, pr, pc, cur_l, cur_r);
     result.score = Score { effort: pe, sfb: ps, rolling: pr, scissors: pc };
     result.slots[p1] = v2;
     result.slots[p2] = v1;
@@ -574,7 +574,7 @@ impl<'a> Optimizer<'a> {
     let ps = part_sfb      + new_bg.0 + new_tg.0;
     let pr = part_rolling  + new_bg.1 + new_tg.1;
     let pc = part_scissors + new_bg.2 + new_tg.2;
-    result.total = self.norm.total_score(pe, ps, pr, pc);
+    result.total = self.norm.total_score(pe, ps, pr, pc, cur_l, cur_r);
     result.score = Score { effort: pe, sfb: ps, rolling: pr, scissors: pc };
     result.slots[p1] = n1; result.slots[p2] = n2; result.slots[p3] = n3;
     if n1 < CHARS as u8 { result.pos[n1 as usize] = p1 as u8; }
@@ -699,7 +699,7 @@ impl<'a> Optimizer<'a> {
     let ps = part_sfb   + new_sfb + new_sfs;
     let pr = part_rolling + new_roll + new_troll;
     let pc = part_scissors + new_sciss + new_tsciss;
-    result.total = self.norm.total_score(pe, ps, pr, pc);
+    result.total = self.norm.total_score(pe, ps, pr, pc, cur_l, cur_r);
     result.score = Score { effort: pe, sfb: ps, rolling: pr, scissors: pc };
 
     for (idx, &p) in swap_pos.iter().enumerate().take(k) {
@@ -769,12 +769,13 @@ mod tests {
 
   #[test]
   fn delta_moves_match_full_recompute() {
-    for space in [true, false] { check_delta_moves(space); }
+    for space in [true, false] { for soft in [false, true] { check_delta_moves(space, soft); } }
   }
 
-  fn check_delta_moves(space_on_grid: bool) {
+  // soft_hand: 손 비율 감점이 붙는 구간(40~45%)에서도 delta 계산이 전체 재계산과 같은지
+  fn check_delta_moves(space_on_grid: bool, soft_hand: bool) {
     let arrays = test_util::stats().to_arrays(space_on_grid);
-    let (precomp, norm) = test_util::precomp_norm_for(&arrays);
+    let (precomp, norm) = if soft_hand { test_util::precomp_norm_soft_hand(&arrays) } else { test_util::precomp_norm_for(&arrays) };
     let o = Optimizer::new(arrays, &precomp, &norm, 1, 1, test_util::sa(), test_util::ga(), 0);
     let mut ws = SaWorkspace::new(o.corpus_arrays.nz_bigrams.len(), o.corpus_arrays.nz_trigrams.len());
     let mut cur = o.make_scored_excl(&[]);

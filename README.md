@@ -49,7 +49,7 @@ cargo run --release -- <result_path> score mine.txt   # 내 배열을 저장된 
 | `wikipedia_limit` | 덤프 앞쪽 N개 문서만 분석합니다(0 = 전체). 오래된 문서 위주라 편향되므로 빠른 확인용입니다. |
 | `bigram_coverage`, `trigram_coverage` | 최적화에 쓸 빅그램·트라이그램의 누적 빈도 비율입니다(기본 0.99, 0.97). 코퍼스 파일에는 전체 통계를 저장하므로, 바꿔도 다시 분석할 필요가 없습니다. |
 | `elites`, `min_home_diff` | 엘리트 배열 수와, 엘리트끼리 홈행 글자가 최소 몇 개 달라야 하는지입니다. |
-| `min_hand_usage` | 각 손이 맡아야 할 최소 입력 비율입니다. |
+| `min_hand_usage`, `hand_penalty`, `hand_hard_limit` | 손 비율 제약입니다. 덜 치는 손이 `min_hand_usage` 이상이면 감점이 없고, 모자라면 글자 100개당 `hand_penalty × (모자란 %p)²`를 감점합니다. `hand_hard_limit` 아래는 실격입니다(지정하지 않으면 `min_hand_usage`와 같아서 기준 아래는 바로 실격). |
 | `center_rare` | 빈도가 가장 낮은 n글자를 가운데 두 열에 강제로 배치합니다(0 = 끔, 2–6). |
 | `seed` | 난수 시드입니다. 비워 두면 실행할 때마다 출력되는 값을 넣어 같은 실행을 재현할 수 있습니다. |
 | `[weights]` | 행·간격·가운데 열 페널티, 롤 방향, 시저스 종류별 배율입니다. |

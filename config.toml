@@ -1,8 +1,12 @@
 corpus_file = "corpus.bin"
 result_file = "result.bin"
 elites = 5
-# 각 손(왼손·오른손)이 최소 이 비율 이상 입력을 맡아야 함 (0.5 이하, 0.45 = 45~55%)
+# 각 손(왼손·오른손)이 최소 이 비율 이상 치면 감점 없음 (0.45 = 45~55%)
 min_hand_usage = 0.45
+# 덜 치는 손이 min_hand_usage보다 모자라면 글자 100개당 hand_penalty × (모자란 %p)² 감점 (1.0: 44% → +1, 43% → +4, 42% → +9)
+hand_penalty = 1.0
+# 이 비율보다 적게 치는 손이 있으면 실격 (없으면 min_hand_usage와 같아서 기준 아래는 바로 실격)
+hand_hard_limit = 0.40
 min_home_diff = 2
 # 멀티스트림 덤프: 여러 스레드로 나눠 분석하고, 중단해도 이어서 분석 (일반 *-pages-articles.xml.bz2는 한 스레드, 이어서 분석 불가)
 # 주소를 여러 개 적으면 받기 전에 각 주소에서 앞부분 4MiB를 받아 속도를 재고 빠른 곳부터 씀.

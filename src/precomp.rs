@@ -183,7 +183,7 @@ impl Precomp {
     Self { bigrams, trigrams, alphabet_effort, min_hand_usage }
   }
 
-  // 왼손·오른손 중 한쪽이라도 min_hand_usage 미만이면 위반
+  // 왼손·오른손 중 한쪽이라도 min_hand_usage(여기서는 실격 기준 hand_hard_limit을 받음) 미만이면 실격
   #[inline] pub fn violates_hand_usage(&self, left: u64, right: u64) -> bool {
     let total = left + right;
     if total == 0 { return false; }

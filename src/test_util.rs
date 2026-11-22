@@ -34,8 +34,16 @@ pub fn precomp_norm(stats: &CorpusStats) -> (Precomp, ScoreNorm) {
   precomp_norm_for(&stats.to_arrays(true))
 }
 
+// 부드러운 손 비율 감점: 45% 아래는 감점, 40% 아래만 실격
+pub fn precomp_norm_soft_hand(arrays: &CorpusArrays) -> (Precomp, ScoreNorm) {
+  let precomp = Precomp::new(&arrays.freq, &weights(), &crate::config::Costs::default(), 0.40);
+  let hand = crate::score::HandRule { soft_min: 0.45, penalty: 1.0 };
+  let norm = crate::layout::init_score_norm(arrays, &precomp, &crate::config::Costs::default(), hand, 0);
+  (precomp, norm)
+}
+
 pub fn precomp_norm_for(arrays: &CorpusArrays) -> (Precomp, ScoreNorm) {
   let precomp = Precomp::new(&arrays.freq, &weights(), &crate::config::Costs::default(), 0.45);
-  let norm = crate::layout::init_score_norm(arrays, &precomp, &crate::config::Costs::default(), 0);
+  let norm = crate::layout::init_score_norm(arrays, &precomp, &crate::config::Costs::default(), crate::score::HandRule::default(), 0);
   (precomp, norm)
 }

@@ -276,11 +276,13 @@ impl Layout {
   // 글자 100개당 항목별 비용과 무작위 배열 대비 변화율
   pub fn print_goodness(&self, norm: &ScoreNorm) {
     if self.total <= PENALTY_SCORE {
-      println!("DISQUALIFIED: one hand types less than min_hand_usage (scores below are for reference only)");
+      println!("DISQUALIFIED: one hand types less than hand_hard_limit (scores below are for reference only)");
     }
     let c = norm.cost_breakdown(&self.score);
-    let total = c.effort + c.sfb + c.rolling + c.scissors;
-    println!("cost per 100 letters (lower is better): total={total:.1}  effort={:.1}  sfb={:.1}  scissors={:.1}  rolling={:.1}", c.effort, c.sfb, c.scissors, c.rolling);
+    let hand = norm.hand_cost(self.left_usage, self.right_usage);
+    let total = c.effort + c.sfb + c.rolling + c.scissors + hand;
+    let hand_part = if hand > 0.0 { format!("  hand-balance={hand:.1}") } else { String::new() };
+    println!("cost per 100 letters (lower is better): total={total:.1}  effort={:.1}  sfb={:.1}  scissors={:.1}  rolling={:.1}{hand_part}", c.effort, c.sfb, c.scissors, c.rolling);
     let v = norm.vs_random(&self.score);
     println!("vs random median: effort {:+.1}%  sfb {:+.1}%  scissors {:+.1}%  rolling {:+.1}%", v.effort, v.sfb, v.scissors, v.rolling);
   }
@@ -294,6 +296,8 @@ impl Layout {
       self.score.sfb,
       self.score.rolling,
       self.score.scissors,
+      self.left_usage,
+      self.right_usage,
     );
   }
 
@@ -326,9 +330,9 @@ pub fn load_results(path: &str) -> anyhow::Result<Vec<Layout>> {
   Ok(bincode::deserialize(&bytes)?)
 }
 
-// 총점 기준: [costs]의 대표 사건 비용을 환산한 배율. 무작위 배열 표본(center_mask 제약을 지킴)의 항목별 중앙값은
-// "무작위 배열 대비" 표시에만 씀
-pub fn init_score_norm(arrays: &CorpusArrays, precomp: &Precomp, costs: &crate::config::Costs, center_mask: u32) -> ScoreNorm {
+// 총점 기준: [costs]의 대표 사건 비용을 환산한 배율과 손 비율 감점. 무작위 배열 표본(center_mask 제약을 지킴)의
+// 항목별 중앙값은 "무작위 배열 대비" 표시에만 씀
+pub fn init_score_norm(arrays: &CorpusArrays, precomp: &Precomp, costs: &crate::config::Costs, hand: crate::score::HandRule, center_mask: u32) -> ScoreNorm {
   const N: usize = 10001;
   let mut effort_vals   = Vec::with_capacity(N);
   let mut sfb_vals      = Vec::with_capacity(N);
@@ -348,6 +352,7 @@ pub fn init_score_norm(arrays: &CorpusArrays, precomp: &Precomp, costs: &crate::
   ScoreNorm {
     median: ScoreNorm::medians(&effort_vals, &sfb_vals, &rolling_vals, &scissors_vals),
     abs: abs_weights(arrays, precomp, costs),
+    hand,
   }
 }
 
@@ -494,7 +499,7 @@ mod tests {
     let stats = test_util::stats();
     let arrays = stats.to_arrays(false);
     let (precomp, _) = test_util::precomp_norm_for(&arrays);
-    let norm = init_score_norm(&arrays, &precomp, &crate::config::Costs::default(), 0);
+    let norm = init_score_norm(&arrays, &precomp, &crate::config::Costs::default(), crate::score::HandRule::default(), 0);
     let mut ls: Vec<Layout> = (0..30).map(|_| {
       let mut l = Layout::make_random(&arrays.keys, &[], 0);
       l.calc_scores(&arrays, &precomp); l.calc_total_score(&norm); l
@@ -506,6 +511,35 @@ mod tests {
     // 총점 = -(글자당 비용) × ABS_SCALE
     let l = &ls[0];
     assert!(((-l.total as f64) / crate::score::ABS_SCALE * 100.0 - cost(l)).abs() < 1e-4);
+  }
+
+  #[test]
+  fn soft_hand_limit_penalizes_instead_of_disqualifying() {
+    let arrays = test_util::stats().to_arrays(false);
+    let (precomp, norm) = test_util::precomp_norm_soft_hand(&arrays);
+    let (mut soft_seen, mut hard_seen) = (false, false);
+    for _ in 0..3000 {
+      let mut l = Layout::make_random(&arrays.keys, &[], 0);
+      l.calc_scores(&arrays, &precomp); l.calc_total_score(&norm);
+      let share = l.left_usage.min(l.right_usage) as f64 / (l.left_usage + l.right_usage) as f64;
+      let hand = norm.hand_cost(l.left_usage, l.right_usage);
+      if share < 0.40 {
+        assert!(l.total <= PENALTY_SCORE, "share {share}");
+        hard_seen = true;
+      } else {
+        assert!(l.total > PENALTY_SCORE, "share {share}");
+        // 45% 아래는 감점이 붙고, 총점에 그대로 들어감
+        assert_eq!(hand > 0.0, share < 0.45, "share {share}");
+        let s = &l.score;
+        assert_eq!(l.total, norm.total_score(s.effort, s.sfb, s.rolling, s.scissors, l.left_usage, l.right_usage));
+        if share < 0.45 {
+          soft_seen = true;
+          let without = norm.total_score(s.effort, s.sfb, s.rolling, s.scissors, 1, 1);
+          assert!(l.total < without);
+        }
+      }
+    }
+    assert!(soft_seen && hard_seen, "soft {soft_seen} hard {hard_seen}");
   }
 
   #[test]
