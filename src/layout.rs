@@ -118,7 +118,7 @@ impl Layout {
     }
   }
 
-  // 배열 텍스트 읽기: 행마다 10칸, 글자는 a-z, 빈칸은 '.' 또는 '_'. 공백은 무시 (print() 출력도 그대로 읽힘).
+  // 배열 텍스트 읽기: 행마다 10칸, 글자는 a-z, 빈칸은 '.' 또는 '_'(예전 출력). 공백은 무시 (print() 출력도 그대로 읽힘).
   // 빈 줄은 건너뛰고, 정확히 3행이어야 하며 각 글자는 한 번씩만
   pub fn parse(text: &str) -> anyhow::Result<Self> {
     let rows: Vec<Vec<char>> = text.lines()
@@ -196,11 +196,9 @@ impl Layout {
       let w = precomp.window(p1, p2, p3);
       counts[kinds.iter().position(|&k| k == w).unwrap_or(0)] += n;
       // 1·3번이 같은 손가락의 다른 키 (가운데는 다른 손가락이나 엄지)
-      if let (Some(x), Some(z)) = (p1, p3) {
-        if x != z && finger(x) == finger(z) && p2.is_none_or(|y| finger(y) != finger(x)) {
-          skip += n;
-          if p2.is_none() { skip_space += n; }
-        }
+      if let (Some(x), Some(z)) = (p1, p3) && x != z && finger(x) == finger(z) && p2.is_none_or(|y| finger(y) != finger(x)) {
+        skip += n;
+        if p2.is_none() { skip_space += n; }
       }
     }
     let pct = |a: u64| if total == 0 { 0.0 } else { a as f64 * 100.0 / total as f64 };
@@ -290,13 +288,7 @@ impl Layout {
       let mut s = String::new();
       for c in 0..COLS {
         let char_idx = self.slots[r * COLS + c];
-        let ch = if char_idx < 26 {
-          (b'a' + char_idx) as char
-        } else if char_idx == 26 {
-          '_'
-        } else {
-          '.'
-        };
+        let ch = if char_idx < 26 { (b'a' + char_idx) as char } else { '.' };
         if c == 5 { s.push_str("  "); }
         s.push(' ');
         s.push(ch);
@@ -489,7 +481,7 @@ mod tests {
 
   #[test]
   fn cross_space_pairs_add_to_sfb_and_scissors_only() {
-    let arrays = test_util::stats().to_arrays(false);
+    let arrays = test_util::stats().to_arrays();
     assert!(!arrays.nz_cross.is_empty());
     let mut no_cross = arrays.clone();
     no_cross.nz_cross.clear();
@@ -514,7 +506,7 @@ mod tests {
   #[test]
   fn sort_unique_respects_min_diff() {
     let stats = test_util::stats();
-    let arrays = stats.to_arrays(true);
+    let arrays = stats.to_arrays();
     let (precomp, norm) = test_util::precomp_norm(&stats);
     let layouts: Vec<Layout> = (0..50).map(|_| {
       let mut l = Layout::make_random(&arrays.keys, &[], 0);
@@ -546,7 +538,7 @@ mod tests {
   #[test]
   fn absolute_costs_match_reference_events() {
     let stats = test_util::stats();
-    let arrays = stats.to_arrays(false);
+    let arrays = stats.to_arrays();
     let (precomp, _) = test_util::precomp_norm_for(&arrays);
     let c = crate::config::Costs::default();
     let a = abs_weights(&arrays, &precomp, &c);
@@ -564,7 +556,7 @@ mod tests {
   #[test]
   fn changing_effort_keeps_reference_event_costs() {
     let stats = test_util::stats();
-    let arrays = stats.to_arrays(false);
+    let arrays = stats.to_arrays();
     let costs = crate::config::Costs::default();
     let mut effort = crate::config::EffortGrid::default();
     let base = Precomp::new(&arrays.freq, &test_util::weights(), &costs, &effort, 0.45);
@@ -589,7 +581,7 @@ mod tests {
   #[test]
   fn absolute_mode_ranks_by_lower_cost() {
     let stats = test_util::stats();
-    let arrays = stats.to_arrays(false);
+    let arrays = stats.to_arrays();
     let (precomp, _) = test_util::precomp_norm_for(&arrays);
     let norm = init_score_norm(&arrays, &precomp, &crate::config::Costs::default(), crate::score::HandRule::default(), 0);
     let mut ls: Vec<Layout> = (0..30).map(|_| {
@@ -607,7 +599,7 @@ mod tests {
 
   #[test]
   fn soft_hand_limit_penalizes_instead_of_disqualifying() {
-    let arrays = test_util::stats().to_arrays(false);
+    let arrays = test_util::stats().to_arrays();
     let (precomp, norm) = test_util::precomp_norm_soft_hand(&arrays);
     let (mut soft_seen, mut hard_seen) = (false, false);
     for _ in 0..3000 {
@@ -640,7 +632,7 @@ mod tests {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("result.bin");
     let path = path.to_str().unwrap();
-    let ls = vec![Layout::make_random(&test_util::stats().to_arrays(false).keys, &[], 0); 2];
+    let ls = vec![Layout::make_random(&test_util::stats().to_arrays().keys, &[], 0); 2];
     save_results(&ls, path).unwrap();
     save_results(&ls[..1], path).unwrap();
     assert_eq!(load_results(path).unwrap().len(), 1);
@@ -651,7 +643,7 @@ mod tests {
   #[test]
   fn penalized_layout_keeps_real_scores_and_recovers() {
     let stats = test_util::stats();
-    let arrays = stats.to_arrays(true);
+    let arrays = stats.to_arrays();
     let (precomp, norm) = test_util::precomp_norm(&stats);
     let (mut checked, mut sides) = (0, [false; 2]);
     for _ in 0..1000 {

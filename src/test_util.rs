@@ -31,7 +31,7 @@ pub fn ga() -> GaParams {
 }
 
 pub fn precomp_norm(stats: &CorpusStats) -> (Precomp, ScoreNorm) {
-  precomp_norm_for(&stats.to_arrays(true))
+  precomp_norm_for(&stats.to_arrays())
 }
 
 // 부드러운 손 비율 감점: 45% 아래는 감점, 40% 아래만 실격

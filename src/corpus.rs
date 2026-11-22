@@ -13,8 +13,7 @@ pub struct CorpusArrays {
   pub bigram_offsets: [usize; CHARS + 1],
   pub trigram_flat: Vec<usize>,
   pub trigram_offsets: [usize; CHARS + 1],
-  // 공백 건너 쌍: "a _ c" 창 (a, c, 횟수). 엄지 자리는 고정이라 값이 a, c 위치로만 정해짐 (공백 너머 스킵그램·스킵 시저스).
-  // 공백을 그리드에 두는 예전 방식(include_space)에서는 비어 있음 (그때는 이 창이 nz_trigrams에 그대로 들어감)
+  // 공백 건너 쌍: "a _ c" 창 (a, c, 횟수). 엄지 자리는 고정이라 값이 a, c 위치로만 정해짐 (공백 너머 스킵그램·스킵 시저스)
   pub nz_cross: Vec<(u8, u8, u64)>,
   pub cross_flat: Vec<usize>,
   pub cross_offsets: [usize; CHARS + 1],
@@ -143,15 +142,11 @@ impl CorpusStats {
     }
   }
 
-  // include_space=false: 공백을 엄지 키로 보고 배열에서 뺌 (a-z 26키만 배치, 공백이 낀 빅/트라이그램은 버림)
-  pub fn to_arrays(&self, include_space: bool) -> CorpusArrays {
-    let keys: Vec<char> = ('a'..='z').chain(include_space.then_some(' ')).collect();
-
-    let lu = |ch: char| -> Option<u8> {
-      if ch.is_ascii_lowercase() { Some(ch as u8 - b'a') }
-      else if ch == ' ' && include_space { Some(26) }
-      else { None }
-    };
+  // 배치할 키는 a-z 26개. 공백은 엄지 키라 그리드에 두지 않으므로, 공백이 낀 빅/트라이그램은 nz_bigrams·nz_trigrams에서 빼고
+  // "a _ c" 창만 nz_cross로 따로 둠
+  pub fn to_arrays(&self) -> CorpusArrays {
+    let keys: Vec<char> = ('a'..='z').collect();
+    let lu = |ch: char| ch.is_ascii_lowercase().then(|| ch as u8 - b'a');
 
     let mut freq = vec![0u64; CHARS].into_boxed_slice();
     for (&ch, &cnt) in &self.letters {
@@ -175,13 +170,10 @@ impl CorpusStats {
     let (bigram_flat, bigram_offsets) = index_lists(nz_bigrams.iter().map(|&(a, b, _)| vec![a, b]));
     let (trigram_flat, trigram_offsets) = index_lists(nz_trigrams.iter().map(|&(a, b, c, _)| vec![a, b, c]));
 
-    let letter = |ch: char| ch.is_ascii_lowercase().then(|| ch as u8 - b'a');
-    let mut nz_cross: Vec<(u8, u8, u64)> = if include_space { Vec::new() } else {
-      self.trigrams.iter()
-        .filter(|&(&(_, b, _), _)| b == ' ')
-        .filter_map(|(&(a, _, c), &cnt)| Some((letter(a)?, letter(c)?, cnt)))
-        .collect()
-    };
+    let mut nz_cross: Vec<(u8, u8, u64)> = self.trigrams.iter()
+      .filter(|&(&(_, b, _), _)| b == ' ')
+      .filter_map(|(&(a, _, c), &cnt)| Some((lu(a)?, lu(c)?, cnt)))
+      .collect();
     nz_cross.sort_unstable_by_key(|&(a, c, _)| (a, c));
     let (cross_flat, cross_offsets) = index_lists(nz_cross.iter().map(|&(a, c, _)| vec![a, c]));
 
@@ -196,7 +188,8 @@ impl CorpusStats {
 
   // 빈도 상위부터 누적 비율이 bigram/trigram 기준에 닿을 때까지만 보존 (1.0 = 전부)
   // 최적화 속도를 위해 불러올 때 적용. 파일에는 전체 통계를 저장해서 기준을 바꿔도 재분석이 필요 없음.
-  // 공백 없는 것과 공백이 낀 것은 따로 자름: 빈도가 큰 공백 n-gram이 섞여도 글자끼리의 n-gram은 예전과 똑같이 남음
+  // 묶음마다 따로 자름: 글자끼리 / 채점에 쓰는 "a _ c" 창 / 나머지 공백이 낀 것(표시용).
+  // 빈도가 큰 공백 n-gram이 섞여도 글자끼리의 n-gram은 예전과 똑같이 남고, "a _ c" 창도 자기들끼리 기준만큼 남음
   pub fn trim_by_coverage(&mut self, bigram: f64, trigram: f64) {
     fn trim<K: Eq + std::hash::Hash + Clone + Ord>(map: &mut HashMap<K, u64>, threshold: f64) {
       if map.is_empty() || threshold >= 1.0 { return; }
@@ -216,15 +209,16 @@ impl CorpusStats {
       items.truncate(keep_count);
       *map = items.into_iter().collect();
     }
-    fn trim_split<K: Eq + std::hash::Hash + Clone + Ord>(map: &mut HashMap<K, u64>, threshold: f64, has_space: impl Fn(&K) -> bool) {
-      let (mut spaced, mut plain): (HashMap<K, u64>, HashMap<K, u64>) = map.drain().partition(|(k, _)| has_space(k));
-      trim(&mut plain, threshold);
-      trim(&mut spaced, threshold);
-      plain.extend(spaced);
-      *map = plain;
+    // group: 키마다 묶음 번호 (0..n)
+    fn trim_groups<K: Eq + std::hash::Hash + Clone + Ord>(map: &mut HashMap<K, u64>, threshold: f64, n: usize, group: impl Fn(&K) -> usize) {
+      let mut groups: Vec<HashMap<K, u64>> = vec![HashMap::new(); n];
+      for (k, v) in map.drain() { groups[group(&k)].insert(k, v); }
+      for g in &mut groups { trim(g, threshold); map.extend(g.drain()); }
     }
-    trim_split(&mut self.bigrams, bigram, |&(a, b)| a == ' ' || b == ' ');
-    trim_split(&mut self.trigrams, trigram, |&(a, b, c)| a == ' ' || b == ' ' || c == ' ');
+    trim_groups(&mut self.bigrams, bigram, 2, |&(a, b)| usize::from(a == ' ' || b == ' '));
+    trim_groups(&mut self.trigrams, trigram, 3, |&(a, b, c)| {
+      if b == ' ' { 1 } else if a == ' ' || c == ' ' { 2 } else { 0 }
+    });
   }
 
   // 파일 형식: CORPUS_MAGIC + 파일 형식 버전(u32) + 파서 버전(u32) + bincode(CorpusStats)
@@ -323,8 +317,12 @@ mod tests {
     let mut b = letters_only(&with);
     b.trim_by_coverage(0.95, 0.80);
     assert_eq!(letters_only(&a), b);
-    // 공백이 낀 것도 자기들끼리 같은 기준으로 잘림
-    assert!(a.trigrams.keys().any(|k| k.1 == ' '));
+    // 채점에 쓰는 "a _ c" 창은 자기들끼리만 잘림 (다른 공백 창이 있든 없든 같은 것이 남음)
+    let cross_only = |s: &CorpusStats| { let mut o = s.clone(); o.bigrams.clear(); o.trigrams.retain(|k, _| k.1 == ' '); o };
+    let mut c = cross_only(&with);
+    c.trim_by_coverage(0.95, 0.80);
+    assert_eq!(cross_only(&a), c);
+    assert!(c.trigrams.len() < cross_only(&with).trigrams.len());
     assert!(a.trigrams.len() < with.trigrams.len());
   }
 
@@ -374,7 +372,7 @@ mod tests {
   fn cross_space_pairs_come_from_letter_space_letter_windows() {
     let mut f = FastCorpus::new();
     crate::analyze_bytes(b"the end. a cat at sea", &mut f);
-    let a = f.into_stats().to_arrays(false);
+    let a = f.into_stats().to_arrays();
     let id = |c: char| c as u8 - b'a';
     let get = |x: char, y: char| a.nz_cross.iter().find(|&&(p, q, _)| (p, q) == (id(x), id(y))).map_or(0, |e| e.2);
     // e_e, a_c, t_a(cat at), t_s(at sea). 마침표 뒤 공백은 세지 않음 (d_a 없음)
@@ -385,25 +383,20 @@ mod tests {
     assert_eq!(list('e').len(), 1);
     assert_eq!(list('t').len(), 2);
     assert!(list('z').is_empty());
-    // 공백을 그리드에 두는 예전 방식에서는 비어 있음
-    assert!(crate::test_util::stats().to_arrays(true).nz_cross.is_empty());
-    assert!(!crate::test_util::stats().to_arrays(false).nz_cross.is_empty());
+    assert!(!crate::test_util::stats().to_arrays().nz_cross.is_empty());
   }
 
   #[test]
-  fn to_arrays_can_drop_space() {
+  fn to_arrays_places_letters_and_keeps_space_out_of_the_grid() {
     let stats = crate::test_util::stats();
-    let with = stats.to_arrays(true);
-    let without = stats.to_arrays(false);
-    assert_eq!(with.keys.len(), 27);
-    assert_eq!(without.keys.len(), 26);
-    assert!(!without.keys.contains(&' '));
-    assert_eq!(without.freq[26], 0);
-    assert!(without.nz_bigrams.iter().all(|&(a, b, _)| a < 26 && b < 26));
-    assert!(without.nz_trigrams.iter().all(|&(a, b, c, _)| a < 26 && b < 26 && c < 26));
-    // 공백 없는 n-gram은 그대로 남아야 함
-    let letters_only = with.nz_bigrams.iter().filter(|&&(a, b, _)| a < 26 && b < 26).count();
-    assert_eq!(without.nz_bigrams.len(), letters_only);
-    assert_eq!(without.bigram_offsets[26], without.bigram_offsets[27]);
+    let a = stats.to_arrays();
+    assert_eq!(a.keys, ('a'..='z').collect::<Vec<_>>());
+    assert_eq!(a.freq[26], 0);
+    assert!(a.nz_bigrams.iter().all(|&(x, y, _)| x < 26 && y < 26));
+    assert!(a.nz_trigrams.iter().all(|&(x, y, z, _)| x < 26 && y < 26 && z < 26));
+    // 글자끼리의 n-gram은 모두 남음
+    let letters_only = stats.bigrams.keys().filter(|k| k.0 != ' ' && k.1 != ' ').count();
+    assert_eq!(a.nz_bigrams.len(), letters_only);
+    assert_eq!(a.bigram_offsets[26], a.bigram_offsets[27]);
   }
 }

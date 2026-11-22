@@ -829,12 +829,12 @@ mod tests {
 
   #[test]
   fn delta_moves_match_full_recompute() {
-    for space in [true, false] { for soft in [false, true] { check_delta_moves(space, soft); } }
+    for soft in [false, true] { check_delta_moves(soft); }
   }
 
   // soft_hand: 손 비율 감점이 붙는 구간(40~45%)에서도 delta 계산이 전체 재계산과 같은지
-  fn check_delta_moves(space_on_grid: bool, soft_hand: bool) {
-    let arrays = test_util::stats().to_arrays(space_on_grid);
+  fn check_delta_moves(soft_hand: bool) {
+    let arrays = test_util::stats().to_arrays();
     let (precomp, norm) = if soft_hand { test_util::precomp_norm_soft_hand(&arrays) } else { test_util::precomp_norm_for(&arrays) };
     let o = Optimizer::new(arrays, &precomp, &norm, 1, 1, test_util::sa(), test_util::ga(), 0);
     let mut ws = SaWorkspace::new(&o.corpus_arrays);
@@ -861,7 +861,7 @@ mod tests {
 
   #[test]
   fn center_rare_constraint_holds() {
-    let arrays = test_util::stats().to_arrays(false);
+    let arrays = test_util::stats().to_arrays();
     let (precomp, norm) = test_util::precomp_norm_for(&arrays);
     let mask = arrays.rare_mask(4);
     assert_eq!(mask.count_ones(), 4);
@@ -885,7 +885,7 @@ mod tests {
 
   #[test]
   fn descend_reaches_a_deterministic_local_optimum() {
-    let arrays = test_util::stats().to_arrays(false);
+    let arrays = test_util::stats().to_arrays();
     let (precomp, norm) = test_util::precomp_norm_soft_hand(&arrays);
     let mask = arrays.rare_mask(4);
     let o = Optimizer::new(arrays, &precomp, &norm, 1, 1, test_util::sa(), test_util::ga(), mask);
@@ -908,7 +908,7 @@ mod tests {
   fn sa_improves_and_repairs_penalized_layouts() {
     let stats = test_util::stats();
     let (precomp, norm) = test_util::precomp_norm(&stats);
-    let o = Optimizer::new(stats.to_arrays(true), &precomp, &norm, 1, 1, test_util::sa(), test_util::ga(), 0);
+    let o = Optimizer::new(stats.to_arrays(), &precomp, &norm, 1, 1, test_util::sa(), test_util::ga(), 0);
     let start = o.make_scored_excl(&[]);
     let out = o.optimize_sa(start, &[]);
     assert!(out.total >= start.total);
@@ -926,7 +926,7 @@ mod tests {
 
   #[test]
   fn space_off_grid_places_only_letters() {
-    let arrays = test_util::stats().to_arrays(false);
+    let arrays = test_util::stats().to_arrays();
     let (precomp, norm) = test_util::precomp_norm_for(&arrays);
     let o = Optimizer::new(arrays, &precomp, &norm, 1, 1, test_util::sa(), test_util::ga(), 0);
     let a = o.optimize_sa(o.make_scored_excl(&[]), &[]);
@@ -943,7 +943,7 @@ mod tests {
   fn sa_stays_away_from_excluded_homes() {
     let stats = test_util::stats();
     let (precomp, norm) = test_util::precomp_norm(&stats);
-    let o = Optimizer::new(stats.to_arrays(true), &precomp, &norm, 1, 3, test_util::sa(), test_util::ga(), 0);
+    let o = Optimizer::new(stats.to_arrays(), &precomp, &norm, 1, 3, test_util::sa(), test_util::ga(), 0);
     for _ in 0..5 {
       let start = o.make_scored_excl(&[]);
       // 제외 없이 찾은 결과의 홈행을 막고 같은 시작점에서 다시 돌리면, 그 홈행과 3글자 이상 달라야 함
@@ -961,7 +961,7 @@ mod tests {
     let stats = test_util::stats();
     fastrand::seed(7); // 정규화 표본도 고정해야 실행(프로세스)마다 같은 목적함수가 됨
     let (precomp, norm) = test_util::precomp_norm(&stats);
-    let o = Optimizer::new(stats.to_arrays(true), &precomp, &norm, 1, 2, test_util::sa(), test_util::ga(), 0);
+    let o = Optimizer::new(stats.to_arrays(), &precomp, &norm, 1, 2, test_util::sa(), test_util::ga(), 0);
     let path = std::env::temp_dir().join(format!("p2anut_seed_{}.bin", std::process::id()));
     let run = |seed: u64| {
       fastrand::seed(seed);
@@ -979,7 +979,7 @@ mod tests {
   fn elites_respect_min_home_diff() {
     let stats = test_util::stats();
     let (precomp, norm) = test_util::precomp_norm(&stats);
-    let o = Optimizer::new(stats.to_arrays(true), &precomp, &norm, 3, 2, test_util::sa(), test_util::ga(), 0);
+    let o = Optimizer::new(stats.to_arrays(), &precomp, &norm, 3, 2, test_util::sa(), test_util::ga(), 0);
     let path = std::env::temp_dir().join(format!("p2anut_test_{}.bin", std::process::id()));
     let (elites, _) = o.run(vec![], path.to_str().unwrap());
     let _ = std::fs::remove_file(&path);

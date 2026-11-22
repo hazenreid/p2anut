@@ -108,10 +108,18 @@ fn analyze_dump(result_path: &Path, config: &Config, corpus_path: &Path) -> anyh
   Ok(stats)
 }
 
-// 저장된 코퍼스 불러오기 (전체 통계). 예전 파서로 만든 것이면 경고
-fn load_corpus(corpus_path: &Path) -> anyhow::Result<CorpusStats> {
+// 공백(엄지)을 세기 시작한 파서 버전. 점수에 공백 너머 스킵그램·스킵 시저스가 들어가므로, 그 전 코퍼스로는 채점하지 않음
+// (공백 데이터가 없어 그 비용이 조용히 0이 되면 예전·지금 결과를 잘못 비교하게 됨)
+const MIN_SCORING_PARSER: u32 = 4;
+
+// 저장된 코퍼스 불러오기 (전체 통계). scoring: 채점·최적화에 쓸지 (그러면 공백을 세기 전 코퍼스는 거부). 그 밖에 파서가 다르면 경고
+fn load_corpus(corpus_path: &Path, scoring: bool) -> anyhow::Result<CorpusStats> {
   println!("[Load Corpus] {}", corpus_path.display());
   let (stats, parser_version) = CorpusStats::load(corpus_path.to_str().context("Invalid corpus path")?)?;
+  if scoring && parser_version < MIN_SCORING_PARSER {
+    anyhow::bail!("{} was built with parser v{parser_version}, before spaces were counted, so scores would miss the cross-space costs; rebuild it with `analyze --reset`",
+      corpus_path.display());
+  }
   if parser_version != dump::PARSER_VERSION {
     println!("[Load Corpus] warning: built with parser v{parser_version}, current is v{}; rebuild with `analyze --reset` for the current rules", dump::PARSER_VERSION);
   }
@@ -119,9 +127,9 @@ fn load_corpus(corpus_path: &Path) -> anyhow::Result<CorpusStats> {
 }
 
 // 전체 통계. 코퍼스 파일이 없거나 --reset이면 덤프를 분석해서 저장
-fn load_or_analyze(result_path: &Path, config: &Config, reset: bool) -> anyhow::Result<CorpusStats> {
+fn load_or_analyze(result_path: &Path, config: &Config, reset: bool, scoring: bool) -> anyhow::Result<CorpusStats> {
   let corpus_path = result_path.join(&config.corpus_file);
-  if !reset && corpus_path.exists() { load_corpus(&corpus_path) } else { analyze_dump(result_path, config, &corpus_path) }
+  if !reset && corpus_path.exists() { load_corpus(&corpus_path, scoring) } else { analyze_dump(result_path, config, &corpus_path) }
 }
 
 // 최적화·채점용: 빈도가 낮은 빅/트라이그램을 config 기준으로 잘라 냄
@@ -140,7 +148,7 @@ fn print_results(results: &[layout::Layout], norm: Option<&score::ScoreNorm>) {
 }
 
 fn cmd_analyze(result_path: &Path, config: &Config, reset: bool) -> anyhow::Result<()> {
-  let stats = load_or_analyze(result_path, config, reset)?;
+  let stats = load_or_analyze(result_path, config, reset, false)?;
   let used = for_scoring(stats.clone(), config);
   // (글자끼리, 공백이 낀 것) 개수
   let split = |s: &CorpusStats| {
@@ -167,8 +175,8 @@ fn cmd_results(result_path: &Path, config: &Config) -> anyhow::Result<()> {
   let corpus_path = result_path.join(&config.corpus_file);
   let mut norm = None;
   if corpus_path.exists() {
-    let stats = for_scoring(load_corpus(&corpus_path)?, config);
-    let arrays = stats.to_arrays(false);
+    let stats = for_scoring(load_corpus(&corpus_path, true)?, config);
+    let arrays = stats.to_arrays();
     results.retain(|l| l.key_count() == arrays.keys.len());
     let precomp = Precomp::new(&arrays.freq, &config.weights, &config.costs, &config.effort, config.hand_hard_limit());
     let n = init_score_norm(&arrays, &precomp, &config.costs, score::HandRule::from_config(config), arrays.rare_mask(config.center_rare));
@@ -187,10 +195,10 @@ fn cmd_results(result_path: &Path, config: &Config) -> anyhow::Result<()> {
 fn cmd_score(result_path: &Path, config: &Config, files: &[String]) -> anyhow::Result<()> {
   anyhow::ensure!(!files.is_empty(), "usage: <result_path> score <layout_file>...");
   let corpus_path = result_path.join(&config.corpus_file);
-  let full = load_corpus(&corpus_path)?;
-  let full_arrays = full.to_arrays(false);
+  let full = load_corpus(&corpus_path, true)?;
+  let full_arrays = full.to_arrays();
   let windows = full.windows();
-  let arrays = for_scoring(full, config).to_arrays(false);
+  let arrays = for_scoring(full, config).to_arrays();
   let precomp = Precomp::new(&arrays.freq, &config.weights, &config.costs, &config.effort, config.hand_hard_limit());
   let center_mask = arrays.rare_mask(config.center_rare);
   let norm = init_score_norm(&arrays, &precomp, &config.costs, score::HandRule::from_config(config), center_mask);
@@ -225,7 +233,7 @@ fn cmd_score(result_path: &Path, config: &Config, files: &[String]) -> anyhow::R
 
 // 점수 설정값을 하나씩 흔들어 저장된 결과와 배열 파일들의 1등이 바뀌는지 점검 (설정·결과 파일은 바꾸지 않음)
 fn cmd_sensitivity(result_path: &Path, config: &Config, files: &[String]) -> anyhow::Result<()> {
-  let arrays = for_scoring(load_corpus(&result_path.join(&config.corpus_file))?, config).to_arrays(false);
+  let arrays = for_scoring(load_corpus(&result_path.join(&config.corpus_file), true)?, config).to_arrays();
   let precomp = Precomp::new(&arrays.freq, &config.weights, &config.costs, &config.effort, config.hand_hard_limit());
   let center_mask = arrays.rare_mask(config.center_rare);
   let norm = init_score_norm(&arrays, &precomp, &config.costs, score::HandRule::from_config(config), center_mask);
@@ -251,7 +259,7 @@ fn cmd_sensitivity(result_path: &Path, config: &Config, files: &[String]) -> any
 }
 
 fn run_optimize(result_path: &Path, config: &Config, stats: &corpus::CorpusStats, reset: bool) -> anyhow::Result<()> {
-  let arrays = stats.to_arrays(false);
+  let arrays = stats.to_arrays();
   print!("[Precomp] ..."); let _ = std::io::stdout().flush();
   let precomp = Precomp::new(&arrays.freq, &config.weights, &config.costs, &config.effort, config.hand_hard_limit());
   println!(" done");
@@ -302,7 +310,7 @@ fn run_optimize(result_path: &Path, config: &Config, stats: &corpus::CorpusStats
 }
 
 fn cmd_run(result_path: &Path, config: &Config, reset: bool) -> anyhow::Result<()> {
-  let stats = for_scoring(load_or_analyze(result_path, config, reset)?, config);
+  let stats = for_scoring(load_or_analyze(result_path, config, reset, true)?, config);
   run_optimize(result_path, config, &stats, reset)
 }
 
@@ -333,7 +341,7 @@ fn main() -> anyhow::Result<()> {
   match cmd {
     Some("analyze")  => cmd_analyze(result_path, &config, reset),
     Some("optimize") => {
-      let stats = for_scoring(load_corpus(&result_path.join(&config.corpus_file))?, &config);
+      let stats = for_scoring(load_corpus(&result_path.join(&config.corpus_file), true)?, &config);
       run_optimize(result_path, &config, &stats, reset)
     },
     Some("run")      => cmd_run(result_path, &config, reset),
@@ -458,6 +466,22 @@ mod tests {
     super::analyze_dump(&result, &test_config(&dump, 0), &corpus).unwrap();
     assert!(!checkpoint.exists());
     std::fs::remove_dir_all(&root).unwrap();
+  }
+
+  #[test]
+  fn scoring_refuses_corpora_built_before_spaces_were_counted() {
+    let dir = std::env::temp_dir().join(format!("p2anut-v3-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("corpus.bin");
+    let stats = crate::test_util::stats();
+    stats.save(path.to_str().unwrap(), super::MIN_SCORING_PARSER - 1).unwrap();
+    let err = super::load_corpus(&path, true).unwrap_err().to_string();
+    assert!(err.contains("before spaces were counted") && err.contains("analyze --reset"), "{err}");
+    // 통계만 볼 때(analyze)는 읽힘
+    assert_eq!(super::load_corpus(&path, false).unwrap(), stats);
+    stats.save(path.to_str().unwrap(), crate::dump::PARSER_VERSION).unwrap();
+    assert_eq!(super::load_corpus(&path, true).unwrap(), stats);
+    std::fs::remove_dir_all(&dir).unwrap();
   }
 
   #[test]
