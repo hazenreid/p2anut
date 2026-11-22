@@ -6,6 +6,7 @@ mod layout;
 mod optimizer;
 mod precomp;
 mod score;
+mod sensitivity;
 mod wiki;
 #[cfg(test)]
 mod test_util;
@@ -205,6 +206,33 @@ fn cmd_score(result_path: &Path, config: &Config, files: &[String]) -> anyhow::R
   Ok(())
 }
 
+// 점수 설정값을 하나씩 흔들어 저장된 결과와 배열 파일들의 1등이 바뀌는지 점검 (설정·결과 파일은 바꾸지 않음)
+fn cmd_sensitivity(result_path: &Path, config: &Config, files: &[String]) -> anyhow::Result<()> {
+  let arrays = for_scoring(load_corpus(&result_path.join(&config.corpus_file))?, config).to_arrays(false);
+  let precomp = Precomp::new(&arrays.freq, &config.weights, &config.costs, &config.effort, config.hand_hard_limit());
+  let center_mask = arrays.rare_mask(config.center_rare);
+  let norm = init_score_norm(&arrays, &precomp, &config.costs, score::HandRule::from_config(config), center_mask);
+  let mut cands: Vec<(String, layout::Layout)> = Vec::new();
+  let result_file = result_path.join(&config.result_file);
+  if result_file.exists() {
+    let mut results = load_results(result_file.to_str().context("Invalid result file path")?)?;
+    results.retain(|l| l.key_count() == arrays.keys.len());
+    for l in &mut results { l.calc_scores(&arrays, &precomp); l.calc_total_score(&norm); }
+    layout::sort_layouts(&mut results);
+    cands.extend(results.into_iter().enumerate().map(|(i, l)| (format!("saved #{}", i + 1), l)));
+  }
+  for f in files {
+    let l = layout::Layout::parse(&fs::read_to_string(f).with_context(|| format!("reading {f}"))?)
+      .with_context(|| format!("parsing {f}"))?;
+    anyhow::ensure!(l.key_count() == arrays.keys.len(), "{f} has {} letters, the corpus has {}", l.key_count(), arrays.keys.len());
+    if !l.center_ok(center_mask) { println!("[Sensitivity] note: {f} does not follow center_rare ({} letters)", config.center_rare); }
+    cands.push((f.clone(), l));
+  }
+  anyhow::ensure!(!cands.is_empty(), "no layouts to check: run optimize first or pass layout files");
+  sensitivity::run(&arrays, config, norm.median, cands, center_mask);
+  Ok(())
+}
+
 fn run_optimize(result_path: &Path, config: &Config, stats: &corpus::CorpusStats, reset: bool) -> anyhow::Result<()> {
   let arrays = stats.to_arrays(false);
   print!("[Precomp] ..."); let _ = std::io::stdout().flush();
@@ -273,12 +301,12 @@ fn main() -> anyhow::Result<()> {
 
   let args: Vec<String> = std::env::args().collect();
   if args.len() < 2 {
-    eprintln!("Usage: {} <result_path> [analyze|optimize|run|results|score <layout_file>...] [--reset]", args[0]);
+    eprintln!("Usage: {} <result_path> [analyze|optimize|run|results|score <layout_file>...|sensitivity [layout_file]...] [--reset]", args[0]);
     std::process::exit(1);
   }
   let result_path = Path::new(&args[1]);
   let cmd = args.get(2).map(std::string::String::as_str);
-  let reset = args.iter().any(|a| a == "--reset") && !matches!(cmd, Some("results" | "score"));
+  let reset = args.iter().any(|a| a == "--reset") && !matches!(cmd, Some("results" | "score" | "sensitivity"));
   let config = load_config(Path::new("config.toml"))?;
   // init_score_norm(무작위 표본)부터 최적화까지 모든 난수가 이 시드에서 나옴
   let seed = config.seed.unwrap_or_else(|| fastrand::u64(..));
@@ -294,8 +322,9 @@ fn main() -> anyhow::Result<()> {
     Some("run")      => cmd_run(result_path, &config, reset),
     Some("results")  => cmd_results(result_path, &config),
     Some("score")    => cmd_score(result_path, &config, &args[3..].iter().filter(|a| *a != "--reset").cloned().collect::<Vec<_>>()),
+    Some("sensitivity") => cmd_sensitivity(result_path, &config, &args[3..].iter().filter(|a| *a != "--reset").cloned().collect::<Vec<_>>()),
     _ => {
-      eprintln!("Usage: {} <result_path> [analyze|optimize|run|results|score <layout_file>...] [--reset]", args[0]);
+      eprintln!("Usage: {} <result_path> [analyze|optimize|run|results|score <layout_file>...|sensitivity [layout_file]...] [--reset]", args[0]);
       std::process::exit(1);
     }
   }

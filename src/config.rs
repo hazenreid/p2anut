@@ -143,7 +143,7 @@ impl GaParams {
   pub fn max_stall(&self) -> usize { self.max_stall.unwrap_or(self.population) }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub struct Config {
   pub corpus_file: String,
   pub result_file: String,

@@ -367,6 +367,38 @@ impl<'a> Optimizer<'a> {
     best
   }
 
+  // 무작위 없는 근처 탐색 (민감도 점검용): 두 키 맞바꾸기를 전부 보고 가장 좋은 것을 적용, 더 좋아지는 게 없으면
+  // 세 키 돌리기를 전부 보고 가장 좋은 것을 적용. 둘 다 없을 때까지 반복. center_rare 구역과 손 비율 규칙은 지킴
+  pub fn descend(&self, mut cur: Layout) -> Layout {
+    const MAX_STEPS: usize = 1000; // 안전장치 (매 단계 점수가 올라야 하므로 실제로는 훨씬 전에 멈춤)
+    const N: usize = ROWS * COLS;
+    let rescore = |l: &mut Layout| { l.calc_scores(&self.corpus_arrays, self.precomp); l.calc_total_score(self.norm); };
+    rescore(&mut cur);
+    let mut ws = SaWorkspace::new(self.corpus_arrays.nz_bigrams.len(), self.corpus_arrays.nz_trigrams.len());
+    for _ in 0..MAX_STEPS {
+      let mut best = cur;
+      for &(p1, p2) in &PAIR_LIST {
+        if !self.same_zone(&[p1, p2]) { continue; }
+        let cand = self.swap2_delta(&cur, p1, p2, &mut ws);
+        if cand.total > best.total { best = cand; }
+      }
+      if best.total == cur.total {
+        for i in 0..N { for j in i + 1..N { for k in j + 1..N {
+          if !self.same_zone(&[i, j, k]) { continue; }
+          for left in [true, false] {
+            let cand = self.swap3_cycle_delta(&cur, i, j, k, left, &mut ws);
+            if cand.total > best.total { best = cand; }
+          }
+        }}}
+      }
+      if best.total <= cur.total { break; }
+      // delta 오차가 쌓이지 않게 단계마다 전체 재계산
+      cur = best;
+      rescore(&mut cur);
+    }
+    cur
+  }
+
   fn random_cycle3(&self, cur: &Layout, ws: &mut SaWorkspace) -> Layout {
     let p1 = fastrand::usize(..ROWS * COLS);
     let p2 = loop { let p = fastrand::usize(..ROWS * COLS); if p != p1 && self.same_zone(&[p1, p]) { break p; } };
@@ -821,6 +853,27 @@ mod tests {
     // 센터에는 제약 글자만: 4글자 + 빈칸 2개
     let n_center = (0..ROWS * COLS).filter(|&p| is_center_slot(p) && a.slots[p] < CHARS as u8).count();
     assert_eq!(n_center, 4);
+  }
+
+  #[test]
+  fn descend_reaches_a_deterministic_local_optimum() {
+    let arrays = test_util::stats().to_arrays(false);
+    let (precomp, norm) = test_util::precomp_norm_soft_hand(&arrays);
+    let mask = arrays.rare_mask(4);
+    let o = Optimizer::new(arrays, &precomp, &norm, 1, 1, test_util::sa(), test_util::ga(), mask);
+    let mut ws = SaWorkspace::new(o.corpus_arrays.nz_bigrams.len(), o.corpus_arrays.nz_trigrams.len());
+    for _ in 0..3 {
+      let start = o.make_scored_excl(&[]);
+      let out = o.descend(start);
+      assert!(out.total >= start.total);
+      assert!(out.center_ok(mask));
+      assert_matches_full_recompute(&out, &o.corpus_arrays, &precomp, &norm);
+      assert!(o.descend(start).slots == out.slots, "same start must give the same result");
+      // 어떤 두 키 맞바꾸기도 더 좋아지지 않음
+      for &(p1, p2) in &PAIR_LIST {
+        if o.same_zone(&[p1, p2]) { assert!(o.swap2_delta(&out, p1, p2, &mut ws).total <= out.total); }
+      }
+    }
   }
 
   #[test]

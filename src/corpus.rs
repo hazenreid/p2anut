@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use serde::{Serialize, Deserialize};
 use crate::layout::CHARS;
 
+#[derive(Clone)]
 pub struct CorpusArrays {
   pub keys: Vec<char>,
   pub freq: Box<[u64]>,
