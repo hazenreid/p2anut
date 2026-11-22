@@ -7,7 +7,10 @@ pub struct Weights {
   pub row: f32,
   pub center: f32,
   pub outroll: f32,
-  pub redirect: f32,
+  // 예전의 redirect 배율은 [costs]의 redirect로 옮김 (설정 파일에 남아 있어도 무시됨)
+  // 검지 없는 리다이렉트(나쁜 리다이렉트) 배율. [costs]의 redirect에 곱함. 1(기본) = 구분 없음
+  #[serde(default = "default_one")]
+  pub bad_redirect: f32,
   // 롤(바이그램·트라이그램)에서 행이 바뀔 때마다 곱하는 값. 없으면 row와 같음 (row는 SFB/scissors의 행 페널티에도 쓰임)
   #[serde(default)]
   pub roll_row: Option<f32>,
@@ -41,7 +44,7 @@ impl Weights {
 
 // 총점의 기준값: 모든 항목을 "검지 홈 행 키 한 번 = 1" 단위의 비용으로 바꿔 그대로 더함.
 // 대표 사건 한 번이 검지 홈 행 키 몇 번을 누르는 만큼인지.
-// 나머지 사건은 [weights]의 세부 배율(행·간격·방향·sfs·redirect 등)로 이 값에서 자동으로 정해짐
+// 나머지 사건은 [weights]의 세부 배율(행·간격·방향·sfs·bad_redirect 등)로 이 값에서 자동으로 정해짐
 #[derive(Deserialize, Clone, Debug)]
 pub struct Costs {
   // 키 노력값 배율 (1 = 노력값 표 그대로)
@@ -56,15 +59,23 @@ pub struct Costs {
   // 안쪽 롤 한 번으로 아끼는 양 (중지 홈 → 검지 홈)
   #[serde(default = "default_cost_inroll")]
   pub inroll: f32,
+  // 리다이렉트 한 번 (홈 행 약지 → 검지 → 중지). 같은 손 세 글자가 방향을 꺾으면 안의 두 쌍은 롤로 치지 않고
+  // 이 비용만 매김. 노력값이 큰 키·손가락 간격·행 이동이 있을수록 커지고, 검지가 없으면 bad_redirect 배
+  #[serde(default = "default_cost_redirect")]
+  pub redirect: f32,
 }
 
 fn default_cost_sfb() -> f32 { 2.5 }
 fn default_cost_full_scissors() -> f32 { 8.0 }
 fn default_cost_inroll() -> f32 { 2.0 }
+fn default_cost_redirect() -> f32 { 1.0 }
 
 impl Default for Costs {
   fn default() -> Self {
-    Self { effort: 1.0, sfb: default_cost_sfb(), full_scissors: default_cost_full_scissors(), inroll: default_cost_inroll() }
+    Self {
+      effort: 1.0, sfb: default_cost_sfb(), full_scissors: default_cost_full_scissors(),
+      inroll: default_cost_inroll(), redirect: default_cost_redirect(),
+    }
   }
 }
 
@@ -209,15 +220,12 @@ impl Config {
       anyhow::bail!("center_rare must be 0 (off) or 2..=6");
     }
     let w = &self.weights;
-    if w.gap < 0.0 || w.row < 0.0 || w.center < 0.0 || w.outroll < 0.0 || w.roll_row() < 0.0 || w.half_scissors < 0.0 || w.full_scissors_good < 0.0 || w.skip_scissors < 0.0 || w.sfs < 0.0 || w.sfs_same_key() < 0.0 {
-      anyhow::bail!("weights.gap, row, roll_row, center, outroll, half_scissors, full_scissors_good, skip_scissors, sfs, sfs_same_key must be non-negative (redirect may be negative)");
-    }
-    if w.redirect < -5.0 || w.redirect > 5.0 {
-      anyhow::bail!("weights.redirect must be in [-5.0, 5.0]");
+    if w.gap < 0.0 || w.row < 0.0 || w.center < 0.0 || w.outroll < 0.0 || w.roll_row() < 0.0 || w.half_scissors < 0.0 || w.full_scissors_good < 0.0 || w.skip_scissors < 0.0 || w.sfs < 0.0 || w.sfs_same_key() < 0.0 || w.bad_redirect < 0.0 {
+      anyhow::bail!("weights.gap, row, roll_row, center, outroll, half_scissors, full_scissors_good, skip_scissors, sfs, sfs_same_key, bad_redirect must be non-negative");
     }
     let c = &self.costs;
-    if c.effort < 0.0 || c.sfb < 0.0 || c.full_scissors < 0.0 || c.inroll < 0.0 {
-      anyhow::bail!("costs.effort, sfb, full_scissors, inroll must be non-negative");
+    if c.effort < 0.0 || c.sfb < 0.0 || c.full_scissors < 0.0 || c.inroll < 0.0 || c.redirect < 0.0 {
+      anyhow::bail!("costs.effort, sfb, full_scissors, inroll, redirect must be non-negative");
     }
     if c.effort + c.sfb + c.full_scissors + c.inroll <= 0.0 {
       anyhow::bail!("at least one cost must be > 0");
@@ -290,9 +298,11 @@ mod tests {
     let mut table: toml::Table = toml::from_str(&std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/config.toml")).unwrap()).unwrap();
     table.remove("costs");
     table.extend(toml::from_str::<toml::Table>(&format!("{url}score_normalization = \"iqr\"\n[rates]\neffort = 0.2\nsfb = 0.2\nrolling = 0.3\nscissors = 0.3\n")).unwrap());
+    // 예전의 [weights] redirect 배율도 무시
+    table.get_mut("weights").unwrap().as_table_mut().unwrap().insert("redirect".into(), toml::Value::Float(-2.0));
     let c: Config = toml::Value::Table(table).try_into().unwrap();
     c.validate().unwrap();
-    assert_eq!((c.costs.sfb, c.costs.full_scissors, c.costs.inroll, c.costs.effort), (2.5, 8.0, 2.0, 1.0));
+    assert_eq!((c.costs.sfb, c.costs.full_scissors, c.costs.inroll, c.costs.effort, c.costs.redirect), (2.5, 8.0, 2.0, 1.0, 1.0));
   }
 
   #[test]

@@ -169,10 +169,10 @@ impl Layout {
       let e = precomp.trigram(p1 as usize, p2 as usize, p3 as usize);
       if e.sfs_base > 0.0 && p1 != p3 { sfs += n; } // 같은 키 스킵그램(ere)은 배열로 피할 수 없어 빼고 셈
       if e.roll_base < 0.0 { redirect += n; }
-      if e.roll_base > 0.0 { roll3 += n; }
+      if e.roll_base > 0.0 { roll3 += n; } // 세 글자 롤
     }
     println!("rows: top={:.1}%  home={:.1}%  bottom={:.1}%", pct(rows[0], letters), pct(rows[1], letters), pct(rows[2], letters));
-    println!("bigrams: sfb={:.2}%  roll={:.1}%  scissors={:.2}%   trigrams: skipgram(other key)={:.2}%  roll/redirect-bonus={:.1}%  redirect-penalty={:.2}%",
+    println!("bigrams: sfb={:.2}%  roll={:.1}%  scissors={:.2}%   trigrams: skipgram(other key)={:.2}%  one-hand-roll={:.1}%  redirect={:.2}%",
       pct(sfb, bg), pct(roll, bg), pct(sciss, bg), pct(sfs, tg), pct(roll3, tg), pct(redirect, tg));
   }
 
@@ -351,9 +351,10 @@ pub fn init_score_norm(arrays: &CorpusArrays, precomp: &Precomp, costs: &crate::
   }
 }
 
-// 대표 사건 (왼손): 검지 홈(1,3)·검지 윗줄(0,3)·중지 홈(1,2)·중지 아랫줄(2,2)
+// 대표 사건 (왼손): 검지 홈(1,3)·검지 윗줄(0,3)·중지 홈(1,2)·중지 아랫줄(2,2). 롤·리다이렉트의 대표 사건은 Precomp에 있음
 const REF_INDEX_HOME: usize = COLS + 3;
 const REF_INDEX_TOP: usize = 3;
+#[cfg(test)]
 const REF_MIDDLE_HOME: usize = COLS + 2;
 const REF_MIDDLE_BOTTOM: usize = 2 * COLS + 2;
 
@@ -365,7 +366,8 @@ pub fn abs_weights(arrays: &CorpusArrays, precomp: &Precomp, c: &crate::config::
     effort: f64::from(c.effort),
     sfb: per(c.sfb, precomp.bigram(REF_INDEX_HOME, REF_INDEX_TOP).sfb_base),
     scissors: per(c.full_scissors, precomp.bigram(REF_MIDDLE_BOTTOM, REF_INDEX_TOP).scissors_base),
-    rolling: per(c.inroll, precomp.bigram(REF_MIDDLE_HOME, REF_INDEX_HOME).rolling_base),
+    // 롤·리다이렉트는 Precomp가 이미 비용 단위로 계산함 (대표 안쪽 롤 = inroll)
+    rolling: 1.0,
     per_letter: if letters > 0 { 1.0 / letters as f64 } else { 0.0 },
   }
 }

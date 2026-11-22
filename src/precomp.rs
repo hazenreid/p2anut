@@ -1,5 +1,5 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss, clippy::cast_sign_loss, clippy::cast_lossless)]
-use crate::config::Weights;
+use crate::config::{Costs, Weights};
 use crate::layout::{ROWS, COLS};
 
 const N: usize = ROWS * COLS; // 30
@@ -10,15 +10,10 @@ const EFFORT_GRID: [[f32; COLS]; ROWS] = [
   [2.2, 1.5, 1.3, 1.1, 4.0, 4.0, 1.1, 1.3, 1.5, 2.2],  // bottom
 ];
 
-// 리다이렉트 페널티의 기준 노력값 합: 홈 행 세 키 정도. 이 값에서 페널티 크기가 보너스 식(1/노력값 합)과 같아짐
-const REDIRECT_REF_EFFORT: f32 = 3.0;
-
-// 트라이그램 롤·리다이렉트 값. 보너스(w ≥ 0)는 쉬울수록(노력값 합이 작고, 간격·행 이동 배율 m이 클수록) 크고,
-// 페널티(w < 0)는 반대로 어려울수록 커야 함. 그래서 페널티는 노력값 합에 비례하고 m으로 나눔.
-// 노력값 합이 REDIRECT_REF_EFFORT이고 m = 1이면 두 식의 크기가 같음
-fn trigram_roll_value(w: f32, effort_sum: f32, m: f32) -> f32 {
-  if w >= 0.0 { w * m / effort_sum } else { w * effort_sum / (REDIRECT_REF_EFFORT * REDIRECT_REF_EFFORT) / m }
-}
+// 대표 사건 위치 (왼손 홈 행): [costs]의 inroll(중지 → 검지), redirect(약지 → 검지 → 중지)가 가리키는 사건
+const REF_RING_HOME: usize = COLS + 1;
+const REF_MIDDLE_HOME: usize = COLS + 2;
+const REF_INDEX_HOME: usize = COLS + 3;
 
 // 손가락 길이 순위 (클수록 김): 중지 > 약지 > 검지 > 새끼. FINGER_GRID 번호(1~8)로 인덱스
 const FINGER_LEN: [u8; 9] = [0, 2, 4, 3, 1, 2, 4, 3, 1];
@@ -51,6 +46,8 @@ pub struct BigramEntry {
 #[derive(Clone, Copy, Default)]
 pub struct TrigramEntry {
   pub sfs_base: f32,
+  // 세 글자 롤의 추가 보너스(양수), 또는 리다이렉트(음수: 안의 두 쌍의 롤 보너스를 되돌리고 리다이렉트 비용을 뺀 값).
+  // 바이그램 rolling_base와 같은 단위 (비용 단위, 검지 홈 키 한 번 = 1)
   pub roll_base: f32,
   // 스킵 시저스: 1·3번 키가 같은 손 인접 손가락, 두 줄 차이 (scissors 항목에 더함)
   pub skip_scissors_base: f32,
@@ -64,7 +61,9 @@ pub struct Precomp {
 }
 
 impl Precomp {
-  pub fn new(freqs: &[u64], weights: &Weights, min_hand_usage: f32) -> Self {
+  // 롤 값(바이그램 rolling_base, 트라이그램 roll_base)은 비용 단위로 계산: 대표 안쪽 롤 = costs.inroll,
+  // 대표 리다이렉트 세 글자 전체 = -costs.redirect. 그래서 리다이렉트 크기가 inroll과 독립적임
+  pub fn new(freqs: &[u64], weights: &Weights, costs: &Costs, min_hand_usage: f32) -> Self {
     let mut bigrams = vec![BigramEntry::default(); N * N].into_boxed_slice();
     let mut trigrams = vec![TrigramEntry::default(); N * N * N].into_boxed_slice();
     
@@ -85,6 +84,23 @@ impl Precomp {
       let is_left = c < mid;
       (r, finger, EFFORT_GRID[r][c], is_center, is_left)
     }).collect();
+
+    // 손가락 간격 배율 (붙은 손가락 = 1, 하나 건너뛸 때마다 gap배)
+    let gap_mult = |fa: u8, fb: u8| { let g = fa.abs_diff(fb); if g > 1 { weights.gap.powf(f32::from(g - 1)) } else { 1.0 } };
+    // 롤 모양 (방향 × 간격 × 행 이동 / 노력값 합). 대표 안쪽 롤이 costs.inroll이 되도록 배율을 맞춤
+    let raw_roll = |p1: usize, p2: usize| {
+      let (r1, f1, e1, _, _) = pos_info[p1]; let (r2, f2, e2, _, _) = pos_info[p2];
+      (if f1 > f2 { 1.0f32 } else { weights.outroll }) * gap_mult(f1, f2) * weights.roll_row().powf(r1.abs_diff(r2) as f32) / (e1 + e2)
+    };
+    let ref_inroll = raw_roll(REF_MIDDLE_HOME, REF_INDEX_HOME);
+    let roll_scale = if ref_inroll > 0.0 { costs.inroll / ref_inroll } else { 0.0 };
+    // 리다이렉트 모양 (노력값 합 / (간격 × 행 이동 배율)): 대표 리다이렉트가 1이 되도록 나눠서 씀
+    let redirect_shape = |p1: usize, p2: usize, p3: usize| {
+      let (r1, f1, e1, _, _) = pos_info[p1]; let (r2, f2, e2, _, _) = pos_info[p2]; let (r3, f3, e3, _, _) = pos_info[p3];
+      let m = gap_mult(f1, f2) * gap_mult(f2, f3) * weights.roll_row().powf((r1.abs_diff(r2) + r2.abs_diff(r3)) as f32);
+      (e1 + e2 + e3) / m
+    };
+    let ref_redirect = redirect_shape(REF_RING_HOME, REF_INDEX_HOME, REF_MIDDLE_HOME);
 
     for p1 in 0..N {
       let (r1, f1, e1, ic1, il1) = pos_info[p1];
@@ -112,9 +128,7 @@ impl Precomp {
             // 나쁜 방향 하프 시저스: 풀 시저스처럼 롤이 아닌 시저스로 분류
             entry.scissors_base = weights.half_scissors * effort_sum * (1.0 + weights.row * row_dist as f32);
           } else {
-            let gap_mult = if gap_dist > 1 { weights.gap.powf(f32::from(gap_dist - 1)) } else { 1.0 };
-            let row_mult = weights.roll_row().powf(row_dist as f32);
-            entry.rolling_base = (if f1 > f2 { 1.0f32 } else { weights.outroll }) * gap_mult * row_mult / effort_sum;
+            entry.rolling_base = roll_scale * raw_roll(p1, p2);
           }
         }
       }
@@ -148,15 +162,19 @@ impl Precomp {
             // 풀 시저스(행 2칸)·나쁜 방향 하프 시저스 전이가 있으면 롤/리다이렉트로 치지 않음
             if f1 != f2 && f2 != f3 && f1 != f3 && !is_center && row_delta1 != 2 && row_delta2 != 2
               && !is_bad_half_scissor(f1, r1, f2, r2) && !is_bad_half_scissor(f2, r2, f3, r3) {
-              let w: f32 = if f1 > f2 && f2 > f3 { 1.0 } else if f1 < f2 && f2 < f3 { weights.outroll } else { weights.redirect };
-              let effort_sum = e1 + e2 + e3;
-              let gap_dist1 = f1.abs_diff(f2);
-              let gap_dist2 = f2.abs_diff(f3);
-              let gap_mult1 = if gap_dist1 > 1 { weights.gap.powf(f32::from(gap_dist1 - 1)) } else { 1.0 };
-              let gap_mult2 = if gap_dist2 > 1 { weights.gap.powf(f32::from(gap_dist2 - 1)) } else { 1.0 };
-              let total_row_dist = (row_delta1 + row_delta2) as f32;
-              let row_mult = weights.roll_row().powf(total_row_dist);
-              entry.roll_base = trigram_roll_value(w, effort_sum, gap_mult1 * gap_mult2 * row_mult);
+              let monotonic = (f1 > f2 && f2 > f3) || (f1 < f2 && f2 < f3);
+              if monotonic {
+                // 세 글자 롤: 두 쌍의 롤 보너스에 더해 주는 추가 보너스 (안쪽 1, 바깥쪽 outroll배)
+                let dir = if f1 > f2 { 1.0 } else { weights.outroll };
+                let m = gap_mult(f1, f2) * gap_mult(f2, f3) * weights.roll_row().powf((row_delta1 + row_delta2) as f32);
+                entry.roll_base = roll_scale * dir * m / (e1 + e2 + e3);
+              } else {
+                // 리다이렉트: 하나의 사건으로 침. 안의 두 쌍(둘 다 롤로 분류됨)의 보너스를 되돌리고 리다이렉트 비용을 뺌
+                let bad = ![f1, f2, f3].iter().any(|&f| f == 1 || f == 5);
+                let cost = costs.redirect * (if bad { weights.bad_redirect } else { 1.0 }) * redirect_shape(p1, p2, p3) / ref_redirect;
+                let pair_bonus = bigrams[p1 * N + p2].rolling_base + bigrams[p2 * N + p3].rolling_base;
+                entry.roll_base = -pair_bonus - cost;
+              }
             }
           }
         }
@@ -203,9 +221,9 @@ mod tests {
   fn sfs_weight_scales_skipgrams_only() {
     let mut w = crate::test_util::weights();
     w.sfs = 1.0;
-    let full = Precomp::new(&[1; crate::layout::CHARS], &w, 0.45);
+    let full = Precomp::new(&[1; crate::layout::CHARS], &w, &Costs::default(), 0.45);
     w.sfs = 0.5;
-    let half = Precomp::new(&[1; crate::layout::CHARS], &w, 0.45);
+    let half = Precomp::new(&[1; crate::layout::CHARS], &w, &Costs::default(), 0.45);
     // 왼손 중지 윗줄(0,2) → 다른 손가락 → 중지 아랫줄(2,2): 스킵그램
     let (a, b, c) = (2, COLS + 3, 2 * COLS + 2);
     assert!(full.trigram(a, b, c).sfs_base > 0.0);
@@ -221,9 +239,9 @@ mod tests {
   fn same_key_skipgram_has_its_own_weight() {
     let mut w = crate::test_util::weights();
     w.sfs = 0.5;
-    let old = Precomp::new(&[1; crate::layout::CHARS], &w, 0.45);
+    let old = Precomp::new(&[1; crate::layout::CHARS], &w, &Costs::default(), 0.45);
     w.sfs_same_key = Some(0.0);
-    let new = Precomp::new(&[1; crate::layout::CHARS], &w, 0.45);
+    let new = Precomp::new(&[1; crate::layout::CHARS], &w, &Costs::default(), 0.45);
     // 같은 키(검지 홈 → 다른 손가락 → 같은 검지 홈): 없으면 sfs와 같고, 0이면 감점 없음
     let (k, mid) = (COLS + 3, COLS + 1);
     assert!(old.trigram(k, mid, k).sfs_base > 0.0);
@@ -233,37 +251,57 @@ mod tests {
     assert!(new.trigram(k, mid, 3).sfs_base > 0.0);
   }
 
-  #[test]
-  fn redirect_penalty_grows_on_harder_keys() {
-    let mut w = crate::test_util::weights();
-    w.redirect = -1.5;
-    let pc = Precomp::new(&[1; crate::layout::CHARS], &w, 0.45);
-    // 왼손 약지 → 검지 → 중지 (방향이 바뀌는 리다이렉트)
-    let home = pc.trigram(COLS + 1, COLS + 3, COLS + 2).roll_base;
-    let top = pc.trigram(1, 3, 2).roll_base;
-    let mixed = pc.trigram(1, COLS + 3, 2).roll_base; // 윗줄 → 홈 → 윗줄 (행 이동 두 번)
-    assert!(home < 0.0 && top < home && mixed < home, "home {home}, top {top}, mixed {mixed}");
-    // 홈 행 기준값: -1.5 × 노력값 합(1.1+1.0+1.0) / 9 / 간격 배율(약지→검지 gap)
-    assert!((home - (-1.5 * 3.1 / 9.0 / w.gap)).abs() < 1e-5, "{home}");
+  // 세 글자 전체의 롤 값 (두 쌍의 바이그램 + 트라이그램). 비용 단위, 양수 = 이득
+  fn whole3(pc: &Precomp, p1: usize, p2: usize, p3: usize) -> f32 {
+    pc.bigram(p1, p2).rolling_base + pc.bigram(p2, p3).rolling_base + pc.trigram(p1, p2, p3).roll_base
+  }
 
-    // 양수면 보너스: 쉬운 키일수록 큼 (롤과 같은 식)
-    w.redirect = 0.5;
-    let pc = Precomp::new(&[1; crate::layout::CHARS], &w, 0.45);
-    let home = pc.trigram(COLS + 1, COLS + 3, COLS + 2).roll_base;
-    let top = pc.trigram(1, 3, 2).roll_base;
-    assert!(home > top && top > 0.0);
-    // 롤 보너스(안쪽 롤)는 그대로: 약지 → 중지 → 검지 홈
-    let roll = pc.trigram(COLS + 1, COLS + 2, COLS + 3).roll_base;
-    assert!((roll - 1.0 / 3.1).abs() < 1e-5, "{roll}");
+  #[test]
+  fn redirect_is_one_event_with_its_own_cost() {
+    let mut w = crate::test_util::weights();
+    w.bad_redirect = 2.0;
+    let c = Costs::default();
+    let pc = Precomp::new(&[1; crate::layout::CHARS], &w, &c, 0.45);
+    // 대표 리다이렉트(약지 → 검지 → 중지, 홈 행): 세 글자 전체가 정확히 -costs.redirect (안의 롤 보너스는 되돌림)
+    let home = whole3(&pc, REF_RING_HOME, REF_INDEX_HOME, REF_MIDDLE_HOME);
+    assert!((home + c.redirect).abs() < 1e-5, "{home}");
+    // 어려운 키·넓은 간격일수록 비쌈
+    let top = whole3(&pc, 1, 3, 2);
+    let wide = whole3(&pc, COLS, COLS + 3, COLS + 1); // 새끼 → 검지 → 약지
+    assert!(top < home && wide < home, "top {top}, wide {wide}");
+    // 검지 없는 리다이렉트(약지 → 새끼 → 중지)는 bad_redirect배: 노력값 (1.1+1.6+1.0)/3.1, 간격 배율은 대표와 같음
+    let bad = whole3(&pc, COLS + 1, COLS, COLS + 2);
+    assert!((bad + 2.0 * c.redirect * 3.7 / 3.1).abs() < 1e-4, "{bad}");
+    // inroll을 바꿔도 리다이렉트 크기는 그대로
+    let c2 = Costs { inroll: 4.0, ..Costs::default() };
+    let pc2 = Precomp::new(&[1; crate::layout::CHARS], &w, &c2, 0.45);
+    assert!((whole3(&pc2, REF_RING_HOME, REF_INDEX_HOME, REF_MIDDLE_HOME) + c.redirect).abs() < 1e-5);
+  }
+
+  #[test]
+  fn rolls_are_in_cost_units() {
+    let w = crate::test_util::weights();
+    let c = Costs::default();
+    let pc = Precomp::new(&[1; crate::layout::CHARS], &w, &c, 0.45);
+    // 대표 안쪽 롤(중지 홈 → 검지 홈) = costs.inroll, 바깥쪽은 outroll배
+    assert!((pc.bigram(REF_MIDDLE_HOME, REF_INDEX_HOME).rolling_base - c.inroll).abs() < 1e-6);
+    assert!((pc.bigram(REF_INDEX_HOME, REF_MIDDLE_HOME).rolling_base - c.inroll * w.outroll).abs() < 1e-6);
+    // 세 글자 안쪽 롤(약지 → 중지 → 검지)의 추가 보너스: 대표 롤과 같은 배율 × 1/(1.1+1.0+1.0)
+    let scale = c.inroll / (1.0 / 2.0);
+    let extra = pc.trigram(REF_RING_HOME, REF_MIDDLE_HOME, REF_INDEX_HOME).roll_base;
+    assert!((extra - scale / 3.1).abs() < 1e-5, "{extra}");
+    // 세 글자 롤 전체는 두 쌍의 롤 + 추가 보너스 (리다이렉트처럼 되돌리지 않음)
+    let total = whole3(&pc, REF_RING_HOME, REF_MIDDLE_HOME, REF_INDEX_HOME);
+    assert!(total > pc.bigram(REF_RING_HOME, REF_MIDDLE_HOME).rolling_base + pc.bigram(REF_MIDDLE_HOME, REF_INDEX_HOME).rolling_base);
   }
 
   #[test]
   fn half_scissors_weight_applies_to_bad_direction_only() {
     let mut w = crate::test_util::weights();
     w.half_scissors = 0.0;
-    let off = Precomp::new(&[1; crate::layout::CHARS], &w, 0.45);
+    let off = Precomp::new(&[1; crate::layout::CHARS], &w, &Costs::default(), 0.45);
     w.half_scissors = 1.0;
-    let on = Precomp::new(&[1; crate::layout::CHARS], &w, 0.45);
+    let on = Precomp::new(&[1; crate::layout::CHARS], &w, &Costs::default(), 0.45);
     // 왼손 검지 윗줄(0,3) → 중지 홈(1,2): 나쁜 방향, 롤 보상은 유지
     let (bad1, bad2) = (3, COLS + 2);
     assert_eq!(off.bigram(bad1, bad2).scissors_base, 0.0);

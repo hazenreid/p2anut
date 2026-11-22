@@ -19,7 +19,7 @@ pub fn stats() -> CorpusStats {
 }
 
 pub fn weights() -> Weights {
-  Weights { gap: 0.78, row: 0.97, center: 2.5, outroll: 0.70, redirect: 0.30, roll_row: None, half_scissors: 1.0, full_scissors_good: 0.5, skip_scissors: 0.5, sfs: 1.0, sfs_same_key: None }
+  Weights { gap: 0.78, row: 0.97, center: 2.5, outroll: 0.70, bad_redirect: 1.0, roll_row: None, half_scissors: 1.0, full_scissors_good: 0.5, skip_scissors: 0.5, sfs: 1.0, sfs_same_key: None }
 }
 
 pub fn sa() -> SaParams {
@@ -35,7 +35,7 @@ pub fn precomp_norm(stats: &CorpusStats) -> (Precomp, ScoreNorm) {
 }
 
 pub fn precomp_norm_for(arrays: &CorpusArrays) -> (Precomp, ScoreNorm) {
-  let precomp = Precomp::new(&arrays.freq, &weights(), 0.45);
+  let precomp = Precomp::new(&arrays.freq, &weights(), &crate::config::Costs::default(), 0.45);
   let norm = crate::layout::init_score_norm(arrays, &precomp, &crate::config::Costs::default(), 0);
   (precomp, norm)
 }
