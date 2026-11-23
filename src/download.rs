@@ -341,7 +341,8 @@ fn save_state(path: &Path, s: &PartState) -> anyhow::Result<()> {
 
 // part를 전체 크기로 만들어 두고(덩어리를 제자리에 씀) 받은 덩어리 목록을 돌려줌.
 // 기록이 맞지 않으면 처음부터. 기록 없이 part만 있으면 예전 방식(앞에서부터 이어 붙임)으로 받다 만 파일로 보고
-// 그 길이까지(덩어리 경계로 버림) 받은 것으로 침
+// 그 길이까지(덩어리 경계로 버림) 받은 것으로 침. 기록 없이 전체 크기인 part는 내용을 알 수 없으므로(전체 크기로 만든 뒤
+// 기록을 쓰기 전에 꺼졌거나 기록만 지운 경우) 여기 오기 전에 SHA-1로 확인함 (full_part_without_state)
 fn prepare_part(part: &Path, file: &str, total: u64, chunk: u64) -> anyhow::Result<Vec<bool>> {
   let n = total.div_ceil(chunk) as usize;
   let sp = state_path(part);
@@ -358,24 +359,44 @@ fn prepare_part(part: &Path, file: &str, total: u64, chunk: u64) -> anyhow::Resu
       println!("[Download] progress record in {} does not match this download; starting over", sp.display());
       if part_len.is_some() { fs::remove_file(part)?; }
     }
-    (None, Some(len)) if len > total => {
-      println!("[Download] partial file larger than remote ({len} > {total}); starting over");
+    // 전체 크기 이상인데 기록이 없으면 내용을 알 수 없음 (전체 크기는 보통 full_part_without_state에서 먼저 걸러짐)
+    (None, Some(len)) if len >= total => {
+      println!("[Download] partial file of {len} bytes (remote {total}) has no progress record; starting over");
       fs::remove_file(part)?;
     }
     (None, Some(len)) => {
-      let full = if len == total { n } else { (len / chunk) as usize };
+      let full = (len / chunk) as usize;
       for d in done.iter_mut().take(full) { *d = true; }
       if full > 0 { println!("[Download] resuming an earlier partial file: {} of {} MiB", (full as u64 * chunk).min(total) >> 20, total >> 20); }
     }
     (None, None) => {}
   }
-  fs::OpenOptions::new().create(true).truncate(false).write(true).open(part)?.set_len(total)?;
+  // 기록을 먼저 쓰고 파일을 키움: 그 사이에 꺼져도 "기록 없이 전체 크기인 part"가 남지 않게
   save_state(&sp, &PartState { file: file.to_string(), total, chunk, done: done.clone() })?;
+  fs::OpenOptions::new().create(true).truncate(false).write(true).open(part)?.set_len(total)?;
   Ok(done)
 }
 
-// 덩어리 [offset, offset+len)를 받아 메모리로. 206과 전체 크기·길이가 맞아야 함
-fn fetch_range(client: &Client, url: &str, offset: u64, len: u64, total: u64, timeout: Duration, received: &AtomicU64) -> anyhow::Result<Vec<u8>> {
+// 기록 없이 전체 크기인 part: 공개된 SHA-1과 같으면 다 받은 파일(예전 방식에서 검증 중에 멈춘 경우 등)로 쓰고,
+// 다르거나 확인할 수 없으면 지우고 처음부터. Ok(true) = 다 받은 파일
+fn full_part_without_state(client: &Client, urls: &[String], part: &Path, file: &str, total: u64, verify: bool) -> anyhow::Result<bool> {
+  if state_path(part).exists() || fs::metadata(part).map(|m| m.len()).ok() != Some(total) { return Ok(false); }
+  println!("[Download] {} is full size but has no progress record; checking it against the published SHA-1", part.display());
+  let expected = if verify { expected_sha1(client, urls, file) } else { None };
+  if let Some(h) = expected && sha1_file(part)? == h {
+    println!("\r[Verify] sha1 OK          ");
+    return Ok(true);
+  }
+  println!("\n[Download] cannot confirm its contents ({}); starting over", if verify { "sha1 differs or is not published" } else { "verification is off" });
+  fs::remove_file(part)?;
+  Ok(false)
+}
+
+// 덩어리 [offset, offset+len)를 받아 메모리로. 206과 전체 크기·길이가 맞아야 함.
+// Ok(None) = 받는 도중 cancelled()가 참이 됨 (같이 받던 다른 연결이 먼저 끝냄): 바로 손을 뗌
+#[allow(clippy::too_many_arguments)]
+fn fetch_range(client: &Client, url: &str, offset: u64, len: u64, total: u64, timeout: Duration, received: &AtomicU64,
+  cancelled: &dyn Fn() -> bool) -> anyhow::Result<Option<Vec<u8>>> {
   let mut resp = client.get(url)
     .header(reqwest::header::RANGE, format!("bytes={offset}-{}", offset + len - 1))
     .timeout(timeout)
@@ -391,6 +412,7 @@ fn fetch_range(client: &Client, url: &str, offset: u64, len: u64, total: u64, ti
   let mut buf = vec![0u8; 1 << 20];
   loop {
     if SHUTDOWN.load(Ordering::SeqCst) { anyhow::bail!("interrupted"); }
+    if cancelled() { return Ok(None); }
     let n = resp.read(&mut buf)?;
     if n == 0 { break; }
     data.extend_from_slice(&buf[..n]);
@@ -398,7 +420,21 @@ fn fetch_range(client: &Client, url: &str, offset: u64, len: u64, total: u64, ti
     anyhow::ensure!(data.len() as u64 <= len, "server sent more than requested");
   }
   anyhow::ensure!(data.len() as u64 == len, "chunk ended early at {}/{len} bytes", data.len());
-  Ok(data)
+  Ok(Some(data))
+}
+
+// Ctrl-C를 0.1초마다 확인하며 기다림 (재시도 대기 중에도 바로 멈출 수 있게)
+fn pause(d: Duration) {
+  let end = Instant::now() + d;
+  while !SHUTDOWN.load(Ordering::SeqCst) && Instant::now() < end {
+    std::thread::sleep(Duration::from_millis(100).min(end.saturating_duration_since(Instant::now())));
+  }
+}
+
+// 작업자가 어떻게 끝나든(panic 포함) 살아 있는 연결 수를 줄임 (진행 표시가 영원히 기다리지 않게)
+struct LiveGuard<'a>(&'a AtomicUsize);
+impl Drop for LiveGuard<'_> {
+  fn drop(&mut self) { self.0.fetch_sub(1, Ordering::SeqCst); }
 }
 
 fn write_at(file: &mut fs::File, offset: u64, data: &[u8]) -> std::io::Result<()> {
@@ -497,8 +533,11 @@ impl Engine<'_> {
       };
       let offset = i as u64 * chunk;
       let len = chunk.min(self.total - offset);
-      match fetch_range(self.client, &url, offset, len, self.total, self.opts.chunk_timeout, &self.received[slot]) {
-        Ok(data) => {
+      let cancelled = || self.work.lock().unwrap().done[i];
+      match fetch_range(self.client, &url, offset, len, self.total, self.opts.chunk_timeout, &self.received[slot], &cancelled) {
+        // 같이 받던 연결이 먼저 끝냄: 이 연결은 손만 뗌
+        Ok(None) => { self.work.lock().unwrap().release(i); }
+        Ok(Some(data)) => {
           failures = 0;
           let already = self.work.lock().unwrap().done[i];
           let written = if already { Ok(()) } else { write_at(&mut file, offset, &data) };
@@ -529,7 +568,7 @@ impl Engine<'_> {
           }
           let wait = (self.opts.retry_wait * failures).min(self.opts.max_wait);
           eprintln!("\n[Download] {}: {e:#} — retry {failures}/{} in {:.1}s", host(&url), self.opts.max_failures, wait.as_secs_f32());
-          std::thread::sleep(wait);
+          pause(wait);
         }
       }
     }
@@ -564,7 +603,7 @@ fn download_chunks(client: &Client, primary: &[String], backups: Vec<String>, pa
   std::thread::scope(|s| {
     for (slot, url) in primary.iter().enumerate() {
       let e = &engine;
-      s.spawn(move || { e.worker(slot, url); e.live.fetch_sub(1, Ordering::SeqCst); });
+      s.spawn(move || { let _live = LiveGuard(&e.live); e.worker(slot, url); });
     }
     // 1초마다 진행 표시: 받은 양, 전체 속도, 연결마다 속도
     let mut last = Instant::now();
@@ -616,7 +655,7 @@ fn remote_size(client: &Client, url: &str, opts: &DownloadOpts) -> anyhow::Resul
         if failures > opts.max_failures { return Err(e.context("all 1 dump URLs failed")); }
         let wait = (opts.retry_wait * failures).min(opts.max_wait);
         eprintln!("[Download] {e:#} — retry {failures}/{} in {:.1}s", opts.max_failures, wait.as_secs_f32());
-        std::thread::sleep(wait);
+        pause(wait);
       }
     }
   }
@@ -640,10 +679,14 @@ pub fn download_dump(client: &Client, urls: &[String], path: &Path, opts: &Downl
   anyhow::ensure!(!urls.is_empty(), "no dump URL");
   let part = PathBuf::from(format!("{}.part", path.display()));
   let file = path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
-  if urls.len() == 1 {
+  // (받을 주소들, 예비, 파일 크기). Range를 무시하는 서버 하나뿐이면 통째로 받음
+  let (primary, backups, total) = if urls.len() == 1 {
     match remote_size(client, &urls[0], opts)? {
-      Some(total) => download_chunks(client, &urls[..1], Vec::new(), &part, &file, total, opts)?,
-      None => download_whole(client, &urls[0], &part)?,
+      Some(total) => (urls[..1].to_vec(), Vec::new(), total),
+      None => {
+        download_whole(client, &urls[0], &part)?;
+        return finish_download(client, urls, &part, path, opts.verify);
+      }
     }
   } else {
     println!("[Mirror] measuring {} URLs one at a time...", urls.len());
@@ -654,14 +697,24 @@ pub fn download_dump(client: &Client, urls: &[String], path: &Path, opts: &Downl
     } else {
       (vec![ranked[0].url.clone()], ranked[1..].iter().map(|p| p.url.clone()).collect())
     };
-    download_chunks(client, &primary, backups, &part, &file, total, opts)?;
+    (primary, backups, total)
+  };
+  if full_part_without_state(client, urls, &part, &file, total, opts.verify)? {
+    // 방금 SHA-1로 확인했으므로 다시 검증하지 않음
+    return finish_download(client, urls, &part, path, false);
   }
-  if opts.verify && let Err(e) = verify_download(client, urls, &part, path) {
-    let _ = fs::remove_file(state_path(&part));
+  download_chunks(client, &primary, backups, &part, &file, total, opts)?;
+  finish_download(client, urls, &part, path, opts.verify)
+}
+
+// 다 받은 part를 검증하고 최종 이름으로. 검증에 실패하면 part는 .bad로 옮겨지고 기록도 지움
+fn finish_download(client: &Client, urls: &[String], part: &Path, path: &Path, verify: bool) -> anyhow::Result<()> {
+  if verify && let Err(e) = verify_download(client, urls, part, path) {
+    let _ = fs::remove_file(state_path(part));
     return Err(e);
   }
-  fs::rename(&part, path)?;
-  let _ = fs::remove_file(state_path(&part));
+  fs::rename(part, path)?;
+  let _ = fs::remove_file(state_path(part));
   println!("[Download] done: {}", path.display());
   Ok(())
 }
@@ -1064,6 +1117,62 @@ mod tests {
     assert_eq!(fs::read(&path).unwrap(), *data);
     assert_eq!(hits.load(Ordering::SeqCst), 1 + 5);
     fs::remove_dir_all(&dir).unwrap();
+  }
+
+  #[test]
+  fn a_superseded_copy_stops_right_away() {
+    // 아주 느린 서버(64KB마다 0.5초): 다 받으면 5초. 0.3초 뒤 "다른 연결이 끝냄"이 되면 바로 손을 뗌
+    let (url, _) = serve(body(640 << 10), Mode::Ok { delay_per_64k_ms: 500 });
+    let t = Instant::now();
+    let cancel = || t.elapsed() > Duration::from_millis(300);
+    let got = fetch_range(&client(), &url, 0, 640 << 10, 640 << 10, Duration::from_secs(30), &AtomicU64::new(0), &cancel).unwrap();
+    assert!(got.is_none());
+    assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+    // 취소되지 않으면 끝까지 받음
+    let (fast, _) = serve(body(300_000), Mode::Ok { delay_per_64k_ms: 0 });
+    let got = fetch_range(&client(), &fast, 100_000, 50_000, 300_000, Duration::from_secs(5), &AtomicU64::new(0), &|| false).unwrap().unwrap();
+    assert_eq!(got, body(300_000)[100_000..150_000]);
+  }
+
+  #[test]
+  fn a_full_size_part_without_record_is_checked_before_use() {
+    let dir = std::env::temp_dir().join(format!("p2anut-full-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let data = body(650_000);
+    let file = &DUMP[1..];
+    let sums = format!("{}  {file}\n", sha1_hex(&data));
+    // 내용이 맞는 파일 (예전 방식에서 검증 중에 멈춤): SHA-1이 맞으면 다시 받지 않음 (크기 요청만)
+    let path = dir.join(file);
+    fs::write(dir.join(format!("{file}.part")), &*data).unwrap();
+    let url = serve_with_sums(data.clone(), &sums);
+    download_dump(&client(), &[url], &path, &opts()).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), *data);
+    fs::remove_file(&path).unwrap();
+    // 0으로 채운 파일 (전체 크기로 만든 뒤 기록 전에 꺼짐): SHA-1이 달라서 처음부터 받음
+    fs::write(dir.join(format!("{file}.part")), vec![0u8; data.len()]).unwrap();
+    let url = serve_with_sums(data.clone(), &sums);
+    download_dump(&client(), &[url], &path, &opts()).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), *data);
+    fs::remove_file(&path).unwrap();
+    // 검증을 끄면 확인할 수 없으므로 처음부터 (크기 요청 + 덩어리 7개)
+    fs::write(dir.join(format!("{file}.part")), vec![0u8; data.len()]).unwrap();
+    let (url, hits) = serve(data.clone(), Mode::Ok { delay_per_64k_ms: 0 });
+    download_dump(&client(), &[url], &path, &DownloadOpts { verify: false, ..opts() }).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), *data);
+    assert_eq!(hits.load(Ordering::SeqCst), 1 + 7);
+    fs::remove_dir_all(&dir).unwrap();
+  }
+
+  #[test]
+  fn live_count_drops_even_if_a_worker_panics() {
+    let live = AtomicUsize::new(2);
+    std::thread::scope(|s| {
+      let l = &live;
+      let h = s.spawn(move || { let _g = LiveGuard(l); panic!("worker died"); });
+      assert!(h.join().is_err());
+      s.spawn(move || { let _g = LiveGuard(l); });
+    });
+    assert_eq!(live.load(Ordering::SeqCst), 0);
   }
 
   #[test]
