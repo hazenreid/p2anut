@@ -197,7 +197,8 @@ pub struct Config {
   #[serde(default = "default_trigram_coverage")]
   pub trigram_coverage: f64,
   // 코퍼스 빈도 최하위 n글자를 가운데 두 열(검지 안쪽)에 강제 배치. 다른 글자는 절대 센터에 안 옴.
-  // 0(기본) = 제약 없음. 2~6 (센터는 6칸, 나머지 24칸에 26-n글자가 들어가야 하므로 2 이상)
+  // 0(기본) = 제약 없음. 2~6 (센터는 6칸, 나머지 24칸에 키 수 - n개가 들어가야 하므로 엄지 방식(26키)은 2 이상,
+  // 스페이스를 배열에 두면(27키) 3 이상)
   #[serde(default)]
   pub center_rare: usize,
   // 스페이스를 어디에 둘지. thumb(기본) = 엄지 키 (배열에는 a-z 26키), grid = 배열의 한 칸 (27키)
@@ -291,8 +292,9 @@ impl Config {
     for (name, v) in [("bigram_coverage", self.bigram_coverage), ("trigram_coverage", self.trigram_coverage)] {
       if !(v > 0.0 && v <= 1.0) { anyhow::bail!("{name} must be in (0.0, 1.0]"); }
     }
-    if self.center_rare != 0 && !(2..=6).contains(&self.center_rare) {
-      anyhow::bail!("center_rare must be 0 (off) or 2..=6");
+    let min_rare = if self.space_on_grid() { 3 } else { 2 };
+    if self.center_rare != 0 && !(min_rare..=6).contains(&self.center_rare) {
+      anyhow::bail!("center_rare must be 0 (off) or {min_rare}..=6{}", if self.space_on_grid() { " with space_key = \"grid\" (27 keys, 24 outer slots)" } else { "" });
     }
     let w = &self.weights;
     if w.gap < 0.0 || w.row < 0.0 || w.center < 0.0 || w.outroll < 0.0 || w.roll_row() < 0.0 || w.half_scissors < 0.0 || w.full_scissors_good < 0.0 || w.skip_scissors < 0.0 || w.sfs < 0.0 || w.sfs_same_key() < 0.0 || w.bad_redirect < 0.0 {
@@ -446,6 +448,16 @@ mod tests {
     assert!(config(&format!("{url}trigram_coverage = 0.0")).validate().is_err());
     assert!(config(&format!("{url}bigram_coverage = 1.0")).validate().is_ok());
     assert!(config("wikipedia_dump_url = \"https://m.org/\"\nwikipedia_download = true").validate().is_err());
+  }
+
+  #[test]
+  fn center_rare_leaves_room_for_the_outer_keys() {
+    let url = "wikipedia_dump_url = \"https://m.org/a.xml.bz2\"\n";
+    // 엄지 방식(26키)은 2부터, 스페이스를 배열에 두면(27키) 바깥 24칸에 다 들어가도록 3부터
+    assert!(config(&format!("{url}center_rare = 2")).validate().is_ok());
+    assert!(config(&format!("{url}center_rare = 2\nspace_key = \"grid\"")).validate().is_err());
+    assert!(config(&format!("{url}center_rare = 3\nspace_key = \"grid\"")).validate().is_ok());
+    assert!(config(&format!("{url}center_rare = 0\nspace_key = \"grid\"")).validate().is_ok());
   }
 
   #[test]
