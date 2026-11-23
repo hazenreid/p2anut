@@ -3,16 +3,6 @@ use crate::score::{Score, ScoreNorm};
 use crate::corpus::CorpusArrays;
 use crate::precomp::Precomp;
 
-pub fn fmt_num(n: i64) -> String {
-  let s = n.unsigned_abs().to_string();
-  let with_commas = s.as_bytes().rchunks(3)
-    .rev()
-    .map(|c| std::str::from_utf8(c).unwrap())
-    .collect::<Vec<_>>()
-    .join(",");
-  if n < 0 { format!("-{with_commas}") } else { with_commas }
-}
-
 pub const EMPTY: u8 = 255;
 pub const CHARS: usize = 27;  // a-z + space(26)
 pub const ROWS: usize = 3;
@@ -299,31 +289,18 @@ impl Layout {
       }
       println!("{s}");
     }
-    let total_usage = (self.left_usage + self.right_usage) as f32;
-    let (left_pct, right_pct) = if total_usage > 0.0 {
-      (self.left_usage as f32 / total_usage * 100.0, self.right_usage as f32 / total_usage * 100.0)
-    } else {
-      (0.0, 0.0)
-    };
-    println!("effort={}  sfb={}  rolling={}  scissors={}  total={}",
-      fmt_num(self.score.effort as i64), fmt_num(self.score.sfb as i64),
-      fmt_num(self.score.rolling as i64), fmt_num(self.score.scissors as i64),
-      fmt_num(self.total));
-    println!("left={left_pct:.1}%  right={right_pct:.1}%");
   }
 
-  // 글자 100개당 항목별 비용과 무작위 배열 대비 변화율
+  // 글자 100개당 항목별 비용 (손 비율 감점이 있으면 함께)
   pub fn print_goodness(&self, norm: &ScoreNorm) {
     if self.total <= PENALTY_SCORE {
-      println!("DISQUALIFIED: one hand types less than hand_hard_limit (scores below are for reference only)");
+      println!("DISQUALIFIED: one hand types less than hand_hard_limit (costs below are for reference only)");
     }
     let c = norm.cost_breakdown(&self.score);
     let hand = norm.hand_cost(self.left_usage, self.right_usage);
     let total = c.effort + c.sfb + c.rolling + c.scissors + hand;
     let hand_part = if hand > 0.0 { format!("  hand-balance={hand:.1}") } else { String::new() };
     println!("cost per 100 letters (lower is better): total={total:.1}  effort={:.1}  sfb={:.1}  scissors={:.1}  rolling={:.1}{hand_part}", c.effort, c.sfb, c.scissors, c.rolling);
-    let v = norm.vs_random(&self.score);
-    println!("vs random median: effort {:+.1}%  sfb {:+.1}%  scissors {:+.1}%  rolling {:+.1}%", v.effort, v.sfb, v.scissors, v.rolling);
   }
 
   pub fn calc_total_score(&mut self, norm: &ScoreNorm) {
@@ -369,30 +346,9 @@ pub fn load_results(path: &str) -> anyhow::Result<Vec<Layout>> {
   Ok(bincode::deserialize(&bytes)?)
 }
 
-// 총점 기준: [costs]의 대표 사건 비용을 환산한 배율과 손 비율 감점. 무작위 배열 표본(center_mask 제약을 지킴)의
-// 항목별 중앙값은 "무작위 배열 대비" 표시에만 씀
-pub fn init_score_norm(arrays: &CorpusArrays, precomp: &Precomp, costs: &crate::config::Costs, hand: crate::score::HandRule, center_mask: u32) -> ScoreNorm {
-  const N: usize = 10001;
-  let mut effort_vals   = Vec::with_capacity(N);
-  let mut sfb_vals      = Vec::with_capacity(N);
-  let mut rolling_vals  = Vec::with_capacity(N);
-  let mut scissors_vals = Vec::with_capacity(N);
-
-  while effort_vals.len() < N {
-    let mut l = Layout::make_random_centered(&arrays.keys, center_mask, &[], 0);
-    l.calc_scores(arrays, precomp);
-    if l.total <= PENALTY_SCORE { continue; }
-    effort_vals.push(l.score.effort as f32);
-    sfb_vals.push(l.score.sfb as f32);
-    rolling_vals.push(l.score.rolling as f32);
-    scissors_vals.push(l.score.scissors as f32);
-  }
-
-  ScoreNorm {
-    median: ScoreNorm::medians(&effort_vals, &sfb_vals, &rolling_vals, &scissors_vals),
-    abs: abs_weights(arrays, precomp, costs),
-    hand,
-  }
+// 총점 기준: [costs]의 대표 사건 비용을 환산한 배율과 손 비율 감점
+pub fn init_score_norm(arrays: &CorpusArrays, precomp: &Precomp, costs: &crate::config::Costs, hand: crate::score::HandRule) -> ScoreNorm {
+  ScoreNorm { abs: abs_weights(arrays, precomp, costs), hand }
 }
 
 // 대표 사건 (왼손): 검지 홈(1,3)·검지 윗줄(0,3)·중지 홈(1,2)·중지 아랫줄(2,2). 롤·리다이렉트의 대표 사건은 Precomp에 있음
@@ -587,7 +543,7 @@ mod tests {
     let stats = test_util::stats();
     let arrays = stats.to_arrays();
     let (precomp, _) = test_util::precomp_norm_for(&arrays);
-    let norm = init_score_norm(&arrays, &precomp, &crate::config::Costs::default(), crate::score::HandRule::default(), 0);
+    let norm = init_score_norm(&arrays, &precomp, &crate::config::Costs::default(), crate::score::HandRule::default());
     let mut ls: Vec<Layout> = (0..30).map(|_| {
       let mut l = Layout::make_random(&arrays.keys, &[], 0);
       l.calc_scores(&arrays, &precomp); l.calc_total_score(&norm); l

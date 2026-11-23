@@ -1,9 +1,9 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss, clippy::cast_sign_loss, clippy::cast_lossless)]
 use rayon::prelude::*;
 use crate::corpus::CorpusArrays;
-use crate::layout::{Layout, ROWS, COLS, EMPTY, CHARS, PENALTY_SCORE, sort_layouts, sort_unique_layouts, save_results, fmt_num, home_row_keys, is_home_distinct, is_center_slot};
+use crate::layout::{Layout, ROWS, COLS, EMPTY, CHARS, PENALTY_SCORE, sort_layouts, sort_unique_layouts, save_results, home_row_keys, is_home_distinct, is_center_slot};
 use crate::precomp::Precomp;
-use crate::score::{Score, ScoreNorm};
+use crate::score::{cost_per_100, Score, ScoreNorm};
 
 const ALL_POSITIONS: [(usize, usize); ROWS * COLS] = {
   let mut arr = [(0usize, 0usize); ROWS * COLS];
@@ -108,7 +108,7 @@ impl<'a> Optimizer<'a> {
       // 이전 라운드 결과와 합쳐서 저장: 라운드 중간에 강제 종료돼도 이전 엘리트를 잃지 않도록
       let merged = sort_unique_layouts(base_layouts.iter().chain(&all_elites).copied().collect(), elites_len, &[], self.min_home_diff);
       save_results(&merged, result_file).ok();
-      println!("\n[Elite {}/{}] total={}", i + 1, elites_len, fmt_num(elite.total));
+      println!("\n[Elite {}/{}]", i + 1, elites_len);
       elite.print();
       elite.print_goodness(self.norm);
       println!();
@@ -137,9 +137,9 @@ impl<'a> Optimizer<'a> {
 
     let print_status = |g: usize, total: i64| {
       use std::io::Write;
-      print!("\r\x1b[2K[{}/{}];{}/{} Best: {}\t{:.1}s",
+      print!("\r\x1b[2K[{}/{}];{}/{} Best: {:.2}\t{:.1}s",
         elite_idx, total_elites, g, max_stall,
-        fmt_num(total), start.elapsed().as_secs_f32());
+        cost_per_100(total), start.elapsed().as_secs_f32());
       let _ = std::io::stdout().flush();
     };
     print_status(generation, prev_total);

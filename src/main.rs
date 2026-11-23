@@ -179,7 +179,7 @@ fn cmd_results(result_path: &Path, config: &Config) -> anyhow::Result<()> {
     let arrays = stats.to_arrays();
     results.retain(|l| l.key_count() == arrays.keys.len());
     let precomp = Precomp::new(&arrays.freq, &config.weights, &config.costs, &config.effort, config.hand_hard_limit());
-    let n = init_score_norm(&arrays, &precomp, &config.costs, score::HandRule::from_config(config), arrays.rare_mask(config.center_rare));
+    let n = init_score_norm(&arrays, &precomp, &config.costs, score::HandRule::from_config(config));
     for l in &mut results {
       l.calc_scores(&arrays, &precomp);
       l.calc_total_score(&n);
@@ -201,7 +201,7 @@ fn cmd_score(result_path: &Path, config: &Config, files: &[String]) -> anyhow::R
   let arrays = for_scoring(full, config).to_arrays();
   let precomp = Precomp::new(&arrays.freq, &config.weights, &config.costs, &config.effort, config.hand_hard_limit());
   let center_mask = arrays.rare_mask(config.center_rare);
-  let norm = init_score_norm(&arrays, &precomp, &config.costs, score::HandRule::from_config(config), center_mask);
+  let norm = init_score_norm(&arrays, &precomp, &config.costs, score::HandRule::from_config(config));
 
   let mut entries: Vec<(String, layout::Layout)> = Vec::new();
   let result_file = result_path.join(&config.result_file);
@@ -236,7 +236,7 @@ fn cmd_sensitivity(result_path: &Path, config: &Config, files: &[String]) -> any
   let arrays = for_scoring(load_corpus(&result_path.join(&config.corpus_file), true)?, config).to_arrays();
   let precomp = Precomp::new(&arrays.freq, &config.weights, &config.costs, &config.effort, config.hand_hard_limit());
   let center_mask = arrays.rare_mask(config.center_rare);
-  let norm = init_score_norm(&arrays, &precomp, &config.costs, score::HandRule::from_config(config), center_mask);
+  let norm = init_score_norm(&arrays, &precomp, &config.costs, score::HandRule::from_config(config));
   let mut cands: Vec<(String, layout::Layout)> = Vec::new();
   let result_file = result_path.join(&config.result_file);
   if result_file.exists() {
@@ -254,7 +254,7 @@ fn cmd_sensitivity(result_path: &Path, config: &Config, files: &[String]) -> any
     cands.push((f.clone(), l));
   }
   anyhow::ensure!(!cands.is_empty(), "no layouts to check: run optimize first or pass layout files");
-  sensitivity::run(&arrays, config, norm.median, cands, center_mask);
+  sensitivity::run(&arrays, config, cands, center_mask);
   Ok(())
 }
 
@@ -265,7 +265,7 @@ fn run_optimize(result_path: &Path, config: &Config, stats: &corpus::CorpusStats
   println!(" done");
   let center_mask = arrays.rare_mask(config.center_rare);
   print!("[Score Norm] ..."); let _ = std::io::stdout().flush();
-  let norm = init_score_norm(&arrays, &precomp, &config.costs, score::HandRule::from_config(config), center_mask);
+  let norm = init_score_norm(&arrays, &precomp, &config.costs, score::HandRule::from_config(config));
   println!(" done");
   if center_mask != 0 {
     let letters: String = (0..arrays.keys.len()).filter(|&i| center_mask >> i & 1 == 1).map(|i| arrays.keys[i]).collect();
@@ -333,7 +333,7 @@ fn main() -> anyhow::Result<()> {
   let cmd = args.get(2).map(std::string::String::as_str);
   let reset = args.iter().any(|a| a == "--reset") && !matches!(cmd, Some("results" | "score" | "sensitivity"));
   let config = load_config(Path::new("config.toml"))?;
-  // init_score_norm(무작위 표본)부터 최적화까지 모든 난수가 이 시드에서 나옴
+  // 최적화의 모든 난수(시작 배열, 담금질, 교차)가 이 시드에서 나옴
   let seed = config.seed.unwrap_or_else(|| fastrand::u64(..));
   println!("[Seed] {seed}");
   fastrand::seed(seed);

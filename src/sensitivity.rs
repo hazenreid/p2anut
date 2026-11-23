@@ -8,7 +8,7 @@ use crate::corpus::CorpusArrays;
 use crate::layout::{abs_weights, Layout, CHARS, COLS, PENALTY_SCORE, ROWS};
 use crate::optimizer::Optimizer;
 use crate::precomp::Precomp;
-use crate::score::{HandRule, Score, ScoreNorm, ABS_SCALE};
+use crate::score::{cost_per_100, HandRule, ScoreNorm};
 
 pub const LEVELS: [f32; 4] = [0.10, 0.20, 0.35, 0.50];
 
@@ -86,14 +86,13 @@ pub fn knobs() -> Vec<Knob> {
 }
 
 // init_score_norm과 같은 기준 (무작위 배열 중앙값은 표시용이라 기준 설정의 값을 그대로 씀)
-pub fn scoring(arrays: &CorpusArrays, c: &Config, median: Score) -> (Precomp, ScoreNorm) {
+pub fn scoring(arrays: &CorpusArrays, c: &Config) -> (Precomp, ScoreNorm) {
   let precomp = Precomp::new(&arrays.freq, &c.weights, &c.costs, &c.effort, c.hand_hard_limit());
-  let norm = ScoreNorm { median, abs: abs_weights(arrays, &precomp, &c.costs), hand: HandRule::from_config(c) };
+  let norm = ScoreNorm { abs: abs_weights(arrays, &precomp, &c.costs), hand: HandRule::from_config(c) };
   (precomp, norm)
 }
 
 // 총점 → 글자 100개당 비용
-pub fn cost100(total: i64) -> f64 { -(total as f64) / ABS_SCALE * 100.0 }
 
 fn rescore(arrays: &CorpusArrays, precomp: &Precomp, norm: &ScoreNorm, cands: &[Layout]) -> Vec<i64> {
   cands.iter().map(|l| { let mut l = *l; l.calc_scores(arrays, precomp); l.calc_total_score(norm); l.total }).collect()
@@ -110,18 +109,18 @@ pub struct Outcome {
   pub gain: f64,
 }
 
-pub fn evaluate(arrays: &CorpusArrays, c: &Config, median: Score, cands: &[Layout], base: usize, center_mask: u32) -> Outcome {
-  let (precomp, norm) = scoring(arrays, c, median);
+pub fn evaluate(arrays: &CorpusArrays, c: &Config, cands: &[Layout], base: usize, center_mask: u32) -> Outcome {
+  let (precomp, norm) = scoring(arrays, c);
   let totals = rescore(arrays, &precomp, &norm, cands);
   let mut winner = base;
   for (i, &t) in totals.iter().enumerate() { if t > totals[winner] { winner = i; } }
   let rival = totals.iter().enumerate().filter(|&(i, &t)| i != base && t > PENALTY_SCORE).map(|(_, &t)| t).max();
-  let rival_lead = rival.map(|t| cost100(totals[base]) - cost100(t));
+  let rival_lead = rival.map(|t| cost_per_100(totals[base]) - cost_per_100(t));
   let o = Optimizer::new(arrays.clone(), &precomp, &norm, 1, 1, c.sa.clone(), c.ga.clone(), center_mask);
   let start = cands[base];
   let descended = o.descend(start);
   let moved = (0..arrays.keys.len()).filter(|&i| descended.pos[i] != start.pos[i]).map(|i| arrays.keys[i]).collect();
-  Outcome { winner, rival_lead, descended, moved, gain: cost100(totals[base]) - cost100(descended.total) }
+  Outcome { winner, rival_lead, descended, moved, gain: cost_per_100(totals[base]) - cost_per_100(descended.total) }
 }
 
 pub fn compact(l: &Layout) -> String {
@@ -236,16 +235,16 @@ pub fn dedupe(cands: Vec<(String, Layout)>) -> Vec<(String, Layout)> {
 
 fn pct(f: f32) -> String { format!("{:+.0}%", (f - 1.0) * 100.0) }
 
-pub fn run(arrays: &CorpusArrays, config: &Config, median: Score, cands: Vec<(String, Layout)>, center_mask: u32) {
+pub fn run(arrays: &CorpusArrays, config: &Config, cands: Vec<(String, Layout)>, center_mask: u32) {
   let mut cands = dedupe(cands);
   let layouts = |c: &[(String, Layout)]| c.iter().map(|(_, l)| *l).collect::<Vec<Layout>>();
-  let (precomp, norm) = scoring(arrays, config, median);
+  let (precomp, norm) = scoring(arrays, config);
   let totals = rescore(arrays, &precomp, &norm, &layouts(&cands));
   let mut base = 0;
   for (i, &t) in totals.iter().enumerate() { if t > totals[base] { base = i; } }
 
   // 기준 1등이 지금 설정에서 이미 근처 최적이 아니면, 근처 탐색 결과를 기준으로 삼음 (아니면 모든 칸이 바뀜으로 나옴)
-  let check = evaluate(arrays, config, median, &layouts(&cands), base, center_mask);
+  let check = evaluate(arrays, config, &layouts(&cands), base, center_mask);
   if !check.moved.is_empty() {
     println!("[Sensitivity] note: [{}] {} is not a local optimum with the current settings: moving {} keys saves {:.2}; using that layout as the base",
       base + 1, cands[base].0, check.moved.len(), check.gain);
@@ -259,7 +258,7 @@ pub fn run(arrays: &CorpusArrays, config: &Config, median: Score, cands: Vec<(St
     LEVELS.iter().map(|l| format!("{:.0}", l * 100.0)).collect::<Vec<_>>().join("/") + "%");
   println!("candidates (cost per 100 letters with the current settings, lower is better; share of typing on letters placed differently from the base):");
   for (i, (name, l)) in cands.iter().enumerate() {
-    let cost = if totals[i] > PENALTY_SCORE { format!("{:.2}", cost100(totals[i])) } else { "DISQUALIFIED".to_string() };
+    let cost = if totals[i] > PENALTY_SCORE { format!("{:.2}", cost_per_100(totals[i])) } else { "DISQUALIFIED".to_string() };
     let diff = if i == base { "<- base".to_string() } else { format!("{:.1}% differs", diff_letters(arrays, &lays[base], l).1) };
     println!("  [{}] {}  {cost}  {diff}  {name}", i + 1, compact(l));
   }
@@ -270,7 +269,7 @@ pub fn run(arrays: &CorpusArrays, config: &Config, median: Score, cands: Vec<(St
   let outcomes: Vec<Outcome> = cases.par_iter().map(|&(k, f)| {
     let mut c = config.clone();
     (knobs[k].apply)(&mut c, f);
-    evaluate(arrays, &c, median, &lays, base, center_mask)
+    evaluate(arrays, &c, &lays, base, center_mask)
   }).collect();
   let names: Vec<&'static str> = knobs.iter().map(|k| k.name).collect();
   let report = build_report(arrays, &names, factors.len(), &outcomes, &lays, base);
@@ -312,8 +311,8 @@ mod tests {
     (0..n).map(|_| Layout::make_random(&arrays.keys, &[], 0)).collect()
   }
 
-  fn totals_for(arrays: &CorpusArrays, c: &Config, median: Score, ls: &[Layout]) -> Vec<i64> {
-    let (p, n) = scoring(arrays, c, median);
+  fn totals_for(arrays: &CorpusArrays, c: &Config, ls: &[Layout]) -> Vec<i64> {
+    let (p, n) = scoring(arrays, c);
     rescore(arrays, &p, &n, ls)
   }
 
@@ -322,13 +321,13 @@ mod tests {
     let arrays = test_util::stats().to_arrays();
     let c = config();
     let precomp = Precomp::new(&arrays.freq, &c.weights, &c.costs, &c.effort, c.hand_hard_limit());
-    let norm = crate::layout::init_score_norm(&arrays, &precomp, &c.costs, HandRule::from_config(&c), 0);
+    let norm = crate::layout::init_score_norm(&arrays, &precomp, &c.costs, HandRule::from_config(&c));
     let ls = random_layouts(&arrays, 20);
     let want = rescore(&arrays, &precomp, &norm, &ls);
     for knob in knobs() {
       let mut k = c.clone();
       (knob.apply)(&mut k, 1.0);
-      let got = totals_for(&arrays, &k, norm.median, &ls);
+      let got = totals_for(&arrays, &k, &ls);
       for (g, w) in got.iter().zip(&want) {
         assert!((g - w).abs() <= 1000, "{}: {g} vs {w}", knob.name);
       }
@@ -341,11 +340,11 @@ mod tests {
     let mut c = config();
     c.min_hand_usage = 0.5; // 손 비율 감점이 거의 모든 배열에 붙게 해서 hand_penalty도 확인
     let ls = random_layouts(&arrays, 30);
-    let want = totals_for(&arrays, &c, Score::default(), &ls);
+    let want = totals_for(&arrays, &c, &ls);
     for knob in knobs() {
       let mut k = c.clone();
       (knob.apply)(&mut k, 1.5);
-      let got = totals_for(&arrays, &k, Score::default(), &ls);
+      let got = totals_for(&arrays, &k, &ls);
       assert!(got.iter().zip(&want).any(|(g, w)| (g - w).abs() > 1000), "{} has no effect", knob.name);
     }
   }
@@ -383,16 +382,16 @@ mod tests {
     let arrays = test_util::stats().to_arrays();
     let c = config();
     let mask = arrays.rare_mask(c.center_rare);
-    let (p, n) = scoring(&arrays, &c, Score::default());
+    let (p, n) = scoring(&arrays, &c);
     let o = Optimizer::new(arrays.clone(), &p, &n, 1, 1, c.sa.clone(), c.ga.clone(), mask);
     let opt = o.descend(Layout::make_random_centered(&arrays.keys, mask, &[], 0));
     let mut worse = Layout::make_random_centered(&arrays.keys, mask, &[], 0);
     worse.calc_scores(&arrays, &p); worse.calc_total_score(&n);
-    let r = evaluate(&arrays, &c, Score::default(), &[opt, worse], 0, mask);
+    let r = evaluate(&arrays, &c, &[opt, worse], 0, mask);
     assert!(r.moved.is_empty() && r.gain.abs() < 1e-9);
     assert!(r.winner == 0 || worse.total > opt.total);
     // 다른 배열에서 시작하면 키가 움직이고 비용이 줄어듦
-    let r = evaluate(&arrays, &c, Score::default(), &[opt, worse], 1, mask);
+    let r = evaluate(&arrays, &c, &[opt, worse], 1, mask);
     assert!(!r.moved.is_empty() && r.gain > 0.0);
   }
 
