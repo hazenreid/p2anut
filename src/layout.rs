@@ -108,10 +108,9 @@ impl Layout {
     }
   }
 
-  // 배열 텍스트 읽기: 행마다 10칸, 글자는 a-z, 빈칸은 '.'. 공백은 무시 (print() 출력도 그대로 읽힘).
-  // '_'는 grid(스페이스를 배열에 둠)면 스페이스 키, 아니면 빈칸 (예전 출력은 빈칸을 '_'로 씀).
+  // 배열 텍스트 읽기: 행마다 10칸, 글자는 a-z, 스페이스 키는 '_', 빈칸은 '.'. 공백은 무시 (print() 출력도 그대로 읽힘).
   // 빈 줄은 건너뛰고, 정확히 3행이어야 하며 각 키는 한 번씩만
-  pub fn parse(text: &str, grid: bool) -> anyhow::Result<Self> {
+  pub fn parse(text: &str) -> anyhow::Result<Self> {
     let rows: Vec<Vec<char>> = text.lines()
       .map(|l| l.chars().filter(|c| !c.is_whitespace()).collect::<Vec<char>>())
       .filter(|r| !r.is_empty())
@@ -122,7 +121,7 @@ impl Layout {
       anyhow::ensure!(row.len() == COLS, "row {} must have {COLS} keys, found {}: {}", r + 1, row.len(), row.iter().collect::<String>());
       for (c, &ch) in row.iter().enumerate() {
         let ch = ch.to_ascii_lowercase();
-        if ch == '.' || (ch == '_' && !grid) { continue; }
+        if ch == '.' { continue; }
         anyhow::ensure!(ch.is_ascii_lowercase() || ch == '_', "unexpected character {ch:?} in row {}", r + 1);
         let id = if ch == '_' { crate::SPACE_ID } else { ch as u8 - b'a' };
         anyhow::ensure!(l.pos[id as usize] == EMPTY, "key {ch} appears more than once");
@@ -135,7 +134,7 @@ impl Layout {
   }
 
   // 사람이 읽기 쉬운 비율 지표 (corpus 기준, 0~100%). 분모는 각각 전체 글자·바이그램·트라이그램 빈도.
-  // windows: 공백(id 26, 엄지)까지 포함한 모든 트라이그램 창 (CorpusStats::windows). 커뮤니티 분석기식 창 기준 통계에 씀
+  // windows: 공백(id 26)까지 포함한 모든 트라이그램 창 (CorpusStats::windows). 커뮤니티 분석기식 창 기준 통계에 씀
   pub fn print_stats(&self, corpus: &CorpusArrays, precomp: &Precomp, windows: &[(u8, u8, u8, u64)]) {
     let pct = |a: u64, b: u64| if b == 0 { 0.0 } else { a as f64 * 100.0 / b as f64 };
     let mut rows = [0u64; ROWS];
@@ -173,14 +172,12 @@ impl Layout {
     self.print_window_stats(precomp, windows);
   }
 
-  // 창 기준 통계: 세 키(공백은 엄지)를 하나씩 밀며 나눈 분류의 비율. 스킵그램은 다른 분류와 겹쳐서 따로 셈
+  // 창 기준 통계: 세 키(공백 포함)를 하나씩 밀며 나눈 분류의 비율. 스킵그램은 다른 분류와 겹쳐서 따로 셈
   fn print_window_stats(&self, precomp: &Precomp, windows: &[(u8, u8, u8, u64)]) {
     use crate::precomp::{finger, Window};
-    let thumb = self.pos[crate::SPACE_ID as usize] == EMPTY;
-    let at = |id: u8| -> Option<Option<usize>> {
-      if id == crate::SPACE_ID && thumb { return Some(None); } // 엄지
+    let at = |id: u8| -> Option<usize> {
       let p = self.pos[id as usize];
-      (p != EMPTY).then_some(Some(p as usize))
+      (p != EMPTY).then_some(p as usize)
     };
     let kinds = [Window::Alternate, Window::Roll2In, Window::Roll2Out, Window::Roll3In, Window::Roll3Out,
       Window::Redirect, Window::BadRedirect, Window::SameHandOther];
@@ -191,15 +188,14 @@ impl Layout {
       total += n;
       let w = precomp.window(p1, p2, p3);
       counts[kinds.iter().position(|&k| k == w).unwrap_or(0)] += n;
-      // 1·3번이 같은 손가락의 다른 키 (가운데는 다른 손가락이나 엄지)
-      if let (Some(x), Some(z)) = (p1, p3) && x != z && finger(x) == finger(z) && p2.is_none_or(|y| finger(y) != finger(x)) {
+      // 1·3번이 같은 손가락의 다른 키 (가운데는 다른 손가락)
+      if p1 != p3 && finger(p1) == finger(p3) && finger(p2) != finger(p1) {
         skip += n;
-        if p2.is_none() { skip_space += n; }
+        if b == crate::SPACE_ID { skip_space += n; }
       }
     }
     let pct = |a: u64| if total == 0 { 0.0 } else { a as f64 * 100.0 / total as f64 };
-    let mode = if thumb { "space = thumb" } else { "space on the grid" };
-    println!("windows ({mode}): alternate={:.1}%  roll2 in={:.1}% out={:.1}%  roll3 in={:.1}% out={:.1}%  redirect={:.2}%  bad-redirect={:.2}%  same-hand-other={:.1}%  skipgram={:.2}% (across space {:.2}%)",
+    println!("windows: alternate={:.1}%  roll2 in={:.1}% out={:.1}%  roll3 in={:.1}% out={:.1}%  redirect={:.2}%  bad-redirect={:.2}%  same-hand-other={:.1}%  skipgram={:.2}% (across space {:.2}%)",
       pct(counts[0]), pct(counts[1]), pct(counts[2]), pct(counts[3]), pct(counts[4]), pct(counts[5]), pct(counts[6]), pct(counts[7]),
       pct(skip), pct(skip_space));
   }
@@ -268,16 +264,6 @@ impl Layout {
       scissors += count as f64 * f64::from(e.skip_scissors_base);
     }
 
-    // 공백 건너 쌍 (a _ c): 공백 너머 스킵그램·스킵 시저스
-    for &(a, c, count) in &corpus.nz_cross {
-      let p1 = self.pos[a as usize];
-      let p3 = self.pos[c as usize];
-      if p1 == EMPTY || p3 == EMPTY { continue; }
-      let e = precomp.cross(p1 as usize, p3 as usize);
-      sfb      += count as f64 * f64::from(e.sfs_base);
-      scissors += count as f64 * f64::from(e.skip_scissors_base);
-    }
-
     self.score = Score {
       effort,
       sfb,
@@ -302,8 +288,8 @@ impl Layout {
     }
   }
 
-  // 스페이스를 배열에 뒀을 때 그 몫의 비용 (글자 100개당, 총점에 이미 들어 있음): 스페이스 누름의 노력과
-  // 스페이스가 낀 빅/트라이그램의 sfb·시저스·롤. 엄지 방식이면 None
+  // 스페이스 키 몫의 비용 (글자 100개당, 총점에 이미 들어 있음): 스페이스 누름의 노력과
+  // 스페이스가 낀 빅/트라이그램의 sfb·시저스·롤. 배열에 스페이스 키가 없으면 None
   pub fn space_cost(&self, corpus: &CorpusArrays, precomp: &Precomp, norm: &ScoreNorm) -> Option<f64> {
     let sp = crate::SPACE_ID;
     let ps = self.pos[sp as usize];
@@ -494,33 +480,9 @@ mod tests {
   }
 
   #[test]
-  fn cross_space_pairs_add_to_sfb_and_scissors_only() {
-    let arrays = test_util::stats().to_arrays(false);
-    assert!(!arrays.nz_cross.is_empty());
-    let mut no_cross = arrays.clone();
-    no_cross.nz_cross.clear();
-    let (precomp, _) = test_util::precomp_norm_for(&arrays);
-    for _ in 0..20 {
-      let base = Layout::make_random(&arrays.keys, &[], 0);
-      let (mut with, mut without) = (base, base);
-      with.calc_scores(&arrays, &precomp);
-      without.calc_scores(&no_cross, &precomp);
-      let (mut s, mut k) = (0.0, 0.0);
-      for &(a, c, n) in &arrays.nz_cross {
-        let e = precomp.cross(base.pos[a as usize] as usize, base.pos[c as usize] as usize);
-        s += n as f64 * f64::from(e.sfs_base);
-        k += n as f64 * f64::from(e.skip_scissors_base);
-      }
-      assert!((with.score.sfb - without.score.sfb - s).abs() < 1e-6);
-      assert!((with.score.scissors - without.score.scissors - k).abs() < 1e-6);
-      assert_eq!((with.score.effort, with.score.rolling), (without.score.effort, without.score.rolling));
-    }
-  }
-
-  #[test]
   fn sort_unique_respects_min_diff() {
     let stats = test_util::stats();
-    let arrays = stats.to_arrays(false);
+    let arrays = stats.to_arrays();
     let (precomp, norm) = test_util::precomp_norm(&stats);
     let layouts: Vec<Layout> = (0..50).map(|_| {
       let mut l = Layout::make_random(&arrays.keys, &[], 0);
@@ -535,43 +497,32 @@ mod tests {
 
   #[test]
   fn parse_reads_files_and_print_output() {
-    let l = Layout::parse(".blyx.foup\nmanijzreht\ncgkdq.s.vw\n", false).unwrap();
-    assert_eq!(l.key_count(), 26);
+    let l = Layout::parse(".blyx_foup\nmanijzreht\ncgkdq.s.vw\n").unwrap();
+    assert_eq!(l.key_count(), 27);
     l.assert_invariants();
     assert_eq!(l.slots[1], b'b' - b'a');
     assert_eq!(l.slots[COLS], b'm' - b'a');
-    assert_eq!(l.slots[5], EMPTY);
-    // print() 형식(공백, 가운데 간격)과 예전 출력의 빈칸 '_'도 읽힘
-    let printed = Layout::parse(" . b l y x   _ f o u p\n m a n i j   z r e h t\n\n c g k d q   . s . v w", false).unwrap();
+    // '_'는 스페이스 키, '.'는 빈칸
+    assert_eq!((l.slots[5], l.pos[crate::SPACE_ID as usize]), (crate::SPACE_ID, 5));
+    assert_eq!((key_char(l.slots[5]), key_char(l.slots[0])), ('_', '.'));
+    assert_eq!(l.slots[0], EMPTY);
+    // print() 형식(공백, 가운데 간격)도 읽힘
+    let printed = Layout::parse(" . b l y x   _ f o u p\n m a n i j   z r e h t\n\n c g k d q   . s . v w").unwrap();
     assert_eq!(printed.slots, l.slots);
-    assert!(Layout::parse("abc", false).is_err());
-    assert!(Layout::parse(".blyx.foup\nmanijzreht\ncgkdq.s.va\n", false).err().unwrap().to_string().contains("more than once"));
-    assert!(Layout::parse(".blyx.foup\nmanijzreht\ncgkdq.s.v\n", false).is_err());
-  }
-
-  #[test]
-  fn grid_mode_reads_and_prints_underscore_as_space() {
-    let g = Layout::parse(".blyx_foup\nmanijzreht\ncgkdq.s.vw\n", true).unwrap();
-    assert_eq!(g.key_count(), 27);
-    g.assert_invariants();
-    assert_eq!((g.slots[5], g.pos[crate::SPACE_ID as usize]), (crate::SPACE_ID, 5));
-    assert_eq!(key_char(g.slots[5]), '_');
-    assert_eq!(key_char(g.slots[0]), '.');
-    // 같은 파일을 엄지 방식으로 읽으면 '_'는 빈칸
-    assert_eq!(Layout::parse(".blyx_foup\nmanijzreht\ncgkdq.s.vw\n", false).unwrap().key_count(), 26);
-    assert!(Layout::parse("_blyx_foup\nmanijzreht\ncgkdq.s.vw\n", true).err().unwrap().to_string().contains("more than once"));
+    assert!(Layout::parse("abc").is_err());
+    assert!(Layout::parse(".blyx_foup\nmanijzreht\ncgkdq.s.va\n").err().unwrap().to_string().contains("more than once"));
+    assert!(Layout::parse("_blyx_foup\nmanijzreht\ncgkdq.s.vw\n").err().unwrap().to_string().contains("more than once"));
+    assert!(Layout::parse(".blyx_foup\nmanijzreht\ncgkdq.s.v\n").is_err());
   }
 
   #[test]
   fn space_cost_is_the_part_of_the_total_that_the_space_key_adds() {
     let stats = test_util::stats();
-    let g = stats.to_arrays(true);
+    let g = stats.to_arrays();
     let (precomp, norm) = test_util::precomp_norm_for(&g);
-    // 비용 분모는 글자 수: 스페이스를 배열에 둬도 엄지 방식과 같음
-    let t = stats.to_arrays(false);
-    let (tp, _) = test_util::precomp_norm_for(&t);
-    assert_eq!(abs_weights(&g, &precomp, &crate::config::Costs::default()).per_letter,
-      abs_weights(&t, &tp, &crate::config::Costs::default()).per_letter);
+    // 비용 분모는 글자(a-z) 수 (스페이스 누름은 분모에 넣지 않음)
+    let letters: u64 = g.freq.iter().take(26).sum();
+    assert!((abs_weights(&g, &precomp, &crate::config::Costs::default()).per_letter * letters as f64 - 1.0).abs() < 1e-12);
     let cost = |l: &Layout| { let c = norm.cost_breakdown(&l.score); c.effort + c.sfb + c.scissors + c.rolling };
     for _ in 0..20 {
       let mut l = Layout::make_random(&g.keys, &[], 0);
@@ -592,7 +543,7 @@ mod tests {
   #[test]
   fn absolute_costs_match_reference_events() {
     let stats = test_util::stats();
-    let arrays = stats.to_arrays(false);
+    let arrays = stats.to_arrays();
     let (precomp, _) = test_util::precomp_norm_for(&arrays);
     let c = crate::config::Costs::default();
     let a = abs_weights(&arrays, &precomp, &c);
@@ -610,7 +561,7 @@ mod tests {
   #[test]
   fn changing_effort_keeps_reference_event_costs() {
     let stats = test_util::stats();
-    let arrays = stats.to_arrays(false);
+    let arrays = stats.to_arrays();
     let costs = crate::config::Costs::default();
     let mut effort = crate::config::EffortGrid::default();
     let base = Precomp::new(&arrays.freq, &test_util::weights(), &costs, &effort, 0.45);
@@ -635,7 +586,7 @@ mod tests {
   #[test]
   fn absolute_mode_ranks_by_lower_cost() {
     let stats = test_util::stats();
-    let arrays = stats.to_arrays(false);
+    let arrays = stats.to_arrays();
     let (precomp, _) = test_util::precomp_norm_for(&arrays);
     let norm = init_score_norm(&arrays, &precomp, &crate::config::Costs::default(), crate::score::HandRule::default());
     let mut ls: Vec<Layout> = (0..30).map(|_| {
@@ -653,7 +604,7 @@ mod tests {
 
   #[test]
   fn soft_hand_limit_penalizes_instead_of_disqualifying() {
-    let arrays = test_util::stats().to_arrays(false);
+    let arrays = test_util::stats().to_arrays();
     let (precomp, norm) = test_util::precomp_norm_soft_hand(&arrays);
     let (mut soft_seen, mut hard_seen) = (false, false);
     for _ in 0..3000 {
@@ -686,7 +637,7 @@ mod tests {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("result.bin");
     let path = path.to_str().unwrap();
-    let ls = vec![Layout::make_random(&test_util::stats().to_arrays(false).keys, &[], 0); 2];
+    let ls = vec![Layout::make_random(&test_util::stats().to_arrays().keys, &[], 0); 2];
     save_results(&ls, path).unwrap();
     save_results(&ls[..1], path).unwrap();
     assert_eq!(load_results(path).unwrap().len(), 1);
@@ -697,7 +648,7 @@ mod tests {
   #[test]
   fn penalized_layout_keeps_real_scores_and_recovers() {
     let stats = test_util::stats();
-    let arrays = stats.to_arrays(false);
+    let arrays = stats.to_arrays();
     let (precomp, norm) = test_util::precomp_norm(&stats);
     let (mut checked, mut sides) = (0, [false; 2]);
     for _ in 0..1000 {

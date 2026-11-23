@@ -53,14 +53,14 @@ pub struct TrigramEntry {
   pub skip_scissors_base: f32,
 }
 
-// 공백 건너 쌍 "a _ c" (엄지가 가운데): 1·3번 키만 보는 공백 너머 스킵그램·스킵 시저스. 트라이그램과 같은 식
+// 엄지가 사이에 끼는 두 누름 "a T c" (심볼 레이어의 원샷 탭): 1·3번 키만 보는 스킵그램·스킵 시저스. 트라이그램과 같은 식
 #[derive(Clone, Copy, Default)]
 pub struct CrossEntry {
   pub sfs_base: f32,
   pub skip_scissors_base: f32,
 }
 
-// 트라이그램 창 하나의 분류 (결과 통계 표시용). 엄지(공백)는 어느 손도 아니라 교차를 만듦
+// 트라이그램 창 하나의 분류 (결과 통계 표시용)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Window {
   Alternate,
@@ -146,7 +146,7 @@ impl Precomp {
         if per_unit > 0.0 && ref_shape > 0.0 { lateral / per_unit / ref_shape } else { 0.0 }
       }
     };
-    // 1·3번 키만 보는 값 (가운데가 다른 손가락이거나 엄지일 때 공통)
+    // 1·3번 키만 보는 값 (가운데가 다른 손가락이거나 엄지 탭일 때 공통)
     // 스킵 풀 시저스: 같은 손 인접 손가락, 두 줄 차이. 센터는 바이그램에서 이미 감점하므로 제외.
     // 방향은 풀 시저스와 같음 (긴 손가락이 아래면 1.0, 위면 full_scissors_good)
     let skip_scissors_of = |p1: usize, p3: usize| {
@@ -250,26 +250,21 @@ impl Precomp {
   #[inline] pub fn effort(&self, pos: usize, char_idx: usize) -> f64 { self.alphabet_effort[pos * crate::layout::CHARS + char_idx] }
   #[inline] pub fn cross(&self, p1: usize, p3: usize) -> &CrossEntry { &self.cross[p1 * N + p3] }
 
-  // 창 하나의 분류. None = 엄지(공백). 같은 손 두 키가 붙어 있고 나머지 하나가 다른 손이나 엄지면 2키 롤,
+  // 창 하나의 분류. 같은 손 두 키가 붙어 있고 나머지 하나가 다른 손이면 2키 롤,
   // 같은 손 세 키면 세 글자 롤·리다이렉트 (점수 계산과 같은 기준: 롤 값이 있는 쌍·창만 롤)
-  pub fn window(&self, p1: Option<usize>, p2: Option<usize>, p3: Option<usize>) -> Window {
-    let same = |a: Option<usize>, b: Option<usize>| matches!((a, b), (Some(a), Some(b)) if is_left(a) == is_left(b));
+  pub fn window(&self, a: usize, b: usize, c: usize) -> Window {
     let pair = |a: usize, b: usize| {
       if self.bigram(a, b).rolling_base <= 0.0 { Window::SameHandOther }
       else if finger(a) > finger(b) { Window::Roll2In } else { Window::Roll2Out }
     };
-    match (p1, p2, p3) {
-      (Some(a), Some(b), Some(c)) if same(p1, p2) && same(p2, p3) => {
-        let t = self.trigram(a, b, c).roll_base;
-        if t > 0.0 { if finger(a) > finger(b) { Window::Roll3In } else { Window::Roll3Out } }
-        else if t < 0.0 {
-          if [a, b, c].iter().any(|&p| matches!(finger(p), 1 | 5)) { Window::Redirect } else { Window::BadRedirect }
-        } else { Window::SameHandOther }
-      }
-      (Some(a), Some(b), _) if same(p1, p2) => pair(a, b),
-      (_, Some(b), Some(c)) if same(p2, p3) => pair(b, c),
-      _ => Window::Alternate,
-    }
+    let (ab, bc) = (is_left(a) == is_left(b), is_left(b) == is_left(c));
+    if ab && bc {
+      let t = self.trigram(a, b, c).roll_base;
+      if t > 0.0 { if finger(a) > finger(b) { Window::Roll3In } else { Window::Roll3Out } }
+      else if t < 0.0 {
+        if [a, b, c].iter().any(|&p| matches!(finger(p), 1 | 5)) { Window::Redirect } else { Window::BadRedirect }
+      } else { Window::SameHandOther }
+    } else if ab { pair(a, b) } else if bc { pair(b, c) } else { Window::Alternate }
   }
 }
 
@@ -383,7 +378,7 @@ mod tests {
     let mut skip = 0;
     for p1 in 0..N { for p3 in 0..N {
       let x = pc.cross(p1, p3);
-      if p1 == p3 { assert_eq!(x.sfs_base, 0.0); continue; } // 같은 키(e_e)는 sfs_same_key = 0
+      if p1 == p3 { assert_eq!(x.sfs_base, 0.0); continue; } // 같은 키는 sfs_same_key = 0
       // 가운데를 다른 손 키로 둔 트라이그램과 같은 값
       let other = if is_left(p1) { COLS + 7 } else { COLS + 2 };
       let t = pc.trigram(p1, other, p3);
@@ -401,13 +396,12 @@ mod tests {
   #[test]
   fn windows_are_classified_like_the_score() {
     let pc = Precomp::new(&[1; crate::layout::CHARS], &crate::test_util::weights(), &Costs::default(), &EffortGrid::default(), 0.45);
-    let (pinky, ring, middle, index) = (Some(COLS), Some(REF_RING_HOME), Some(REF_MIDDLE_HOME), Some(REF_INDEX_HOME));
-    let right = Some(COLS + 7);
-    // 엄지나 다른 손이 끼면 교차 / 2키 롤
-    assert_eq!(pc.window(middle, None, index), Window::Alternate);
+    let (pinky, ring, middle, index) = (COLS, REF_RING_HOME, REF_MIDDLE_HOME, REF_INDEX_HOME);
+    let (right, right2) = (COLS + 7, COLS + 8);
+    // 다른 손이 끼면 교차 / 2키 롤
     assert_eq!(pc.window(middle, right, index), Window::Alternate);
-    assert_eq!(pc.window(None, middle, None), Window::Alternate);
-    assert_eq!(pc.window(middle, index, None), Window::Roll2In);
+    assert_eq!(pc.window(right, middle, right2), Window::Alternate);
+    assert_eq!(pc.window(middle, index, right), Window::Roll2In);
     assert_eq!(pc.window(right, index, middle), Window::Roll2Out);
     // 같은 손 세 키
     assert_eq!(pc.window(ring, middle, index), Window::Roll3In);
@@ -415,8 +409,8 @@ mod tests {
     assert_eq!(pc.window(ring, index, middle), Window::Redirect);
     assert_eq!(pc.window(ring, pinky, middle), Window::BadRedirect);
     // SFB(검지 홈 → 검지 윗줄)가 낀 창은 롤이 아님
-    assert_eq!(pc.window(index, Some(3), None), Window::SameHandOther);
-    assert_eq!(pc.window(middle, index, Some(3)), Window::SameHandOther);
+    assert_eq!(pc.window(index, 3, right), Window::SameHandOther);
+    assert_eq!(pc.window(middle, index, 3), Window::SameHandOther);
   }
 
   #[test]

@@ -320,7 +320,7 @@ mod tests {
 
   #[test]
   fn unscaled_settings_keep_every_score() {
-    let arrays = test_util::stats().to_arrays(false);
+    let arrays = test_util::stats().to_arrays();
     let c = config();
     let precomp = Precomp::new(&arrays.freq, &c.weights, &c.costs, &c.effort, c.hand_hard_limit());
     let norm = crate::layout::init_score_norm(&arrays, &precomp, &c.costs, HandRule::from_config(&c));
@@ -338,7 +338,7 @@ mod tests {
 
   #[test]
   fn every_setting_changes_some_score() {
-    let arrays = test_util::stats().to_arrays(false);
+    let arrays = test_util::stats().to_arrays();
     let mut c = config();
     c.min_hand_usage = 0.5; // 손 비율 감점이 거의 모든 배열에 붙게 해서 hand_penalty도 확인
     let ls = random_layouts(&arrays, 30);
@@ -381,7 +381,7 @@ mod tests {
 
   #[test]
   fn evaluate_reports_no_change_at_a_local_optimum() {
-    let arrays = test_util::stats().to_arrays(false);
+    let arrays = test_util::stats().to_arrays();
     let c = config();
     let mask = arrays.rare_mask(c.center_rare);
     let (p, n) = scoring(&arrays, &c);
@@ -408,7 +408,7 @@ mod tests {
 
   #[test]
   fn diff_letters_counts_typing_share_and_ignores_mirroring() {
-    let arrays = test_util::stats().to_arrays(false);
+    let arrays = test_util::stats().to_arrays();
     let base = Layout::make_random(&arrays.keys, &[], 0);
     let total: u64 = arrays.freq.iter().sum();
     let (letters, share) = diff_letters(&arrays, &base, &swapped(&base, 'e', 'q'));
@@ -427,7 +427,7 @@ mod tests {
 
   #[test]
   fn report_groups_the_same_layout_and_keeps_the_bigger_saving() {
-    let arrays = test_util::stats().to_arrays(false);
+    let arrays = test_util::stats().to_arrays();
     let base = Layout::make_random(&arrays.keys, &[], 0);
     let near = swapped(&base, 'q', 'z'); // 드문 글자만 다름
     let far = swapped(&swapped(&base, 'e', 't'), 'a', 'o');
@@ -454,7 +454,7 @@ mod tests {
 
   #[test]
   fn dedupe_drops_mirrors() {
-    let arrays = test_util::stats().to_arrays(false);
+    let arrays = test_util::stats().to_arrays();
     let a = Layout::make_random(&arrays.keys, &[], 0);
     let mut m = Layout::new();
     m.slots = mirrored(&a);

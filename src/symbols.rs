@@ -6,11 +6,10 @@
 // 기호가 낀 n-gram만 셈 (글자·공백끼리는 베이스가 고정이라 어느 배치에서나 같음).
 //
 // 원샷 레이어: 심볼 레이어 기호는 누를 때마다 엄지로 레이어 키를 먼저 한 번 누름(탭). 엄지가 끼는 두 손가락 누름은
-// p2anut이 엄지 스페이스에 쓰는 규칙과 같게 봄: 같은 손가락이면 스킵그램(sfs), 인접 손가락 두 줄 차이면 스킵 시저스만
+// 사이에 다른 손가락이 끼는 경우와 같게 봄: 같은 손가락이면 스킵그램(sfs), 인접 손가락 두 줄 차이면 스킵 시저스만
 // 셈 (롤·SFB·시저스 없음). 기호 다음 키는 탭 없이 바로 이어지므로 보통 바이그램·트라이그램. 기호 앞에 탭이 끼면
 // 그 기호가 낀 트라이그램은 롤·리다이렉트로 치지 않음. 탭 한 번은 layer_tap 비용.
 // 베이스 빈칸의 기호는 탭이 없는 대신 노력값에 base_slot_extra를 더함 (layer_tap보다 크면 심볼 레이어가 모자랄 때만 씀).
-// 엄지 스페이스(space_key = "thumb")는 공백 너머 쌍(a _ c)을 같은 방식으로 셈.
 //
 // 짝: pairs(순서 있음)는 첫 글자가 왼쪽인 같은 줄 나란히, 또는 좌우 대칭(같은 손가락·같은 줄, 첫 글자가 왼손).
 // loose_pairs(순서 없음)는 나란히·좌우 대칭·같은 열 위아래 중 하나. 짝은 심볼 레이어 안에서만.
@@ -24,8 +23,6 @@ use crate::layout::{Layout, CHARS, COLS, EMPTY, ROWS};
 use crate::precomp::{finger, Precomp};
 
 const N: usize = ROWS * COLS;
-// 엄지 키(엄지 스페이스)의 자리 표시
-const THUMB: u8 = 255;
 pub const EMPTY_TOKEN: char = '·';
 pub const SPACE_TOKEN: char = '␣';
 // 담금질 온도 (글자 100개당 비용 단위): 처음에는 이 정도 악화를 자주 받아들이고 끝에는 거의 안 받아들임
@@ -228,17 +225,15 @@ fn placements(ordered: bool) -> Vec<(u8, u8)> {
 }
 
 impl<'a> Problem<'a> {
-  pub fn new(t: &'a Tables, g: &'a Ngrams, base: &Layout, space_on_grid: bool, cfg: &SymbolsConfig) -> anyhow::Result<Self> {
-    let mut key_pos = [THUMB; KEYS];
+  pub fn new(t: &'a Tables, g: &'a Ngrams, base: &Layout, cfg: &SymbolsConfig) -> anyhow::Result<Self> {
+    let mut key_pos = [0; KEYS];
     for (id, kp) in key_pos.iter_mut().enumerate().take(26) {
       anyhow::ensure!(base.pos[id] != EMPTY, "the base layout has no key {}", (b'a' + id as u8) as char);
       *kp = base.pos[id];
     }
-    if space_on_grid {
-      let p = base.pos[crate::SPACE_ID as usize];
-      anyhow::ensure!(p != EMPTY, "space_key = \"grid\" but the base layout has no space key");
-      key_pos[SPACE as usize] = p;
-    }
+    let p = base.pos[crate::SPACE_ID as usize];
+    anyhow::ensure!(p != EMPTY, "the base layout has no space key (_)");
+    key_pos[SPACE as usize] = p;
     let free: Vec<u8> = (0..N as u8).filter(|&p| base.slots[p as usize] == EMPTY).collect();
     anyhow::ensure!(N + free.len() >= NSYM, "the base layout leaves {} empty slots; 32 symbols need at least {}", free.len(), NSYM - N);
     let slots: Vec<Slot> = (0..N as u8).map(|p| Slot { pos: p, tap: true }).chain(free.iter().map(|&p| Slot { pos: p, tap: false })).collect();
@@ -285,17 +280,14 @@ impl<'a> Problem<'a> {
   }
 
   fn bi(&self, st: &State, a: u8, b: u8) -> f64 {
-    let (pa, pb) = (st.pos[a as usize], st.pos[b as usize]);
-    if pa == THUMB || pb == THUMB { return 0.0; }
-    let i = pa as usize * N + pb as usize;
+    let i = st.pos[a as usize] as usize * N + st.pos[b as usize] as usize;
     if st.tap[b as usize] { self.t.x[i] } else { self.t.bg[i] }
   }
 
   fn tri(&self, st: &State, a: u8, b: u8, c: u8) -> f64 {
-    let (pa, pb, pc) = (st.pos[a as usize], st.pos[b as usize], st.pos[c as usize]);
-    if pb == THUMB { return if pa != THUMB && pc != THUMB { self.t.x[pa as usize * N + pc as usize] } else { 0.0 }; }
-    if pa == THUMB || pc == THUMB || st.tap[b as usize] || st.tap[c as usize] { return 0.0; }
-    self.t.tg[(pa as usize * N + pb as usize) * N + pc as usize]
+    if st.tap[b as usize] || st.tap[c as usize] { return 0.0; }
+    let (pa, pb, pc) = (st.pos[a as usize] as usize, st.pos[b as usize] as usize, st.pos[c as usize] as usize);
+    self.t.tg[(pa * N + pb) * N + pc]
   }
 
   pub fn total(&self, st: &State) -> f64 {
@@ -494,20 +486,13 @@ impl<'a> Problem<'a> {
       if st.tap[k] { b.taps += u * self.tap_cost; }
     }
     for &(x, y, w) in &self.g.bi {
-      let (pa, pb) = (st.pos[x as usize], st.pos[y as usize]);
-      if pa == THUMB || pb == THUMB { continue; }
-      let i = pa as usize * N + pb as usize;
+      let i = st.pos[x as usize] as usize * N + st.pos[y as usize] as usize;
       if st.tap[y as usize] { b.sfb += w * t.xsfs[i]; b.scissors += w * t.xssc[i]; }
       else { b.sfb += w * t.sfb[i]; b.scissors += w * t.sc[i]; b.rolling += w * t.roll[i]; }
     }
     for &(x, y, z, w) in &self.g.tri {
-      let (pa, pb, pc) = (st.pos[x as usize], st.pos[y as usize], st.pos[z as usize]);
-      if pb == THUMB {
-        if pa != THUMB && pc != THUMB { let i = pa as usize * N + pc as usize; b.sfb += w * t.xsfs[i]; b.scissors += w * t.xssc[i]; }
-        continue;
-      }
-      if pa == THUMB || pc == THUMB || st.tap[y as usize] || st.tap[z as usize] { continue; }
-      let j = (pa as usize * N + pb as usize) * N + pc as usize;
+      if st.tap[y as usize] || st.tap[z as usize] { continue; }
+      let j = (st.pos[x as usize] as usize * N + st.pos[y as usize] as usize) * N + st.pos[z as usize] as usize;
       b.sfb += w * t.sfs[j];
       b.scissors += w * t.ssc[j];
       b.rolling += w * t.roll3[j];
@@ -518,7 +503,6 @@ impl<'a> Problem<'a> {
   // 바이그램 하나의 분류 (표시용)
   fn kind(&self, st: &State, a: u8, b: u8) -> &'static str {
     let (pa, pb) = (st.pos[a as usize], st.pos[b as usize]);
-    if pa == THUMB || pb == THUMB { return "thumb"; }
     let i = pa as usize * N + pb as usize;
     if st.tap[b as usize] {
       return if pa == pb { "tap:same-key" } else if self.t.xsfs[i] > 0.0 { "tap:sfs" } else if self.t.xssc[i] > 0.0 { "tap:skip-sc" } else { "tap" };
@@ -602,7 +586,7 @@ impl<'a> Problem<'a> {
 
 // 기호 배치 파일 읽기: 칸 10개짜리 줄만 행으로 봄 (나머지 줄은 제목 등으로 무시). 앞 3행은 심볼 레이어, 다음 3행은 베이스
 // (글자, ␣ = 스페이스, · = 빈칸, 기호 = 베이스 빈칸에 둔 기호). 돌려주는 것: 베이스 배열과 기호마다 (위치, 심볼 레이어인지)
-pub fn parse_text(text: &str, space_on_grid: bool) -> anyhow::Result<(Layout, [(u8, bool); NSYM])> {
+pub fn parse_text(text: &str) -> anyhow::Result<(Layout, [(u8, bool); NSYM])> {
   // 한 글자짜리 토큰만 칸으로 (여러 글자 토큰이 있는 줄은 제목으로 봄)
   let one_char = |t: &str| { let mut c = t.chars(); match (c.next(), c.next()) { (Some(ch), None) => Some(ch), _ => None } };
   let rows: Vec<Vec<char>> = text.lines()
@@ -638,8 +622,8 @@ pub fn parse_text(text: &str, space_on_grid: bool) -> anyhow::Result<(Layout, [(
   }
   let missing: String = (0..NSYM).filter(|&i| placed[i].is_none()).map(|i| keycorpus::key_char(FIRST_SYM + i as u8)).collect();
   anyhow::ensure!(missing.is_empty(), "symbols missing from the file: {missing}");
-  let base = Layout::parse(&base_text, space_on_grid)?;
-  anyhow::ensure!(base.key_count() == 26 + usize::from(space_on_grid), "the base layer must hold a-z{}", if space_on_grid { " and ␣" } else { "" });
+  let base = Layout::parse(&base_text)?;
+  anyhow::ensure!(base.key_count() == 27, "the base layer must hold a-z and ␣");
   Ok((base, placed.map(|p| p.expect("checked above"))))
 }
 
@@ -673,8 +657,8 @@ mod tests {
   fn delta_matches_full_recompute() {
     let c = config();
     let (t, g) = (Tables::new(&c), ngrams(0.4));
-    let base = Layout::parse(BASE, true).unwrap();
-    let p = Problem::new(&t, &g, &base, true, &c.symbols).unwrap();
+    let base = Layout::parse(BASE).unwrap();
+    let p = Problem::new(&t, &g, &base, &c.symbols).unwrap();
     let mut rng = fastrand::Rng::with_seed(7);
     let mut st = p.random_state(&mut rng);
     let mut w = p.work();
@@ -695,7 +679,7 @@ mod tests {
   fn tap_makes_pairs_cross_and_base_slots_cost_more() {
     let c = config();
     let t = Tables::new(&c);
-    // 심볼 레이어 기호 앞의 쌍은 엄지 너머 쌍: 같은 손가락 다른 키면 스킵그램, 다른 손가락은 0 (롤도 없음)
+    // 심볼 레이어 기호 앞의 쌍은 탭 너머 쌍: 같은 손가락 다른 키면 스킵그램, 다른 손가락은 0 (롤도 없음)
     let (e_pos, idx_top, mid_home) = (13usize, 3usize, 12usize);
     assert!(t.x[e_pos * N + idx_top] > 0.0 && t.x[e_pos * N + idx_top] < t.bg[e_pos * N + idx_top]);
     assert_eq!(t.x[e_pos * N + mid_home], 0.0);
@@ -703,8 +687,8 @@ mod tests {
     // 같은 키는 레이어가 달라도 비용 없음
     assert_eq!((t.x[e_pos * N + e_pos], t.bg[e_pos * N + e_pos]), (0.0, 0.0));
     let g = ngrams(0.0);
-    let base = Layout::parse(BASE, true).unwrap();
-    let p = Problem::new(&t, &g, &base, true, &c.symbols).unwrap();
+    let base = Layout::parse(BASE).unwrap();
+    let p = Problem::new(&t, &g, &base, &c.symbols).unwrap();
     // 베이스 빈칸 3칸 + 심볼 레이어 30칸
     assert_eq!(p.slots.iter().filter(|s| !s.tap).map(|s| s.pos).collect::<Vec<_>>(), vec![4, 14, 24]);
     let mut st = p.random_state(&mut fastrand::Rng::with_seed(1));
@@ -732,8 +716,8 @@ mod tests {
     let (t, g) = (Tables::new(&c), ngrams(0.3));
     // 모든 기호가 코퍼스에 있음 (빈도 0인 기호는 어디에 둬도 비용이 같아서 빈칸 표시와 자리를 바꿔도 같은 점수)
     assert!((0..NSYM).all(|i| g.uni[FIRST_SYM as usize + i] > 0.0));
-    let base = Layout::parse(BASE, true).unwrap();
-    let p = Problem::new(&t, &g, &base, true, &c.symbols).unwrap();
+    let base = Layout::parse(BASE).unwrap();
+    let p = Problem::new(&t, &g, &base, &c.symbols).unwrap();
     let (cost, st, _, starts) = p.search(&c.sa, 20_000, None);
     assert_eq!(starts, 4);
     assert!((cost - p.total(&st)).abs() < 1e-9);
@@ -759,36 +743,19 @@ mod tests {
   fn text_roundtrip_and_parse_errors() {
     let c = config();
     let (t, g) = (Tables::new(&c), ngrams(0.5));
-    let base = Layout::parse(BASE, true).unwrap();
-    let p = Problem::new(&t, &g, &base, true, &c.symbols).unwrap();
+    let base = Layout::parse(BASE).unwrap();
+    let p = Problem::new(&t, &g, &base, &c.symbols).unwrap();
     let st = p.random_state(&mut fastrand::Rng::with_seed(3));
     let text = p.to_text(&base, &st);
-    let (b2, placed) = parse_text(&text, true).unwrap();
+    let (b2, placed) = parse_text(&text).unwrap();
     assert_eq!(b2.slots, base.slots);
     let st2 = p.state_of(&placed).unwrap();
     assert!((p.total(&st2) - p.total(&st)).abs() < 1e-9);
     assert_eq!(p.to_text(&base, &st2), text);
     // 기호가 빠지거나 두 번 나오면 거부
     let dup = text.replacen(EMPTY_TOKEN, "(", 1);
-    assert!(parse_text(&dup, true).is_err());
+    assert!(parse_text(&dup).is_err());
     let lines: Vec<&str> = text.lines().collect();
-    assert!(parse_text(&lines[..4].join("\n"), true).is_err());
-  }
-
-  #[test]
-  fn thumb_space_pairs_cross_the_thumb() {
-    let c = config();
-    let t = Tables::new(&c);
-    let base = Layout::parse(".blyxzfoup\nmanijqreht\ncgkdw.s.v.\n", false).unwrap();
-    let g = ngrams(0.0);
-    let p = Problem::new(&t, &g, &base, false, &c.symbols).unwrap();
-    // 엄지 방식은 베이스 빈칸이 4칸
-    assert_eq!(p.slots.len(), N + 4);
-    let st = p.random_state(&mut fastrand::Rng::with_seed(5));
-    let comma = FIRST_SYM + keycorpus::sym_index(',').unwrap() as u8;
-    let e = b'e' - b'a';
-    assert_eq!(p.bi(&st, comma, SPACE), 0.0);
-    let (pa, pc) = (st.pos[comma as usize] as usize, st.pos[e as usize] as usize);
-    assert_eq!(p.tri(&st, comma, SPACE, e), t.x[pa * N + pc]);
+    assert!(parse_text(&lines[..4].join("\n")).is_err());
   }
 }

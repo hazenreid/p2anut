@@ -46,10 +46,8 @@ fn task_seeds(n: usize) -> Vec<u64> {
 struct SaWorkspace {
   aff_bg_indices: Vec<usize>,
   aff_tg_indices: Vec<usize>,
-  aff_cross_indices: Vec<usize>,
   bg_mark: Vec<u32>,
   tg_mark: Vec<u32>,
-  cross_mark: Vec<u32>,
   session: u32,
 }
 
@@ -58,10 +56,8 @@ impl SaWorkspace {
     Self {
       aff_bg_indices: Vec::with_capacity(1024),
       aff_tg_indices: Vec::with_capacity(8192),
-      aff_cross_indices: Vec::with_capacity(1024),
       bg_mark: vec![0; arrays.nz_bigrams.len()],
       tg_mark: vec![0; arrays.nz_trigrams.len()],
-      cross_mark: vec![0; arrays.nz_cross.len()],
       session: 0,
     }
   }
@@ -414,12 +410,10 @@ impl<'a> Optimizer<'a> {
       new_tg.2 += cnt as f64 * f64::from(e.skip_scissors_base);
     }
 
-    let (old_cs, old_ck) = self.cross_sum(&base.pos, ws);
-    let (new_cs, new_ck) = self.cross_sum(&temp_pos, ws);
     let pe = part_effort   + new_effort;
-    let ps = part_sfb      + new_bg.0 + new_tg.0 + new_cs - old_cs;
+    let ps = part_sfb      + new_bg.0 + new_tg.0;
     let pr = part_rolling  + new_bg.1 + new_tg.1;
-    let pc = part_scissors + new_bg.2 + new_tg.2 + new_ck - old_ck;
+    let pc = part_scissors + new_bg.2 + new_tg.2;
     result.total = self.norm.total_score(pe, ps, pr, pc, cur_l, cur_r);
     result.score = Score { effort: pe, sfb: ps, rolling: pr, scissors: pc };
     result.slots[p1] = v2;
@@ -515,12 +509,10 @@ impl<'a> Optimizer<'a> {
       new_tg.2 += cnt as f64 * f64::from(e.skip_scissors_base);
     }
 
-    let (old_cs, old_ck) = self.cross_sum(&base.pos, ws);
-    let (new_cs, new_ck) = self.cross_sum(&temp_pos, ws);
     let pe = part_effort   + new_effort;
-    let ps = part_sfb      + new_bg.0 + new_tg.0 + new_cs - old_cs;
+    let ps = part_sfb      + new_bg.0 + new_tg.0;
     let pr = part_rolling  + new_bg.1 + new_tg.1;
-    let pc = part_scissors + new_bg.2 + new_tg.2 + new_ck - old_ck;
+    let pc = part_scissors + new_bg.2 + new_tg.2;
     result.total = self.norm.total_score(pe, ps, pr, pc, cur_l, cur_r);
     result.score = Score { effort: pe, sfb: ps, rolling: pr, scissors: pc };
     result.slots[p1] = n1; result.slots[p2] = n2; result.slots[p3] = n3;
@@ -642,12 +634,10 @@ impl<'a> Optimizer<'a> {
       new_troll += cnt as f64 * f64::from(e.roll_base);
       new_tsciss += cnt as f64 * f64::from(e.skip_scissors_base);
     }
-    let (old_cs, old_ck) = self.cross_sum(&base.pos, ws);
-    let (new_cs, new_ck) = self.cross_sum(&temp_pos, ws);
     let pe = part_effort + new_effort;
-    let ps = part_sfb   + new_sfb + new_sfs + new_cs - old_cs;
+    let ps = part_sfb   + new_sfb + new_sfs;
     let pr = part_rolling + new_roll + new_troll;
-    let pc = part_scissors + new_sciss + new_tsciss + new_ck - old_ck;
+    let pc = part_scissors + new_sciss + new_tsciss;
     result.total = self.norm.total_score(pe, ps, pr, pc, cur_l, cur_r);
     result.score = Score { effort: pe, sfb: ps, rolling: pr, scissors: pc };
 
@@ -664,9 +654,8 @@ impl<'a> Optimizer<'a> {
   fn collect_affected(&self, ids: &[u8], ws: &mut SaWorkspace) {
     ws.aff_bg_indices.clear();
     ws.aff_tg_indices.clear();
-    ws.aff_cross_indices.clear();
     ws.session = ws.session.wrapping_add(1);
-    if ws.session == 0 { ws.bg_mark.fill(0); ws.tg_mark.fill(0); ws.cross_mark.fill(0); ws.session = 1; }
+    if ws.session == 0 { ws.bg_mark.fill(0); ws.tg_mark.fill(0); ws.session = 1; }
     let sess = ws.session;
     for &id in ids {
       if id < CHARS as u8 {
@@ -680,25 +669,8 @@ impl<'a> Optimizer<'a> {
         for &idx in &self.corpus_arrays.trigram_flat[start_t..end_t] {
           if ws.tg_mark[idx] != sess { ws.tg_mark[idx] = sess; ws.aff_tg_indices.push(idx); }
         }
-        let start_c = self.corpus_arrays.cross_offsets[id as usize];
-        let end_c   = self.corpus_arrays.cross_offsets[id as usize + 1];
-        for &idx in &self.corpus_arrays.cross_flat[start_c..end_c] {
-          if ws.cross_mark[idx] != sess { ws.cross_mark[idx] = sess; ws.aff_cross_indices.push(idx); }
-        }
       }
     }
-  }
-
-  // 영향받는 공백 건너 쌍들의 (스킵그램, 스킵 시저스) 합. pos: 글자 → 칸
-  fn cross_sum(&self, pos: &[u8; CHARS], ws: &SaWorkspace) -> (f64, f64) {
-    let mut sum = (0.0f64, 0.0f64);
-    for &idx in &ws.aff_cross_indices {
-      let (a, c, cnt) = self.corpus_arrays.nz_cross[idx];
-      let e = self.precomp.cross(pos[a as usize] as usize, pos[c as usize] as usize);
-      sum.0 += cnt as f64 * f64::from(e.sfs_base);
-      sum.1 += cnt as f64 * f64::from(e.skip_scissors_base);
-    }
-    sum
   }
 
   fn violates_hand_usage(&self, cur_l: u64, cur_r: u64) -> bool {
@@ -736,13 +708,12 @@ mod tests {
 
   #[test]
   fn delta_moves_match_full_recompute() {
-    for soft in [false, true] { for grid in [false, true] { check_delta_moves(soft, grid); } }
+    for soft in [false, true] { check_delta_moves(soft); }
   }
 
   // soft_hand: 손 비율 감점이 붙는 구간(40~45%)에서도 delta 계산이 전체 재계산과 같은지
-  // grid: 스페이스를 27번째 키로 배열에 둘 때도
-  fn check_delta_moves(soft_hand: bool, grid: bool) {
-    let arrays = test_util::stats().to_arrays(grid);
+  fn check_delta_moves(soft_hand: bool) {
+    let arrays = test_util::stats().to_arrays();
     let (precomp, norm) = if soft_hand { test_util::precomp_norm_soft_hand(&arrays) } else { test_util::precomp_norm_for(&arrays) };
     let o = Optimizer::new(arrays, &precomp, &norm, 1, 1, test_util::sa(), 0);
     let mut ws = SaWorkspace::new(&o.corpus_arrays);
@@ -769,7 +740,7 @@ mod tests {
 
   #[test]
   fn center_rare_constraint_holds() {
-    let arrays = test_util::stats().to_arrays(false);
+    let arrays = test_util::stats().to_arrays();
     let (precomp, norm) = test_util::precomp_norm_for(&arrays);
     let mask = arrays.rare_mask(4);
     assert_eq!(mask.count_ones(), 4);
@@ -792,7 +763,7 @@ mod tests {
 
   #[test]
   fn descend_reaches_a_deterministic_local_optimum() {
-    let arrays = test_util::stats().to_arrays(false);
+    let arrays = test_util::stats().to_arrays();
     let (precomp, norm) = test_util::precomp_norm_soft_hand(&arrays);
     let mask = arrays.rare_mask(4);
     let o = Optimizer::new(arrays, &precomp, &norm, 1, 1, test_util::sa(), mask);
@@ -815,7 +786,7 @@ mod tests {
   fn sa_improves_and_repairs_penalized_layouts() {
     let stats = test_util::stats();
     let (precomp, norm) = test_util::precomp_norm(&stats);
-    let o = Optimizer::new(stats.to_arrays(false), &precomp, &norm, 1, 1, test_util::sa(), 0);
+    let o = Optimizer::new(stats.to_arrays(), &precomp, &norm, 1, 1, test_util::sa(), 0);
     let start = o.make_scored_excl(&[]);
     let out = o.optimize_sa(start, &[]);
     assert!(out.total >= start.total);
@@ -832,16 +803,16 @@ mod tests {
   }
 
   #[test]
-  fn space_off_grid_places_only_letters() {
-    let arrays = test_util::stats().to_arrays(false);
+  fn sa_places_the_space_key_with_the_letters() {
+    let arrays = test_util::stats().to_arrays();
     let (precomp, norm) = test_util::precomp_norm_for(&arrays);
     let o = Optimizer::new(arrays, &precomp, &norm, 1, 1, test_util::sa(), 0);
     let a = o.optimize_sa(o.make_scored_excl(&[]), &[]);
     let b = o.optimize_sa(o.make_scored_excl(&[]), &[]);
     for l in [a, b] {
       l.assert_invariants();
-      assert_eq!(l.key_count(), 26);
-      assert_eq!(l.pos[26], EMPTY);
+      assert_eq!(l.key_count(), 27);
+      assert_ne!(l.pos[26], EMPTY);
     }
     assert!(a.total > PENALTY_SCORE);
   }
@@ -850,7 +821,7 @@ mod tests {
   fn sa_stays_away_from_excluded_homes() {
     let stats = test_util::stats();
     let (precomp, norm) = test_util::precomp_norm(&stats);
-    let o = Optimizer::new(stats.to_arrays(false), &precomp, &norm, 1, 3, test_util::sa(), 0);
+    let o = Optimizer::new(stats.to_arrays(), &precomp, &norm, 1, 3, test_util::sa(), 0);
     for _ in 0..5 {
       let start = o.make_scored_excl(&[]);
       // 제외 없이 찾은 결과의 홈행을 막고 같은 시작점에서 다시 돌리면, 그 홈행과 3글자 이상 달라야 함
@@ -868,7 +839,7 @@ mod tests {
     let stats = test_util::stats();
     fastrand::seed(7); // 정규화 표본도 고정해야 실행(프로세스)마다 같은 목적함수가 됨
     let (precomp, norm) = test_util::precomp_norm(&stats);
-    let o = Optimizer::new(stats.to_arrays(false), &precomp, &norm, 1, 2, test_util::sa(), 0);
+    let o = Optimizer::new(stats.to_arrays(), &precomp, &norm, 1, 2, test_util::sa(), 0);
     let path = std::env::temp_dir().join(format!("p2anut_seed_{}.bin", std::process::id()));
     let run = |seed: u64| {
       fastrand::seed(seed);
@@ -886,7 +857,7 @@ mod tests {
   fn elites_respect_min_home_diff() {
     let stats = test_util::stats();
     let (precomp, norm) = test_util::precomp_norm(&stats);
-    let o = Optimizer::new(stats.to_arrays(false), &precomp, &norm, 3, 2, test_util::sa(), 0);
+    let o = Optimizer::new(stats.to_arrays(), &precomp, &norm, 3, 2, test_util::sa(), 0);
     let path = std::env::temp_dir().join(format!("p2anut_test_{}.bin", std::process::id()));
     let elites = o.run(&[], path.to_str().unwrap());
     let _ = std::fs::remove_file(&path);
@@ -924,7 +895,7 @@ mod tests {
 
   #[test]
   fn each_elite_stops_once_its_best_repeats() {
-    let arrays = test_util::stats().to_arrays(false);
+    let arrays = test_util::stats().to_arrays();
     let (precomp, norm) = test_util::precomp_norm_for(&arrays);
     // 최고점이 한 번만 나와도 되면 첫 묶음(4번)을 채우고 멈춤 (최소 한 묶음)
     let sa = crate::config::SaParams { starts_per_batch: 4, stop_after_hits: 1, max_starts: 400, ..test_util::sa() };
@@ -938,7 +909,7 @@ mod tests {
     assert!(again.total >= best.total);
     // 최고점이 다시 안 나오면(목표가 너무 높음) 상한에서 멈춤
     let sa = crate::config::SaParams { starts_per_batch: 4, stop_after_hits: 1000, max_starts: 12, ..test_util::sa() };
-    let o = Optimizer::new(test_util::stats().to_arrays(false), &precomp, &norm, 1, 1, sa, 0);
+    let o = Optimizer::new(test_util::stats().to_arrays(), &precomp, &norm, 1, 1, sa, 0);
     let (_, t) = o.find_one(1, 1, &[], None, std::time::Instant::now());
     assert_eq!(t.starts, 12);
   }

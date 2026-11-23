@@ -149,20 +149,16 @@ fn analyze_dump(result_path: &Path, config: &Config, corpus_path: &Path) -> anyh
   Ok(stats)
 }
 
-// 채점·최적화에 쓸 수 있는 가장 오래된 파서 버전. 4부터 글자 사이 공백을 세서 엄지 방식의 공백 너머 비용을 계산할 수 있고,
-// 스페이스를 배열에 둘 때는 단어 사이 공백만 세는 6부터 (5는 문장부호 옆 공백까지 세서 누름 횟수가 다름).
-// 그 전 코퍼스로 채점하면 그 몫이 조용히 빠져 예전·지금 결과를 잘못 비교하게 됨
-const MIN_THUMB_PARSER: u32 = 4;
-const MIN_GRID_PARSER: u32 = 6;
-
-fn scoring_parser(config: &Config) -> u32 { if config.space_on_grid() { MIN_GRID_PARSER } else { MIN_THUMB_PARSER } }
+// 채점·최적화에 쓸 수 있는 가장 오래된 파서 버전: 단어 사이 공백만 세는 6부터 (스페이스 키도 배열에 두므로.
+// 5는 문장부호 옆 공백까지 세서 누름 횟수가 다르고, 그 전에는 공백을 세지 않음)
+const MIN_SCORING_PARSER: u32 = 6;
 
 // 저장된 코퍼스 불러오기 (전체 통계). min_parser보다 오래된 파서로 만든 것은 거부 (0 = 통계만 볼 때). 그 밖에 파서가 다르면 경고
 fn load_corpus(corpus_path: &Path, min_parser: u32) -> anyhow::Result<CorpusStats> {
   println!("[Load Corpus] {}", corpus_path.display());
   let (stats, parser_version) = CorpusStats::load(corpus_path.to_str().context("Invalid corpus path")?)?;
   if parser_version < min_parser {
-    anyhow::bail!("{} was built with parser v{parser_version}, which does not count spaces the way this mode needs (v{min_parser}+); rebuild it with `analyze --reset`",
+    anyhow::bail!("{} was built with parser v{parser_version}, which does not count spaces the way scoring needs (v{min_parser}+); rebuild it with `analyze --reset`",
       corpus_path.display());
   }
   if parser_version != dump::PARSER_VERSION {
@@ -272,12 +268,12 @@ fn symbol_ngrams(result_path: &Path, config: &Config) -> anyhow::Result<symbols:
 
 // 저장된 결과를 results 명령과 같은 순서로 (코퍼스가 있으면 지금 설정으로 다시 채점해서 정렬)
 fn sorted_results(result_path: &Path, config: &Config) -> anyhow::Result<Vec<layout::Layout>> {
-  let result_file = result_path.join(config.result_file_for_mode());
+  let result_file = result_path.join(&config.result_file);
   anyhow::ensure!(result_file.exists(), "no results at {}: run optimize first, or pass a layout file", result_file.display());
   let mut results = load_results(result_file.to_str().context("Invalid result file path")?)?;
   let corpus_path = result_path.join(&config.corpus_file);
   if corpus_path.exists() {
-    let arrays = for_scoring(load_corpus(&corpus_path, scoring_parser(config))?, config).to_arrays(config.space_on_grid());
+    let arrays = for_scoring(load_corpus(&corpus_path, MIN_SCORING_PARSER)?, config).to_arrays();
     results.retain(|l| l.key_count() == arrays.keys.len());
     let precomp = Precomp::new(&arrays.freq, &config.weights, &config.costs, &config.effort, config.hand_hard_limit());
     let n = init_score_norm(&arrays, &precomp, &config.costs, score::HandRule::from_config(config));
@@ -291,26 +287,25 @@ fn sorted_results(result_path: &Path, config: &Config) -> anyhow::Result<Vec<lay
 fn cmd_symbols(result_path: &Path, config: &Config, args: &[String]) -> anyhow::Result<()> {
   let flip = args.iter().any(|a| a == "--flip");
   let target = args.iter().find(|a| !a.starts_with("--")).map_or("1", String::as_str);
-  let grid = config.space_on_grid();
   let (mut base, label, what) = if let Ok(n) = target.parse::<usize>() {
     let results = sorted_results(result_path, config)?;
     anyhow::ensure!((1..=results.len()).contains(&n), "there are {} saved results; pick 1..={}", results.len(), results.len());
     (results[n - 1], n.to_string(), format!("saved result #{n}"))
   } else {
-    let l = layout::Layout::parse(&fs::read_to_string(target).with_context(|| format!("reading {target}"))?, grid)
+    let l = layout::Layout::parse(&fs::read_to_string(target).with_context(|| format!("reading {target}"))?)
       .with_context(|| format!("parsing {target}"))?;
     let stem = Path::new(target).file_stem().map_or_else(|| "layout".to_string(), |s| s.to_string_lossy().into_owned());
     (l, stem, target.to_string())
   };
-  anyhow::ensure!(base.key_count() == 26 + usize::from(grid), "the base layout must hold a-z{}", if grid { " and the space key" } else { "" });
+  anyhow::ensure!(base.key_count() == 27, "the base layout must hold a-z and the space key (_)");
   if flip { base = base.mirrored(); }
   println!("[Symbols] base: {what}{}", if flip { ", mirrored" } else { "" });
   let g = symbol_ngrams(result_path, config)?;
   let t = symbols::Tables::new(config);
-  let problem = symbols::Problem::new(&t, &g, &base, grid, &config.symbols)?;
-  let out = result_path.join(format!("symbols{}-{label}{}.txt", if grid { "-grid" } else { "" }, if flip { "-flip" } else { "" }));
+  let problem = symbols::Problem::new(&t, &g, &base, &config.symbols)?;
+  let out = result_path.join(format!("symbols-{label}{}.txt", if flip { "-flip" } else { "" }));
   // 같은 베이스로 저장해 둔 결과가 있으면 첫 시작점으로 (이전보다 나빠지지 않게)
-  let seed = fs::read_to_string(&out).ok().and_then(|text| symbols::parse_text(&text, grid).ok())
+  let seed = fs::read_to_string(&out).ok().and_then(|text| symbols::parse_text(&text).ok())
     .filter(|(b, _)| b.slots == base.slots)
     .and_then(|(_, placed)| problem.state_of(&placed).ok())
     .filter(|st| problem.broken_pairs(st).is_empty());
@@ -330,13 +325,12 @@ fn cmd_symbols(result_path: &Path, config: &Config, args: &[String]) -> anyhow::
 // 기호 배치 파일을 같은 기준으로 채점
 fn cmd_symbols_score(result_path: &Path, config: &Config, files: &[String]) -> anyhow::Result<()> {
   anyhow::ensure!(!files.is_empty(), "usage: <result_path> symbols-score <symbols_file>...");
-  let grid = config.space_on_grid();
   let g = symbol_ngrams(result_path, config)?;
   let t = symbols::Tables::new(config);
   for f in files {
-    let (base, placed) = symbols::parse_text(&fs::read_to_string(f).with_context(|| format!("reading {f}"))?, grid)
+    let (base, placed) = symbols::parse_text(&fs::read_to_string(f).with_context(|| format!("reading {f}"))?)
       .with_context(|| format!("parsing {f}"))?;
-    let problem = symbols::Problem::new(&t, &g, &base, grid, &config.symbols)?;
+    let problem = symbols::Problem::new(&t, &g, &base, &config.symbols)?;
     let st = problem.state_of(&placed)?;
     println!("[{f}]");
     print!("{}", problem.to_text(&base, &st));
@@ -349,7 +343,7 @@ fn cmd_symbols_score(result_path: &Path, config: &Config, files: &[String]) -> a
 }
 
 fn cmd_results(result_path: &Path, config: &Config) -> anyhow::Result<()> {
-  let result_file = result_path.join(config.result_file_for_mode());
+  let result_file = result_path.join(&config.result_file);
   let result_file_str = result_file.to_str().context("Invalid result file path")?;
   if !result_file.exists() {
     eprintln!("No results found at {}", result_file.display());
@@ -359,8 +353,8 @@ fn cmd_results(result_path: &Path, config: &Config) -> anyhow::Result<()> {
   let corpus_path = result_path.join(&config.corpus_file);
   let mut scoring = None;
   if corpus_path.exists() {
-    let stats = for_scoring(load_corpus(&corpus_path, scoring_parser(config))?, config);
-    let arrays = stats.to_arrays(config.space_on_grid());
+    let stats = for_scoring(load_corpus(&corpus_path, MIN_SCORING_PARSER)?, config);
+    let arrays = stats.to_arrays();
     results.retain(|l| l.key_count() == arrays.keys.len());
     let precomp = Precomp::new(&arrays.freq, &config.weights, &config.costs, &config.effort, config.hand_hard_limit());
     let n = init_score_norm(&arrays, &precomp, &config.costs, score::HandRule::from_config(config));
@@ -379,16 +373,16 @@ fn cmd_results(result_path: &Path, config: &Config) -> anyhow::Result<()> {
 fn cmd_score(result_path: &Path, config: &Config, files: &[String]) -> anyhow::Result<()> {
   anyhow::ensure!(!files.is_empty(), "usage: <result_path> score <layout_file>...");
   let corpus_path = result_path.join(&config.corpus_file);
-  let full = load_corpus(&corpus_path, scoring_parser(config))?;
-  let full_arrays = full.to_arrays(config.space_on_grid());
+  let full = load_corpus(&corpus_path, MIN_SCORING_PARSER)?;
+  let full_arrays = full.to_arrays();
   let windows = full.windows();
-  let arrays = for_scoring(full, config).to_arrays(config.space_on_grid());
+  let arrays = for_scoring(full, config).to_arrays();
   let precomp = Precomp::new(&arrays.freq, &config.weights, &config.costs, &config.effort, config.hand_hard_limit());
   let center_mask = arrays.rare_mask(config.center_rare);
   let norm = init_score_norm(&arrays, &precomp, &config.costs, score::HandRule::from_config(config));
 
   let mut entries: Vec<(String, layout::Layout)> = Vec::new();
-  let result_file = result_path.join(config.result_file_for_mode());
+  let result_file = result_path.join(&config.result_file);
   if result_file.exists() {
     let mut results = load_results(result_file.to_str().context("Invalid result file path")?)?;
     results.retain(|l| l.key_count() == arrays.keys.len());
@@ -397,7 +391,7 @@ fn cmd_score(result_path: &Path, config: &Config, files: &[String]) -> anyhow::R
     if let Some(best) = results.first() { entries.push(("best saved result".to_string(), *best)); }
   }
   for f in files {
-    let mut l = layout::Layout::parse(&fs::read_to_string(f).with_context(|| format!("reading {f}"))?, config.space_on_grid())
+    let mut l = layout::Layout::parse(&fs::read_to_string(f).with_context(|| format!("reading {f}"))?)
       .with_context(|| format!("parsing {f}"))?;
     anyhow::ensure!(l.key_count() == arrays.keys.len(), "{f} has {} letters, the corpus has {}", l.key_count(), arrays.keys.len());
     if !l.center_ok(center_mask) { println!("[Score] note: {f} does not follow center_rare ({} letters)", config.center_rare); }
@@ -417,12 +411,12 @@ fn cmd_score(result_path: &Path, config: &Config, files: &[String]) -> anyhow::R
 
 // 점수 설정값을 하나씩 흔들어 저장된 결과와 배열 파일들의 1등이 바뀌는지 점검 (설정·결과 파일은 바꾸지 않음)
 fn cmd_sensitivity(result_path: &Path, config: &Config, files: &[String]) -> anyhow::Result<()> {
-  let arrays = for_scoring(load_corpus(&result_path.join(&config.corpus_file), scoring_parser(config))?, config).to_arrays(config.space_on_grid());
+  let arrays = for_scoring(load_corpus(&result_path.join(&config.corpus_file), MIN_SCORING_PARSER)?, config).to_arrays();
   let precomp = Precomp::new(&arrays.freq, &config.weights, &config.costs, &config.effort, config.hand_hard_limit());
   let center_mask = arrays.rare_mask(config.center_rare);
   let norm = init_score_norm(&arrays, &precomp, &config.costs, score::HandRule::from_config(config));
   let mut cands: Vec<(String, layout::Layout)> = Vec::new();
-  let result_file = result_path.join(config.result_file_for_mode());
+  let result_file = result_path.join(&config.result_file);
   if result_file.exists() {
     let mut results = load_results(result_file.to_str().context("Invalid result file path")?)?;
     results.retain(|l| l.key_count() == arrays.keys.len());
@@ -431,7 +425,7 @@ fn cmd_sensitivity(result_path: &Path, config: &Config, files: &[String]) -> any
     cands.extend(results.into_iter().enumerate().map(|(i, l)| (format!("saved #{}", i + 1), l)));
   }
   for f in files {
-    let l = layout::Layout::parse(&fs::read_to_string(f).with_context(|| format!("reading {f}"))?, config.space_on_grid())
+    let l = layout::Layout::parse(&fs::read_to_string(f).with_context(|| format!("reading {f}"))?)
       .with_context(|| format!("parsing {f}"))?;
     anyhow::ensure!(l.key_count() == arrays.keys.len(), "{f} has {} letters, the corpus has {}", l.key_count(), arrays.keys.len());
     if !l.center_ok(center_mask) { println!("[Sensitivity] note: {f} does not follow center_rare ({} letters)", config.center_rare); }
@@ -443,7 +437,7 @@ fn cmd_sensitivity(result_path: &Path, config: &Config, files: &[String]) -> any
 }
 
 fn run_optimize(result_path: &Path, config: &Config, stats: &corpus::CorpusStats, reset: bool) -> anyhow::Result<()> {
-  let arrays = stats.to_arrays(config.space_on_grid());
+  let arrays = stats.to_arrays();
   print!("[Precomp] ..."); let _ = std::io::stdout().flush();
   let precomp = Precomp::new(&arrays.freq, &config.weights, &config.costs, &config.effort, config.hand_hard_limit());
   println!(" done");
@@ -455,7 +449,7 @@ fn run_optimize(result_path: &Path, config: &Config, stats: &corpus::CorpusStats
     let letters: String = (0..arrays.keys.len()).filter(|&i| center_mask >> i & 1 == 1).map(|i| arrays.keys[i]).collect();
     println!("[Center] least frequent {} letters forced into the center columns: {letters}", config.center_rare);
   }
-  let result_file = result_path.join(config.result_file_for_mode());
+  let result_file = result_path.join(&config.result_file);
   let result_file_str = result_file.to_str().context("Invalid result file path")?;
   let base_layouts = if !reset && result_file.exists() {
     let mut layouts = load_results(result_file_str)?;
@@ -463,7 +457,7 @@ fn run_optimize(result_path: &Path, config: &Config, stats: &corpus::CorpusStats
     let before = layouts.len();
     layouts.retain(|l| l.key_count() == arrays.keys.len());
     if layouts.len() < before {
-      println!("[Results] skipped {} saved layouts with a different key set (made with the other space_key setting)", before - layouts.len());
+      println!("[Results] skipped {} saved layouts with a different key set (made with the old thumb space key)", before - layouts.len());
     }
     // center_rare를 어기는 배열은 구역 안에서만 움직이는 SA로는 못 고치므로 시드로 쓰지 않음
     let before = layouts.len();
@@ -487,7 +481,7 @@ fn run_optimize(result_path: &Path, config: &Config, stats: &corpus::CorpusStats
 }
 
 fn cmd_run(result_path: &Path, config: &Config, reset: bool) -> anyhow::Result<()> {
-  let stats = for_scoring(load_or_analyze(result_path, config, reset, scoring_parser(config), false)?, config);
+  let stats = for_scoring(load_or_analyze(result_path, config, reset, MIN_SCORING_PARSER, false)?, config);
   run_optimize(result_path, config, &stats, reset)
 }
 
@@ -520,7 +514,7 @@ fn main() -> anyhow::Result<()> {
   match cmd {
     Some("analyze")  => cmd_analyze(result_path, &config, reset),
     Some("optimize") => {
-      let stats = for_scoring(load_corpus(&result_path.join(&config.corpus_file), scoring_parser(&config))?, &config);
+      let stats = for_scoring(load_corpus(&result_path.join(&config.corpus_file), MIN_SCORING_PARSER)?, &config);
       run_optimize(result_path, &config, &stats, reset)
     },
     Some("run")      => cmd_run(result_path, &config, reset),
@@ -558,7 +552,7 @@ mod tests {
   fn tri_s(f: &FastCorpus, a: char, b: char, c: char) -> u64 { f.trigrams[(idc(a) * CHARS + idc(b)) * CHARS + idc(c)] }
 
   #[test]
-  fn one_space_between_letters_is_a_thumb_key() {
+  fn one_space_between_letters_is_counted() {
     let f = run("ab Cd");
     assert_eq!(f.letters[26], 1);
     assert_eq!((bi_s(&f, 'b', SP), bi_s(&f, SP, 'c')), (1, 1));
@@ -701,17 +695,13 @@ mod tests {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("corpus.bin");
     let stats = crate::test_util::stats();
-    stats.save(path.to_str().unwrap(), super::MIN_THUMB_PARSER - 1).unwrap();
-    let err = super::load_corpus(&path, super::MIN_THUMB_PARSER).unwrap_err().to_string();
+    stats.save(path.to_str().unwrap(), super::MIN_SCORING_PARSER - 1).unwrap();
+    let err = super::load_corpus(&path, super::MIN_SCORING_PARSER).unwrap_err().to_string();
     assert!(err.contains("does not count spaces") && err.contains("analyze --reset"), "{err}");
     // 통계만 볼 때(analyze)는 읽힘
     assert_eq!(super::load_corpus(&path, 0).unwrap(), stats);
-    // 엄지 방식은 v4부터, 스페이스를 배열에 두면 v6부터
-    stats.save(path.to_str().unwrap(), super::MIN_THUMB_PARSER).unwrap();
-    assert_eq!(super::load_corpus(&path, super::MIN_THUMB_PARSER).unwrap(), stats);
-    assert!(super::load_corpus(&path, super::MIN_GRID_PARSER).is_err());
     stats.save(path.to_str().unwrap(), crate::dump::PARSER_VERSION).unwrap();
-    assert_eq!(super::load_corpus(&path, super::MIN_GRID_PARSER).unwrap(), stats);
+    assert_eq!(super::load_corpus(&path, super::MIN_SCORING_PARSER).unwrap(), stats);
     std::fs::remove_dir_all(&dir).unwrap();
   }
 
