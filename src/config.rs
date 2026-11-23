@@ -454,7 +454,7 @@ mod tests {
   fn center_rare_leaves_room_for_the_outer_keys() {
     let url = "wikipedia_dump_url = \"https://m.org/a.xml.bz2\"\n";
     // 엄지 방식(26키)은 2부터, 스페이스를 배열에 두면(27키) 바깥 24칸에 다 들어가도록 3부터
-    assert!(config(&format!("{url}center_rare = 2")).validate().is_ok());
+    assert!(config(&format!("{url}center_rare = 2\nspace_key = \"thumb\"")).validate().is_ok());
     assert!(config(&format!("{url}center_rare = 2\nspace_key = \"grid\"")).validate().is_err());
     assert!(config(&format!("{url}center_rare = 3\nspace_key = \"grid\"")).validate().is_ok());
     assert!(config(&format!("{url}center_rare = 0\nspace_key = \"grid\"")).validate().is_ok());
@@ -462,7 +462,9 @@ mod tests {
 
   #[test]
   fn space_key_mode_and_result_file() {
-    let c = config("wikipedia_dump_url = \"https://m.org/a.xml.bz2\"\n");
+    // 설정에 없으면 엄지 방식 (config.toml의 값과 상관없이)
+    assert_eq!(SpaceKey::default(), SpaceKey::Thumb);
+    let c = config("wikipedia_dump_url = \"https://m.org/a.xml.bz2\"\nspace_key = \"thumb\"");
     assert_eq!(c.space_key, SpaceKey::Thumb);
     assert_eq!(c.result_file_for_mode(), c.result_file);
     let g = config("wikipedia_dump_url = \"https://m.org/a.xml.bz2\"\nspace_key = \"grid\"\nresult_file = \"result.bin\"");
