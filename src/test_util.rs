@@ -1,5 +1,5 @@
 // 테스트 전용: 고정 영문 텍스트로 만든 작은 코퍼스와 기본 설정값
-use crate::config::{GaParams, SaParams, Weights};
+use crate::config::{SaParams, Weights};
 use crate::corpus::{CorpusArrays, CorpusStats, FastCorpus};
 use crate::precomp::Precomp;
 use crate::score::ScoreNorm;
@@ -23,11 +23,7 @@ pub fn weights() -> Weights {
 }
 
 pub fn sa() -> SaParams {
-  SaParams { max_no_improve: 300, accept_start: 0.3, cooling: 0.98 }
-}
-
-pub fn ga() -> GaParams {
-  GaParams { population: 8, tournament: 3, max_stall: None }
+  SaParams { max_no_improve: 300, accept_start: 0.3, cooling: 0.98, starts_per_batch: 8, stop_after_hits: 2, max_starts: 64 }
 }
 
 pub fn precomp_norm(stats: &CorpusStats) -> (Precomp, ScoreNorm) {

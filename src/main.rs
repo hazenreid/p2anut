@@ -275,7 +275,7 @@ fn run_optimize(result_path: &Path, config: &Config, stats: &corpus::CorpusStats
   let result_file_str = result_file.to_str().context("Invalid result file path")?;
   let base_layouts = if !reset && result_file.exists() {
     let mut layouts = load_results(result_file_str)?;
-    // 공백을 그리드에 두던 예전 결과(27키)는 키 개수가 달라 교차(PMX)를 깨뜨리므로 시드로 쓰지 않음
+    // 공백을 그리드에 두던 예전 결과(27키)는 키 구성이 달라 시드로 쓰지 않음
     let before = layouts.len();
     layouts.retain(|l| l.key_count() == arrays.keys.len());
     if layouts.len() < before {
@@ -290,20 +290,13 @@ fn run_optimize(result_path: &Path, config: &Config, stats: &corpus::CorpusStats
     for l in &mut layouts { l.calc_scores(&arrays, &precomp); l.calc_total_score(&norm); }
     layouts
   } else { vec![] };
-  let optimizer = Optimizer::new(arrays, &precomp, &norm, config.elites, config.min_home_diff, config.sa.clone(), config.ga.clone(), center_mask);
-  let mut best = base_layouts;
-  let mut round = 1usize;
-  loop {
-    println!("[Optimize {round}]");
-    let prev = best.clone();
-    let (layouts, improved) = optimizer.run(best, result_file_str);
-    let mut combined = prev;
-    combined.extend(layouts);
-    best = sort_unique_layouts(combined, config.elites, &[], config.min_home_diff);
-    save_results(&best, result_file_str)?;
-    if !improved || SHUTDOWN.load(Ordering::SeqCst) { break; }
-    round += 1;
-  }
+  let optimizer = Optimizer::new(arrays, &precomp, &norm, config.elites, config.min_home_diff, config.sa.clone(), center_mask);
+  println!("[Optimize]");
+  let layouts = optimizer.run(&base_layouts, result_file_str);
+  let mut combined = base_layouts;
+  combined.extend(layouts);
+  let best = sort_unique_layouts(combined, config.elites, &[], config.min_home_diff);
+  save_results(&best, result_file_str)?;
   println!("\n[Results]");
   print_results(&best, Some(&norm));
   Ok(())

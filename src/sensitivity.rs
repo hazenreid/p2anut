@@ -116,7 +116,7 @@ pub fn evaluate(arrays: &CorpusArrays, c: &Config, cands: &[Layout], base: usize
   for (i, &t) in totals.iter().enumerate() { if t > totals[winner] { winner = i; } }
   let rival = totals.iter().enumerate().filter(|&(i, &t)| i != base && t > PENALTY_SCORE).map(|(_, &t)| t).max();
   let rival_lead = rival.map(|t| cost_per_100(totals[base]) - cost_per_100(t));
-  let o = Optimizer::new(arrays.clone(), &precomp, &norm, 1, 1, c.sa.clone(), c.ga.clone(), center_mask);
+  let o = Optimizer::new(arrays.clone(), &precomp, &norm, 1, 1, c.sa.clone(), center_mask);
   let start = cands[base];
   let descended = o.descend(start);
   let moved = (0..arrays.keys.len()).filter(|&i| descended.pos[i] != start.pos[i]).map(|i| arrays.keys[i]).collect();
@@ -383,7 +383,7 @@ mod tests {
     let c = config();
     let mask = arrays.rare_mask(c.center_rare);
     let (p, n) = scoring(&arrays, &c);
-    let o = Optimizer::new(arrays.clone(), &p, &n, 1, 1, c.sa.clone(), c.ga.clone(), mask);
+    let o = Optimizer::new(arrays.clone(), &p, &n, 1, 1, c.sa.clone(), mask);
     let opt = o.descend(Layout::make_random_centered(&arrays.keys, mask, &[], 0));
     let mut worse = Layout::make_random_centered(&arrays.keys, mask, &[], 0);
     worse.calc_scores(&arrays, &p); worse.calc_total_score(&n);

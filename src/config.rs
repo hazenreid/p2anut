@@ -126,27 +126,26 @@ pub struct SaParams {
   // Phase 2 스텝마다 온도에 곱하는 냉각 계수
   #[serde(default = "default_cooling")]
   pub cooling: f64,
+  // 엘리트마다 무작위 배열에서 시작하는 담금질을 이만큼씩 묶어 동시에 돌림 (최소 시작 횟수이기도 함)
+  #[serde(default = "default_starts_per_batch")]
+  pub starts_per_batch: usize,
+  // 같은 최고점이 이만큼 나오면 그 엘리트 탐색을 끝냄
+  #[serde(default = "default_stop_after_hits")]
+  pub stop_after_hits: usize,
+  // 시작 횟수 상한 (최고점이 그만큼 안 나와도 여기서 끝냄)
+  #[serde(default = "default_max_starts")]
+  pub max_starts: usize,
 }
 
 fn default_cooling() -> f64 { 0.998 }
+fn default_starts_per_batch() -> usize { 40 }
+fn default_stop_after_hits() -> usize { 3 }
+fn default_max_starts() -> usize { 2000 }
 fn default_bigram_coverage() -> f64 { 0.99 }
 fn default_trigram_coverage() -> f64 { 0.97 }
 fn default_sample() -> f64 { 1.0 }
 fn default_true() -> bool { true }
 fn default_min_home_diff() -> u32 { 1 }
-
-#[derive(Deserialize, Clone)]
-pub struct GaParams {
-  pub population: usize,
-  pub tournament: usize,
-  // 최고 점수가 이 세대 수 동안 안 오르면 해당 엘리트 탐색 종료. 없으면 population 값 (예전 동작)
-  #[serde(default)]
-  pub max_stall: Option<usize>,
-}
-
-impl GaParams {
-  pub fn max_stall(&self) -> usize { self.max_stall.unwrap_or(self.population) }
-}
 
 #[derive(Deserialize, Clone)]
 pub struct Config {
@@ -208,7 +207,7 @@ pub struct Config {
   #[serde(default)]
   pub effort: EffortGrid,
   pub sa: SaParams,
-  pub ga: GaParams,
+  // 예전 설정의 [ga](유전 알고리즘)는 더 이상 쓰지 않으며 남아 있어도 무시됨
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -301,11 +300,8 @@ impl Config {
     if sa.max_no_improve == 0 { anyhow::bail!("sa.max_no_improve must be > 0"); }
     if !(0.0..1.0).contains(&sa.accept_start) { anyhow::bail!("sa.accept_start must be in [0.0, 1.0)"); }
     if !(sa.cooling > 0.0 && sa.cooling <= 1.0) { anyhow::bail!("sa.cooling must be in (0.0, 1.0]"); }
-    let ga = &self.ga;
-    if ga.population == 0 { anyhow::bail!("ga.population must be > 0"); }
-    if ga.tournament == 0 { anyhow::bail!("ga.tournament must be > 0"); }
-    if ga.tournament > ga.population { anyhow::bail!("ga.tournament must be <= ga.population"); }
-    if ga.max_stall == Some(0) { anyhow::bail!("ga.max_stall must be > 0"); }
+    if sa.starts_per_batch == 0 || sa.stop_after_hits == 0 { anyhow::bail!("sa.starts_per_batch and sa.stop_after_hits must be > 0"); }
+    if sa.max_starts < sa.starts_per_batch { anyhow::bail!("sa.max_starts must be >= sa.starts_per_batch"); }
     Ok(())
   }
 }

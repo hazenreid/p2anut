@@ -67,6 +67,31 @@ impl SaWorkspace {
   }
 }
 
+// 한 엘리트 탐색의 결과 집계: 지금까지의 최고 배열, 그 점수가 나온 횟수, 시작 횟수
+#[derive(Default)]
+pub struct Tally {
+  pub best: Option<Layout>,
+  pub hits: usize,
+  pub starts: usize,
+}
+
+impl Tally {
+  // ok = 쓸 수 있는 결과인지 (실격·홈행 제약 위반이면 시작 횟수만 셈)
+  fn add(&mut self, l: Layout, ok: bool) {
+    self.starts += 1;
+    if !ok { return; }
+    match self.best {
+      Some(b) if l.total < b.total => {}
+      Some(b) if l.total == b.total => self.hits += 1,
+      _ => { self.best = Some(l); self.hits = 1; }
+    }
+  }
+
+  fn done(&self, p: &crate::config::SaParams) -> bool {
+    self.starts >= p.max_starts || (self.starts >= p.starts_per_batch && self.hits >= p.stop_after_hits)
+  }
+}
+
 pub struct Optimizer<'a> {
   corpus_arrays: CorpusArrays,
   precomp: &'a Precomp,
@@ -74,15 +99,13 @@ pub struct Optimizer<'a> {
   elites_len: usize,
   min_home_diff: u32,
   sa_params: crate::config::SaParams,
-  ga_params: crate::config::GaParams,
   // center_rare로 고른 글자 비트마스크 (0 = 제약 없음). 제약이 있으면 가운데 두 열과 나머지 칸 사이에서는 글자를 옮기지 않음
   center_mask: u32,
 }
 
 impl<'a> Optimizer<'a> {
-  #[allow(clippy::too_many_arguments)]
-  pub fn new(corpus_arrays: CorpusArrays, precomp: &'a Precomp, norm: &'a ScoreNorm, elites_len: usize, min_home_diff: u32, sa_params: crate::config::SaParams, ga_params: crate::config::GaParams, center_mask: u32) -> Self {
-    Self { corpus_arrays, precomp, norm, elites_len, min_home_diff, sa_params, ga_params, center_mask }
+  pub fn new(corpus_arrays: CorpusArrays, precomp: &'a Precomp, norm: &'a ScoreNorm, elites_len: usize, min_home_diff: u32, sa_params: crate::config::SaParams, center_mask: u32) -> Self {
+    Self { corpus_arrays, precomp, norm, elites_len, min_home_diff, sa_params, center_mask }
   }
 
   // 이동에 쓰는 칸들이 모두 같은 구역(센터/바깥)인지. 제약이 없으면 항상 true
@@ -90,176 +113,58 @@ impl<'a> Optimizer<'a> {
     self.center_mask == 0 || ps.iter().all(|&p| is_center_slot(p) == is_center_slot(ps[0]))
   }
 
-  #[allow(clippy::needless_pass_by_value)]
-  pub fn run(&self, base_layouts: Vec<Layout>, result_file: &str) -> (Vec<Layout>, bool) {
+  // 엘리트를 하나씩 찾음. 앞서 찾은 엘리트와 홈행이 min_home_diff 이상 다른 배열만. seeds: 저장된 이전 결과 (엘리트마다 첫 시작점으로 씀)
+  pub fn run(&self, seeds: &[Layout], result_file: &str) -> Vec<Layout> {
     let elites_len = self.elites_len;
     let mut all_elites: Vec<Layout> = vec![];
     let mut excluded_homes: Vec<u32> = vec![];
-    let seeds: Vec<Option<Layout>> = (0..elites_len).map(|i| base_layouts.get(i).copied()).collect();
-    let mut any_improved = false;
     let start = std::time::Instant::now();
 
-    for (i, seed) in seeds.iter().enumerate().take(elites_len) {
-      let (elite, improved) = self.find_one(i + 1, elites_len, &excluded_homes, *seed, start);
-      if improved { any_improved = true; }
+    for i in 0..elites_len {
+      let (elite, tally) = self.find_one(i + 1, elites_len, &excluded_homes, seeds.get(i).copied(), start);
       excluded_homes.push(home_row_keys(&elite));
       all_elites.push(elite);
       sort_layouts(&mut all_elites);
-      // 이전 라운드 결과와 합쳐서 저장: 라운드 중간에 강제 종료돼도 이전 엘리트를 잃지 않도록
-      let merged = sort_unique_layouts(base_layouts.iter().chain(&all_elites).copied().collect(), elites_len, &[], self.min_home_diff);
+      // 이전 결과와 합쳐서 저장: 중간에 강제 종료돼도 이전 엘리트를 잃지 않도록
+      let merged = sort_unique_layouts(seeds.iter().chain(&all_elites).copied().collect(), elites_len, &[], self.min_home_diff);
       save_results(&merged, result_file).ok();
-      println!("\n[Elite {}/{}]", i + 1, elites_len);
+      println!("\n[Elite {}/{}] best found {} times in {} starts", i + 1, elites_len, tally.hits, tally.starts);
       elite.print();
       elite.print_goodness(self.norm);
       println!();
       if crate::SHUTDOWN.load(std::sync::atomic::Ordering::SeqCst) { break; }
     }
-    (all_elites, any_improved)
+    all_elites
   }
 
-  fn find_one(&self, elite_idx: usize, total_elites: usize, excluded_homes: &[u32], seed: Option<Layout>, start: std::time::Instant) -> (Layout, bool) {
-    let pop_size = self.ga_params.population;
-    let max_stall = self.ga_params.max_stall();
-
-    let mut population: Vec<Layout> = (0..pop_size).map(|_| self.make_scored_excl(excluded_homes)).collect();
-    // 이미 찾은 엘리트와 홈행이 너무 비슷한 시드는 쓰지 않음 (그대로 반환되면 중복 엘리트가 됨)
-    if let Some(mut s) = seed.filter(|s| is_home_distinct(home_row_keys(s), excluded_homes, self.min_home_diff)) {
-      s.calc_scores(&self.corpus_arrays, self.precomp);
-      s.calc_total_score(self.norm);
-      population[0] = s;
-    }
-    sort_layouts(&mut population);
-
-    let mut best = population[0];
-    let mut prev_total = best.total;
-    let mut generation = 1usize;
-    let mut improved = false;
-
-    let print_status = |g: usize, total: i64| {
-      use std::io::Write;
-      print!("\r\x1b[2K[{}/{}];{}/{} Best: {:.2}\t{:.1}s",
-        elite_idx, total_elites, g, max_stall,
-        cost_per_100(total), start.elapsed().as_secs_f32());
-      let _ = std::io::stdout().flush();
-    };
-    print_status(generation, prev_total);
-
-    while generation <= max_stall {
-      let pool: Vec<&Layout> = population.iter().collect();
-
-      let mut next: Vec<Layout> = task_seeds(pop_size - 1).into_par_iter()
-        .map(|seed| {
-          fastrand::seed(seed);
-          let p1 = self.tournament(&pool);
-          let p2 = self.tournament(&pool);
-          let mut child = self.crossover(p1, p2);
-          child.calc_scores(&self.corpus_arrays, self.precomp);
-          child.calc_total_score(self.norm);
-          child
+  // 무작위 배열에서 시작하는 담금질을 starts_per_batch개씩 동시에 돌리고, 같은 최고점이 stop_after_hits번 나오면 멈춤
+  // (최소 한 묶음, 최대 max_starts번). seed가 있으면 첫 시작점으로 씀 (이전 결과보다 나빠지지 않게)
+  fn find_one(&self, elite_idx: usize, total_elites: usize, excluded_homes: &[u32], seed: Option<Layout>, start: std::time::Instant) -> (Layout, Tally) {
+    let p = &self.sa_params;
+    let seed = seed.filter(|s| s.center_ok(self.center_mask) && is_home_distinct(home_row_keys(s), excluded_homes, self.min_home_diff));
+    let mut tally = Tally::default();
+    loop {
+      let n = p.starts_per_batch.min(p.max_starts - tally.starts);
+      let first = tally.starts;
+      let found: Vec<Layout> = task_seeds(n).into_par_iter().enumerate()
+        .map(|(k, s)| {
+          fastrand::seed(s);
+          let init = match seed { Some(l) if first == 0 && k == 0 => l, _ => self.make_scored_excl(excluded_homes) };
+          self.optimize_sa(init, excluded_homes)
         })
         .collect();
-      next.push(best);
-
-      population = sort_unique_layouts(next, pop_size, excluded_homes, self.min_home_diff);
-      while population.len() < pop_size {
-        population.push(self.make_scored_excl(excluded_homes));
+      for l in found {
+        let ok = l.total > PENALTY_SCORE && is_home_distinct(home_row_keys(&l), excluded_homes, self.min_home_diff);
+        tally.add(l, ok);
       }
-
-      let seeds = task_seeds(population.len());
-      population = population.into_par_iter().zip(seeds)
-        .map(|(l, seed)| { fastrand::seed(seed); self.optimize_sa(l, excluded_homes) })
-        .collect();
-
-      if crate::SHUTDOWN.load(std::sync::atomic::Ordering::SeqCst) { break; }
-
-      // 한 손에 크게 치우친 시작 배열은 단일 이동으로 손 비율을 못 맞춰 페널티로 남을 수 있음 → 버리고 새로 채움
-      population.retain(|l| {
-        l.total > PENALTY_SCORE && is_home_distinct(home_row_keys(l), excluded_homes, self.min_home_diff)
-      });
-      while population.len() < pop_size {
-        population.push(self.make_scored_excl(excluded_homes));
-      }
-      sort_layouts(&mut population);
-
-      let cur_best = &population[0];
-      let cur_total = cur_best.total;
-
-      if cur_total > prev_total {
-        best = *cur_best;
-        prev_total = cur_total;
-        generation = 1;
-        improved = true;
-        let inject = pop_size / 5;
-        for entry in population.iter_mut().rev().take(inject) {
-          *entry = self.make_scored_excl(excluded_homes);
-        }
-      } else {
-        generation += 1;
-      }
-      print_status(generation, prev_total);
+      let best = tally.best.map_or(f64::NAN, |b| cost_per_100(b.total));
+      print!("\r\x1b[2K[{elite_idx}/{total_elites}] {} starts  best {best:.2} x{}\t{:.1}s", tally.starts, tally.hits, start.elapsed().as_secs_f32());
+      { use std::io::Write; let _ = std::io::stdout().flush(); }
+      if crate::SHUTDOWN.load(std::sync::atomic::Ordering::SeqCst) || tally.done(p) { break; }
     }
-
-
-    (best, improved)
-  }
-
-  fn tournament<'b>(&self, pool: &[&'b Layout]) -> &'b Layout {
-    debug_assert!(!pool.is_empty(), "tournament pool is empty");
-    let n = pool.len();
-    let mut best = pool[fastrand::usize(..n)];
-    for _ in 1..self.ga_params.tournament {
-      let candidate = pool[fastrand::usize(..n)];
-      if candidate.total > best.total { best = candidate; }
-    }
-    best
-  }
-
-  fn crossover(&self, p1: &Layout, p2: &Layout) -> Layout {
-    let nk = CHARS;
-    let mut tags1 = [0u8; ROWS * COLS];
-    let mut tags2 = [0u8; ROWS * COLS];
-    // 빈칸 태그는 구역별로 따로 번호를 매김: 센터 빈칸끼리, 바깥 빈칸끼리만 대응되어
-    // PMX가 구역을 넘나들지 않음 (두 부모가 제약을 지키면 자식도 지킴)
-    let constrained = self.center_mask != 0;
-    let fill_tags = |layout: &Layout, tags: &mut [u8; ROWS * COLS]| {
-      let mut blank_id = nk + 1;
-      let mut center_blank = nk + 1 + ROWS * COLS;
-      for (i, &id) in layout.slots.iter().enumerate() {
-        tags[i] = if id < CHARS as u8 { id + 1 }
-          else if constrained && is_center_slot(i) { let b = center_blank; center_blank += 1; b as u8 }
-          else { let b = blank_id; blank_id += 1; b as u8 };
-      }
-    };
-    fill_tags(p1, &mut tags1);
-    fill_tags(p2, &mut tags2);
-
-    let lo = fastrand::usize(..ROWS * COLS - 1);
-    let hi = lo + 1 + fastrand::usize(..ROWS * COLS - lo - 1);
-    let mut child_tags = [0u8; ROWS * COLS];
-    child_tags[lo..=hi].copy_from_slice(&tags1[lo..=hi]);
-
-    let mut reverse_map = [0u8; 256];
-    let mut in_segment = [false; 256];
-    for i in lo..=hi {
-      reverse_map[tags1[i] as usize] = tags2[i];
-      in_segment[tags1[i] as usize] = true;
-    }
-    for i in (0..lo).chain(hi + 1..ROWS * COLS) {
-      let mut val = tags2[i];
-      let mut steps = 0usize;
-      while in_segment[val as usize] { val = reverse_map[val as usize]; steps += 1; if steps > hi - lo + 1 { break; } }
-      child_tags[i] = val;
-    }
-
-    let mut layout = Layout::new();
-    for (i, &v) in child_tags.iter().enumerate() {
-      if (1..=CHARS as u8).contains(&v) {
-        let id = v - 1;
-        layout.slots[i] = id;
-        layout.pos[id as usize] = i as u8;
-      }
-    }
-    layout
+    // 하나도 못 찾았으면(모든 시작이 손 비율 실격 등) 조건을 지키는 무작위 배열이라도 돌려줌
+    let best = tally.best.unwrap_or_else(|| self.make_scored_excl(excluded_homes));
+    (best, tally)
   }
 
   #[allow(clippy::too_many_lines)]
@@ -836,7 +741,7 @@ mod tests {
   fn check_delta_moves(soft_hand: bool) {
     let arrays = test_util::stats().to_arrays();
     let (precomp, norm) = if soft_hand { test_util::precomp_norm_soft_hand(&arrays) } else { test_util::precomp_norm_for(&arrays) };
-    let o = Optimizer::new(arrays, &precomp, &norm, 1, 1, test_util::sa(), test_util::ga(), 0);
+    let o = Optimizer::new(arrays, &precomp, &norm, 1, 1, test_util::sa(), 0);
     let mut ws = SaWorkspace::new(&o.corpus_arrays);
     let mut cur = o.make_scored_excl(&[]);
     let mut checked = 0;
@@ -865,7 +770,7 @@ mod tests {
     let (precomp, norm) = test_util::precomp_norm_for(&arrays);
     let mask = arrays.rare_mask(4);
     assert_eq!(mask.count_ones(), 4);
-    let o = Optimizer::new(arrays, &precomp, &norm, 1, 1, test_util::sa(), test_util::ga(), mask);
+    let o = Optimizer::new(arrays, &precomp, &norm, 1, 1, test_util::sa(), mask);
     let mut ws = SaWorkspace::new(&o.corpus_arrays);
     let mut cur = o.make_scored_excl(&[]);
     assert!(cur.center_ok(mask));
@@ -876,7 +781,6 @@ mod tests {
     }
     let a = o.optimize_sa(o.make_scored_excl(&[]), &[]);
     let b = o.optimize_sa(o.make_scored_excl(&[]), &[]);
-    for _ in 0..50 { let c = o.crossover(&a, &b); c.assert_invariants(); assert!(c.center_ok(mask)); }
     assert!(a.center_ok(mask) && b.center_ok(mask) && a.total > PENALTY_SCORE);
     // 센터에는 제약 글자만: 4글자 + 빈칸 2개
     let n_center = (0..ROWS * COLS).filter(|&p| is_center_slot(p) && a.slots[p] < CHARS as u8).count();
@@ -888,7 +792,7 @@ mod tests {
     let arrays = test_util::stats().to_arrays();
     let (precomp, norm) = test_util::precomp_norm_soft_hand(&arrays);
     let mask = arrays.rare_mask(4);
-    let o = Optimizer::new(arrays, &precomp, &norm, 1, 1, test_util::sa(), test_util::ga(), mask);
+    let o = Optimizer::new(arrays, &precomp, &norm, 1, 1, test_util::sa(), mask);
     let mut ws = SaWorkspace::new(&o.corpus_arrays);
     for _ in 0..3 {
       let start = o.make_scored_excl(&[]);
@@ -908,7 +812,7 @@ mod tests {
   fn sa_improves_and_repairs_penalized_layouts() {
     let stats = test_util::stats();
     let (precomp, norm) = test_util::precomp_norm(&stats);
-    let o = Optimizer::new(stats.to_arrays(), &precomp, &norm, 1, 1, test_util::sa(), test_util::ga(), 0);
+    let o = Optimizer::new(stats.to_arrays(), &precomp, &norm, 1, 1, test_util::sa(), 0);
     let start = o.make_scored_excl(&[]);
     let out = o.optimize_sa(start, &[]);
     assert!(out.total >= start.total);
@@ -928,10 +832,10 @@ mod tests {
   fn space_off_grid_places_only_letters() {
     let arrays = test_util::stats().to_arrays();
     let (precomp, norm) = test_util::precomp_norm_for(&arrays);
-    let o = Optimizer::new(arrays, &precomp, &norm, 1, 1, test_util::sa(), test_util::ga(), 0);
+    let o = Optimizer::new(arrays, &precomp, &norm, 1, 1, test_util::sa(), 0);
     let a = o.optimize_sa(o.make_scored_excl(&[]), &[]);
     let b = o.optimize_sa(o.make_scored_excl(&[]), &[]);
-    for l in [a, b, o.crossover(&a, &b)] {
+    for l in [a, b] {
       l.assert_invariants();
       assert_eq!(l.key_count(), 26);
       assert_eq!(l.pos[26], EMPTY);
@@ -943,7 +847,7 @@ mod tests {
   fn sa_stays_away_from_excluded_homes() {
     let stats = test_util::stats();
     let (precomp, norm) = test_util::precomp_norm(&stats);
-    let o = Optimizer::new(stats.to_arrays(), &precomp, &norm, 1, 3, test_util::sa(), test_util::ga(), 0);
+    let o = Optimizer::new(stats.to_arrays(), &precomp, &norm, 1, 3, test_util::sa(), 0);
     for _ in 0..5 {
       let start = o.make_scored_excl(&[]);
       // 제외 없이 찾은 결과의 홈행을 막고 같은 시작점에서 다시 돌리면, 그 홈행과 3글자 이상 달라야 함
@@ -961,11 +865,11 @@ mod tests {
     let stats = test_util::stats();
     fastrand::seed(7); // 정규화 표본도 고정해야 실행(프로세스)마다 같은 목적함수가 됨
     let (precomp, norm) = test_util::precomp_norm(&stats);
-    let o = Optimizer::new(stats.to_arrays(), &precomp, &norm, 1, 2, test_util::sa(), test_util::ga(), 0);
+    let o = Optimizer::new(stats.to_arrays(), &precomp, &norm, 1, 2, test_util::sa(), 0);
     let path = std::env::temp_dir().join(format!("p2anut_seed_{}.bin", std::process::id()));
     let run = |seed: u64| {
       fastrand::seed(seed);
-      let (elites, _) = o.run(vec![], path.to_str().unwrap());
+      let elites = o.run(&[], path.to_str().unwrap());
       elites.iter().map(|l| (l.slots, l.total)).collect::<Vec<_>>()
     };
     // 다른 시드끼리 결과가 다른지는 확인하지 않음: 작은 코퍼스에서는 같은 최적해로 수렴할 수 있음
@@ -979,13 +883,60 @@ mod tests {
   fn elites_respect_min_home_diff() {
     let stats = test_util::stats();
     let (precomp, norm) = test_util::precomp_norm(&stats);
-    let o = Optimizer::new(stats.to_arrays(), &precomp, &norm, 3, 2, test_util::sa(), test_util::ga(), 0);
+    let o = Optimizer::new(stats.to_arrays(), &precomp, &norm, 3, 2, test_util::sa(), 0);
     let path = std::env::temp_dir().join(format!("p2anut_test_{}.bin", std::process::id()));
-    let (elites, _) = o.run(vec![], path.to_str().unwrap());
+    let elites = o.run(&[], path.to_str().unwrap());
     let _ = std::fs::remove_file(&path);
     assert_eq!(elites.len(), 3);
     for i in 0..elites.len() { for j in i + 1..elites.len() {
       assert!(crate::layout::home_diff(home_row_keys(&elites[i]), home_row_keys(&elites[j])) >= 2);
     }}
+  }
+
+  fn scored(total: i64) -> Layout { let mut l = Layout::new(); l.total = total; l }
+
+  #[test]
+  fn tally_counts_how_often_the_best_comes_back() {
+    let p = crate::config::SaParams { starts_per_batch: 4, stop_after_hits: 2, max_starts: 10, ..test_util::sa() };
+    let mut t = Tally::default();
+    t.add(scored(-10), true);
+    t.add(scored(-5), true);
+    t.add(scored(-5), false); // 실격이나 홈행 위반은 시작으로만 셈
+    t.add(scored(-7), true);
+    assert_eq!((t.best.unwrap().total, t.hits, t.starts), (-5, 1, 4));
+    assert!(!t.done(&p));
+    t.add(scored(-5), true);
+    assert_eq!(t.hits, 2);
+    assert!(t.done(&p));
+    // 더 좋은 점수가 나오면 횟수를 처음부터
+    t.add(scored(-1), true);
+    assert_eq!((t.best.unwrap().total, t.hits), (-1, 1));
+    // 최소 한 묶음은 채움, 상한에서는 멈춤
+    let mut u = Tally::default();
+    u.add(scored(-1), true); u.add(scored(-1), true);
+    assert!(!u.done(&p));
+    for _ in 0..8 { u.add(scored(-9), true); }
+    assert!(u.done(&p));
+  }
+
+  #[test]
+  fn each_elite_stops_once_its_best_repeats() {
+    let arrays = test_util::stats().to_arrays();
+    let (precomp, norm) = test_util::precomp_norm_for(&arrays);
+    // 최고점이 한 번만 나와도 되면 첫 묶음(4번)을 채우고 멈춤 (최소 한 묶음)
+    let sa = crate::config::SaParams { starts_per_batch: 4, stop_after_hits: 1, max_starts: 400, ..test_util::sa() };
+    let o = Optimizer::new(arrays, &precomp, &norm, 1, 1, sa, 0);
+    let (best, t) = o.find_one(1, 1, &[], None, std::time::Instant::now());
+    assert_eq!(t.starts, 4);
+    assert!(t.hits >= 1);
+    assert_eq!(t.best.unwrap().total, best.total);
+    // 이전 결과를 첫 시작점으로 쓰면 그보다 나빠지지 않음
+    let (again, _) = o.find_one(1, 1, &[], Some(best), std::time::Instant::now());
+    assert!(again.total >= best.total);
+    // 최고점이 다시 안 나오면(목표가 너무 높음) 상한에서 멈춤
+    let sa = crate::config::SaParams { starts_per_batch: 4, stop_after_hits: 1000, max_starts: 12, ..test_util::sa() };
+    let o = Optimizer::new(test_util::stats().to_arrays(), &precomp, &norm, 1, 1, sa, 0);
+    let (_, t) = o.find_one(1, 1, &[], None, std::time::Instant::now());
+    assert_eq!(t.starts, 12);
   }
 }
