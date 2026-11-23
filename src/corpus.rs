@@ -1,5 +1,6 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss, clippy::cast_sign_loss, clippy::cast_lossless)]
 use std::collections::HashMap;
+use anyhow::Context;
 use serde::{Serialize, Deserialize};
 use crate::layout::CHARS;
 
@@ -251,7 +252,12 @@ impl CorpusStats {
 
   // 파일 형식: CORPUS_MAGIC + 파일 형식 버전(u32) + 파서 버전(u32) + bincode(CorpusStats)
   pub fn save(&self, path: &str, parser_version: u32) -> anyhow::Result<()> {
-    let mut bytes = CORPUS_MAGIC.to_vec();
+    self.save_with(path, CORPUS_MAGIC, parser_version)
+  }
+
+  // 머리표가 다른 코퍼스(심볼 레이어용 영어 문장부호·코드 코퍼스)도 같은 형식으로 저장
+  pub fn save_with(&self, path: &str, magic: &[u8], parser_version: u32) -> anyhow::Result<()> {
+    let mut bytes = magic.to_vec();
     bytes.extend_from_slice(&CORPUS_FORMAT.to_le_bytes());
     bytes.extend_from_slice(&parser_version.to_le_bytes());
     bytes.extend_from_slice(&bincode::serialize(self)?);
@@ -264,15 +270,20 @@ impl CorpusStats {
 
   // (통계, 만들 때의 파서 버전)
   pub fn load(path: &str) -> anyhow::Result<(Self, u32)> {
-    let bytes = std::fs::read(path)?;
-    let header = CORPUS_MAGIC.len() + 8;
-    if bytes.len() < header || !bytes.starts_with(CORPUS_MAGIC) {
-      anyhow::bail!("{path} is an old-format corpus (trimmed at save time); rebuild it with `analyze --reset`");
+    Self::load_with(path, CORPUS_MAGIC)
+  }
+
+  pub fn load_with(path: &str, magic: &[u8]) -> anyhow::Result<(Self, u32)> {
+    let bytes = std::fs::read(path).with_context(|| format!("reading {path}"))?;
+    let header = magic.len() + 8;
+    if bytes.len() < header || !bytes.starts_with(magic) {
+      if magic == CORPUS_MAGIC { anyhow::bail!("{path} is an old-format corpus (trimmed at save time); rebuild it with `analyze --reset`"); }
+      anyhow::bail!("{path} is not a {} file", String::from_utf8_lossy(magic.strip_suffix(b"\0").unwrap_or(magic)));
     }
     let word = |i: usize| u32::from_le_bytes(bytes[i..i + 4].try_into().expect("4 bytes"));
-    let format = word(CORPUS_MAGIC.len());
+    let format = word(magic.len());
     anyhow::ensure!(format == CORPUS_FORMAT, "{path} has corpus format {format}, expected {CORPUS_FORMAT}; rebuild it with `analyze --reset`");
-    let parser_version = word(CORPUS_MAGIC.len() + 4);
+    let parser_version = word(magic.len() + 4);
     Ok((bincode::deserialize(&bytes[header..])?, parser_version))
   }
 

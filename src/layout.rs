@@ -204,6 +204,14 @@ impl Layout {
       pct(skip), pct(skip_space));
   }
 
+  // 좌우를 뒤집은 배열 (점수는 같음. 스페이스를 반대 손으로 옮겨 쓸 때 등)
+  pub fn mirrored(&self) -> Layout {
+    let mut m = *self;
+    for r in 0..ROWS { m.slots[r * COLS..(r + 1) * COLS].reverse(); }
+    for (p, &id) in m.slots.iter().enumerate() { if id < CHARS as u8 { m.pos[id as usize] = p as u8; } }
+    m
+  }
+
   pub fn key_count(&self) -> usize {
     self.slots.iter().filter(|&&id| id < CHARS as u8).count()
   }
@@ -396,15 +404,22 @@ const REF_INDEX_TOP: usize = 3;
 const REF_MIDDLE_HOME: usize = COLS + 2;
 const REF_MIDDLE_BOTTOM: usize = 2 * COLS + 2;
 
+// [costs]의 대표 사건 비용으로 정한 (sfb, scissors) 원래 점수 1단위당 비용
+pub fn event_units(precomp: &Precomp, c: &crate::config::Costs) -> (f64, f64) {
+  let per = |cost: f32, base: f32| if base > 0.0 { f64::from(cost) / f64::from(base) } else { 0.0 };
+  (per(c.sfb, precomp.bigram(REF_INDEX_HOME, REF_INDEX_TOP).sfb_base),
+   per(c.full_scissors, precomp.bigram(REF_MIDDLE_BOTTOM, REF_INDEX_TOP).scissors_base))
+}
+
 // [costs]의 대표 사건 비용을 원래 점수 1단위당 비용으로 환산
 pub fn abs_weights(arrays: &CorpusArrays, precomp: &Precomp, c: &crate::config::Costs) -> crate::score::AbsWeights {
-  let per = |cost: f32, base: f32| if base > 0.0 { f64::from(cost) / f64::from(base) } else { 0.0 };
   // 비용은 글자(a-z) 100개당. 스페이스를 배열에 두면 스페이스 누름 비용도 이 분모로 나눔
   let letters: u64 = arrays.freq.iter().take(26).sum();
+  let (sfb, scissors) = event_units(precomp, c);
   crate::score::AbsWeights {
     effort: f64::from(c.effort),
-    sfb: per(c.sfb, precomp.bigram(REF_INDEX_HOME, REF_INDEX_TOP).sfb_base),
-    scissors: per(c.full_scissors, precomp.bigram(REF_MIDDLE_BOTTOM, REF_INDEX_TOP).scissors_base),
+    sfb,
+    scissors,
     // 롤·리다이렉트는 Precomp가 이미 비용 단위로 계산함 (대표 안쪽 롤 = inroll)
     rolling: 1.0,
     per_letter: if letters > 0 { 1.0 / letters as f64 } else { 0.0 },

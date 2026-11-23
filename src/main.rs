@@ -1,12 +1,15 @@
+mod code;
 mod config;
 mod corpus;
 mod download;
 mod dump;
+mod keycorpus;
 mod layout;
 mod optimizer;
 mod precomp;
 mod score;
 mod sensitivity;
+mod symbols;
 mod wiki;
 #[cfg(test)]
 mod test_util;
@@ -106,7 +109,7 @@ fn analyze_dump(result_path: &Path, config: &Config, corpus_path: &Path) -> anyh
   let checkpoint = std::path::PathBuf::from(format!("{}.partial", corpus_path.display()));
   // 중간 저장은 병렬 분석을 끝까지 마쳤을 때만 지움 (앞쪽 N개만 보는 빠른 확인이 전체 분석의 진행을 지우지 않도록)
   let mut parallel = false;
-  let (fast, counts) = if let Some(dump_path) = config.dump_path(result_path) {
+  let (dump_stats, counts) = if let Some(dump_path) = config.dump_path(result_path) {
     if !dump_path.exists() {
       if urls.is_empty() { anyhow::bail!("dump file {} not found and wikipedia_dump_url is empty", dump_path.display()); }
       if let Some(dir) = dump_path.parent() { fs::create_dir_all(dir)?; }
@@ -134,9 +137,14 @@ fn analyze_dump(result_path: &Path, config: &Config, corpus_path: &Path) -> anyh
   };
   println!("[Wikipedia Dump] used {} articles; skipped {} redirects, {} list/disambiguation pages, {} outside sample",
     counts.articles, counts.redirects, counts.lists, counts.sampled_out);
+  let wiki::DumpStats { letters: fast, punct } = dump_stats;
   fast.print_space_cases();
   let stats = fast.into_stats();
   stats.save(corpus_path.to_str().context("Invalid corpus path")?, dump::PARSER_VERSION)?;
+  // 같은 본문에서 센 영어 문장부호 코퍼스 (심볼 레이어용)
+  let english_path = result_path.join(&config.symbols.english_corpus_file);
+  punct.into_stats().save_with(english_path.to_str().context("Invalid corpus path")?, keycorpus::ENGLISH_MAGIC, keycorpus::ENGLISH_VERSION)?;
+  println!("[English Punctuation] saved {} (symbol layer corpus from the same articles)", english_path.display());
   if parallel && checkpoint.exists() { fs::remove_file(&checkpoint)?; }
   Ok(stats)
 }
@@ -163,9 +171,16 @@ fn load_corpus(corpus_path: &Path, min_parser: u32) -> anyhow::Result<CorpusStat
   Ok(stats)
 }
 
-// 전체 통계. 코퍼스 파일이 없거나 --reset이면 덤프를 분석해서 저장
-fn load_or_analyze(result_path: &Path, config: &Config, reset: bool, min_parser: u32) -> anyhow::Result<CorpusStats> {
+// 전체 통계. 코퍼스 파일이 없거나 --reset이면 덤프를 분석해서 저장.
+// need_english: 영어 문장부호 코퍼스도 있어야 함 (analyze 명령). 없으면 덤프를 다시 분석해서 둘 다 저장
+fn load_or_analyze(result_path: &Path, config: &Config, reset: bool, min_parser: u32, need_english: bool) -> anyhow::Result<CorpusStats> {
   let corpus_path = result_path.join(&config.corpus_file);
+  let english_path = result_path.join(&config.symbols.english_corpus_file);
+  if !reset && corpus_path.exists() && need_english && !english_path.exists() {
+    println!("[English Punctuation] {} not found: analyzing the dump again (it is counted in the same pass; {} is rebuilt with the same rules)",
+      english_path.display(), corpus_path.display());
+    return analyze_dump(result_path, config, &corpus_path);
+  }
   if !reset && corpus_path.exists() { load_corpus(&corpus_path, min_parser) } else { analyze_dump(result_path, config, &corpus_path) }
 }
 
@@ -185,7 +200,7 @@ fn print_results(results: &[layout::Layout], scoring: Option<(&corpus::CorpusArr
 }
 
 fn cmd_analyze(result_path: &Path, config: &Config, reset: bool) -> anyhow::Result<()> {
-  let stats = load_or_analyze(result_path, config, reset, 0)?;
+  let stats = load_or_analyze(result_path, config, reset, 0, true)?;
   let used = for_scoring(stats.clone(), config);
   // (글자끼리, 공백이 낀 것) 개수
   let split = |s: &CorpusStats| {
@@ -198,6 +213,138 @@ fn cmd_analyze(result_path: &Path, config: &Config, reset: bool) -> anyhow::Resu
   println!("letters: {}, bigrams: {b} letters-only + {bs} with space (scoring uses {ub} + {ubs} at {}% coverage), trigrams: {t} + {ts} (scoring uses {ut} + {uts} at {}% coverage)",
     stats.letters.keys().filter(|&&c| c != ' ').count(), config.bigram_coverage * 100.0, config.trigram_coverage * 100.0);
   stats.print();
+  let english_path = result_path.join(&config.symbols.english_corpus_file);
+  if english_path.exists() {
+    let (english, _) = CorpusStats::load_with(english_path.to_str().context("Invalid corpus path")?, keycorpus::ENGLISH_MAGIC)?;
+    println!("\n[English Punctuation] {} (symbols used by the symbol layer: {})", english_path.display(), config.symbols.english_punct);
+    keycorpus::print_summary(&english, Some(&config.symbols.english_punct));
+  }
+  Ok(())
+}
+
+// 러스트 코드 코퍼스: code_dirs의 .rs 파일을 읽어 저장
+fn cmd_analyze_code(result_path: &Path, config: &Config) -> anyhow::Result<CorpusStats> {
+  let s = &config.symbols;
+  println!("[Code Corpus] reading .rs files under {}", s.code_dirs.join(", "));
+  let (k, scan) = code::analyze_code(&s.code_dirs, &s.code_exclude, s.code_crate_cap)?;
+  anyhow::ensure!(scan.files > 0, "no .rs files found under {}", s.code_dirs.join(", "));
+  fs::create_dir_all(result_path)?;
+  let path = result_path.join(&s.code_corpus_file);
+  let stats = k.into_stats();
+  stats.save_with(path.to_str().context("Invalid corpus path")?, keycorpus::CODE_MAGIC, keycorpus::CODE_VERSION)?;
+  #[allow(clippy::cast_precision_loss)]
+  let mb = scan.bytes as f64 / 1e6;
+  println!("[Code Corpus] {} crates ({} left out by code_exclude), {} files, {mb:.1} MB without comments -> {}",
+    scan.crates, scan.excluded, scan.files, path.display());
+  keycorpus::print_summary(&stats, None);
+  Ok(stats)
+}
+
+// 심볼 레이어 코퍼스 (코드, 영어 문장부호)를 english_weight로 섞은 n-gram. 코드 코퍼스가 없으면 만듦
+fn symbol_ngrams(result_path: &Path, config: &Config) -> anyhow::Result<symbols::Ngrams> {
+  let s = &config.symbols;
+  let load = |file: &str, magic: &[u8], version: u32, rebuild: &str| -> anyhow::Result<CorpusStats> {
+    let path = result_path.join(file);
+    let (stats, v) = CorpusStats::load_with(path.to_str().context("Invalid corpus path")?, magic)?;
+    if v != version { println!("[Symbols] warning: {} was built with rules v{v}, current is v{version}; rebuild it with `{rebuild}`", path.display()); }
+    Ok(stats)
+  };
+  let code = if s.english_weight < 1.0 {
+    Some(if result_path.join(&s.code_corpus_file).exists() {
+      load(&s.code_corpus_file, keycorpus::CODE_MAGIC, keycorpus::CODE_VERSION, "analyze-code")?
+    } else {
+      println!("[Code Corpus] {} not found: building it", result_path.join(&s.code_corpus_file).display());
+      cmd_analyze_code(result_path, config)?
+    })
+  } else { None };
+  let english = if s.english_weight > 0.0 {
+    let path = result_path.join(&s.english_corpus_file);
+    anyhow::ensure!(path.exists(), "{} not found: run `analyze` (it counts English punctuation from the dump in the same pass), or set [symbols] english_weight = 0",
+      path.display());
+    Some(load(&s.english_corpus_file, keycorpus::ENGLISH_MAGIC, keycorpus::ENGLISH_VERSION, "analyze --reset")?)
+  } else { None };
+  let mut sources: Vec<(&CorpusStats, f64, Option<&str>)> = Vec::new();
+  if let Some(c) = &code { sources.push((c, 1.0 - s.english_weight, None)); }
+  if let Some(e) = &english { sources.push((e, s.english_weight, Some(s.english_punct.as_str()))); }
+  println!("[Symbols] n-grams: Rust code {:.0}% + English punctuation {:.0}% (by letters)", (1.0 - s.english_weight) * 100.0, s.english_weight * 100.0);
+  Ok(symbols::Ngrams::mix(&sources, config.bigram_coverage, config.trigram_coverage))
+}
+
+// 저장된 결과를 results 명령과 같은 순서로 (코퍼스가 있으면 지금 설정으로 다시 채점해서 정렬)
+fn sorted_results(result_path: &Path, config: &Config) -> anyhow::Result<Vec<layout::Layout>> {
+  let result_file = result_path.join(config.result_file_for_mode());
+  anyhow::ensure!(result_file.exists(), "no results at {}: run optimize first, or pass a layout file", result_file.display());
+  let mut results = load_results(result_file.to_str().context("Invalid result file path")?)?;
+  let corpus_path = result_path.join(&config.corpus_file);
+  if corpus_path.exists() {
+    let arrays = for_scoring(load_corpus(&corpus_path, scoring_parser(config))?, config).to_arrays(config.space_on_grid());
+    results.retain(|l| l.key_count() == arrays.keys.len());
+    let precomp = Precomp::new(&arrays.freq, &config.weights, &config.costs, &config.effort, config.hand_hard_limit());
+    let n = init_score_norm(&arrays, &precomp, &config.costs, score::HandRule::from_config(config));
+    for l in &mut results { l.calc_scores(&arrays, &precomp); l.calc_total_score(&n); }
+    layout::sort_layouts(&mut results);
+  }
+  Ok(results)
+}
+
+// 심볼 레이어 최적화: 저장된 결과 N번(기본 1) 또는 배열 파일을 베이스로. --flip이면 베이스를 좌우로 뒤집어서
+fn cmd_symbols(result_path: &Path, config: &Config, args: &[String]) -> anyhow::Result<()> {
+  let flip = args.iter().any(|a| a == "--flip");
+  let target = args.iter().find(|a| !a.starts_with("--")).map_or("1", String::as_str);
+  let grid = config.space_on_grid();
+  let (mut base, label, what) = if let Ok(n) = target.parse::<usize>() {
+    let results = sorted_results(result_path, config)?;
+    anyhow::ensure!((1..=results.len()).contains(&n), "there are {} saved results; pick 1..={}", results.len(), results.len());
+    (results[n - 1], n.to_string(), format!("saved result #{n}"))
+  } else {
+    let l = layout::Layout::parse(&fs::read_to_string(target).with_context(|| format!("reading {target}"))?, grid)
+      .with_context(|| format!("parsing {target}"))?;
+    let stem = Path::new(target).file_stem().map_or_else(|| "layout".to_string(), |s| s.to_string_lossy().into_owned());
+    (l, stem, target.to_string())
+  };
+  anyhow::ensure!(base.key_count() == 26 + usize::from(grid), "the base layout must hold a-z{}", if grid { " and the space key" } else { "" });
+  if flip { base = base.mirrored(); }
+  println!("[Symbols] base: {what}{}", if flip { ", mirrored" } else { "" });
+  let g = symbol_ngrams(result_path, config)?;
+  let t = symbols::Tables::new(config);
+  let problem = symbols::Problem::new(&t, &g, &base, grid, &config.symbols)?;
+  let out = result_path.join(format!("symbols{}-{label}{}.txt", if grid { "-grid" } else { "" }, if flip { "-flip" } else { "" }));
+  // 같은 베이스로 저장해 둔 결과가 있으면 첫 시작점으로 (이전보다 나빠지지 않게)
+  let seed = fs::read_to_string(&out).ok().and_then(|text| symbols::parse_text(&text, grid).ok())
+    .filter(|(b, _)| b.slots == base.slots)
+    .and_then(|(_, placed)| problem.state_of(&placed).ok())
+    .filter(|st| problem.broken_pairs(st).is_empty());
+  if seed.is_some() { println!("[Symbols] also starting from {}", out.display()); }
+  let (_, st, hits, starts) = problem.search(&config.sa, config.symbols.steps, seed);
+  println!("[Symbols] best found {hits} times in {starts} starts");
+  let text = problem.to_text(&base, &st);
+  print!("{text}");
+  problem.print_report(&st);
+  let tmp = out.with_extension("txt.tmp");
+  fs::write(&tmp, &text)?;
+  fs::rename(&tmp, &out)?;
+  println!("[Symbols] saved {} (edit it and check with `symbols-score`)", out.display());
+  Ok(())
+}
+
+// 기호 배치 파일을 같은 기준으로 채점
+fn cmd_symbols_score(result_path: &Path, config: &Config, files: &[String]) -> anyhow::Result<()> {
+  anyhow::ensure!(!files.is_empty(), "usage: <result_path> symbols-score <symbols_file>...");
+  let grid = config.space_on_grid();
+  let g = symbol_ngrams(result_path, config)?;
+  let t = symbols::Tables::new(config);
+  for f in files {
+    let (base, placed) = symbols::parse_text(&fs::read_to_string(f).with_context(|| format!("reading {f}"))?, grid)
+      .with_context(|| format!("parsing {f}"))?;
+    let problem = symbols::Problem::new(&t, &g, &base, grid, &config.symbols)?;
+    let st = problem.state_of(&placed)?;
+    println!("[{f}]");
+    print!("{}", problem.to_text(&base, &st));
+    let broken = problem.broken_pairs(&st);
+    if !broken.is_empty() { println!("note: pairs not placed by the pair rules: {}", broken.join(" ")); }
+    problem.print_report(&st);
+    println!();
+  }
   Ok(())
 }
 
@@ -340,9 +487,11 @@ fn run_optimize(result_path: &Path, config: &Config, stats: &corpus::CorpusStats
 }
 
 fn cmd_run(result_path: &Path, config: &Config, reset: bool) -> anyhow::Result<()> {
-  let stats = for_scoring(load_or_analyze(result_path, config, reset, scoring_parser(config))?, config);
+  let stats = for_scoring(load_or_analyze(result_path, config, reset, scoring_parser(config), false)?, config);
   run_optimize(result_path, config, &stats, reset)
 }
+
+const USAGE: &str = "[analyze|optimize|run|results|score <layout_file>...|sensitivity [layout_file]...|analyze-code|symbols [N|layout_file] [--flip]|symbols-score <symbols_file>...] [--reset]";
 
 fn main() -> anyhow::Result<()> {
   ctrlc::set_handler(move || {
@@ -356,12 +505,12 @@ fn main() -> anyhow::Result<()> {
 
   let args: Vec<String> = std::env::args().collect();
   if args.len() < 2 {
-    eprintln!("Usage: {} <result_path> [analyze|optimize|run|results|score <layout_file>...|sensitivity [layout_file]...] [--reset]", args[0]);
+    eprintln!("Usage: {} <result_path> {USAGE}", args[0]);
     std::process::exit(1);
   }
   let result_path = Path::new(&args[1]);
   let cmd = args.get(2).map(std::string::String::as_str);
-  let reset = args.iter().any(|a| a == "--reset") && !matches!(cmd, Some("results" | "score" | "sensitivity"));
+  let reset = args.iter().any(|a| a == "--reset") && !matches!(cmd, Some("results" | "score" | "sensitivity" | "analyze-code" | "symbols" | "symbols-score"));
   let config = load_config(Path::new("config.toml"))?;
   // 최적화의 모든 난수(시작 배열, 담금질, 교차)가 이 시드에서 나옴
   let seed = config.seed.unwrap_or_else(|| fastrand::u64(..));
@@ -378,8 +527,11 @@ fn main() -> anyhow::Result<()> {
     Some("results")  => cmd_results(result_path, &config),
     Some("score")    => cmd_score(result_path, &config, &args[3..].iter().filter(|a| *a != "--reset").cloned().collect::<Vec<_>>()),
     Some("sensitivity") => cmd_sensitivity(result_path, &config, &args[3..].iter().filter(|a| *a != "--reset").cloned().collect::<Vec<_>>()),
+    Some("analyze-code") => cmd_analyze_code(result_path, &config).map(|_| ()),
+    Some("symbols") => cmd_symbols(result_path, &config, &args[3..]),
+    Some("symbols-score") => cmd_symbols_score(result_path, &config, &args[3..]),
     _ => {
-      eprintln!("Usage: {} <result_path> [analyze|optimize|run|results|score <layout_file>...|sensitivity [layout_file]...] [--reset]", args[0]);
+      eprintln!("Usage: {} <result_path> {USAGE}", args[0]);
       std::process::exit(1);
     }
   }

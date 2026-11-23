@@ -212,6 +212,81 @@ pub struct Config {
   pub effort: EffortGrid,
   pub sa: SaParams,
   // 예전 설정의 [ga](유전 알고리즘)는 더 이상 쓰지 않으며 남아 있어도 무시됨
+  // 심볼 레이어 최적화 (symbols 명령)와 그 코퍼스. 없으면 기본값
+  #[serde(default)]
+  pub symbols: SymbolsConfig,
+}
+
+// 심볼 레이어: 기호 32개를 원샷 심볼 레이어 30칸과 베이스 배열의 빈칸에 배치
+#[derive(Deserialize, Clone, Debug)]
+#[serde(default)]
+pub struct SymbolsConfig {
+  // 영어 문장부호 코퍼스 (analyze가 위키 덤프를 분석할 때 같은 본문에서 함께 만듦, result_path 기준)
+  pub english_corpus_file: String,
+  // 러스트 코드 코퍼스 (analyze-code가 code_dirs에서 만듦, result_path 기준)
+  pub code_corpus_file: String,
+  // 코드 코퍼스로 읽을 폴더들 (아래의 .rs 파일 전부, ~는 홈 폴더)
+  pub code_dirs: Vec<String>,
+  // 뺄 크레이트 이름: "abc"는 정확히, "abc*"는 앞부분, "*abc"는 끝부분이 같으면 뺌 (자동 생성된 바인딩 등)
+  pub code_exclude: Vec<String>,
+  // 크레이트 하나에서 읽을 코드 양의 상한 (주석을 뺀 바이트). 큰 크레이트 몇 개가 통계를 독차지하지 않게 함
+  pub code_crate_cap: usize,
+  // 섞는 비율: 글자 수 기준으로 영어 문장부호 코퍼스가 차지하는 몫 (0 = 코드만, 1 = 영어만)
+  pub english_weight: f64,
+  // 영어 코퍼스에서 쓰는 기호. 나머지 기호가 낀 n-gram은 버림 (위키 본문에 남은 마크업 찌꺼기를 빼는 효과도 있음)
+  pub english_punct: String,
+  // 원샷 레이어 키를 한 번 누르는 비용 (검지 홈 행 키 한 번 = 1). 심볼 레이어 기호를 누를 때마다 더함
+  pub layer_tap: f32,
+  // 베이스 빈칸에 둔 기호의 추가 노력값 (같은 자리 노력값에 더함). layer_tap보다 크면 심볼 레이어가 모자랄 때만 씀
+  pub base_slot_extra: f32,
+  // 순서 있는 짝: 첫 글자가 왼쪽. 같은 손 같은 줄에 나란히, 또는 좌우 대칭 (같은 손가락·같은 줄, 첫 글자가 왼손)
+  pub pairs: Vec<String>,
+  // 순서 없는 짝: 나란히, 좌우 대칭, 같은 열 위아래 중 하나 (어느 쪽이 먼저든)
+  pub loose_pairs: Vec<String>,
+  // 담금질 한 번의 이동 횟수 (여러 번 시작하는 규칙은 [sa]의 starts_per_batch, stop_after_hits, max_starts)
+  pub steps: usize,
+}
+
+impl Default for SymbolsConfig {
+  fn default() -> Self {
+    Self {
+      english_corpus_file: "english-punct.bin".into(),
+      code_corpus_file: "code.bin".into(),
+      code_dirs: vec!["~/.cargo/registry/src".into()],
+      code_exclude: ["windows*", "winapi*", "linux-raw-sys", "libc", "web-sys", "js-sys", "wasm-bindgen*", "icu_*", "unicode-*",
+        "encoding_rs", "r-efi", "wasi", "wasip2", "*-sys"].iter().map(|s| (*s).to_string()).collect(),
+      code_crate_cap: 250_000,
+      english_weight: 0.5,
+      english_punct: ".,'\"?!-():;".into(),
+      layer_tap: 1.0,
+      base_slot_extra: 3.0,
+      pairs: ["()", "[]", "{}", "<>"].iter().map(|s| (*s).to_string()).collect(),
+      loose_pairs: vec!["'\"".into()],
+      steps: 100_000,
+    }
+  }
+}
+
+impl SymbolsConfig {
+  pub fn validate(&self) -> anyhow::Result<()> {
+    let sym = |c: char| c.is_ascii_punctuation();
+    if !(0.0..=1.0).contains(&self.english_weight) { anyhow::bail!("symbols.english_weight must be in [0.0, 1.0]"); }
+    if let Some(c) = self.english_punct.chars().find(|&c| !sym(c)) {
+      anyhow::bail!("symbols.english_punct may only hold ASCII symbols, found {c:?}");
+    }
+    if !(self.layer_tap >= 0.0 && self.base_slot_extra >= 0.0) { anyhow::bail!("symbols.layer_tap and base_slot_extra must be non-negative"); }
+    if self.steps == 0 || self.code_crate_cap == 0 { anyhow::bail!("symbols.steps and code_crate_cap must be > 0"); }
+    let mut seen = String::new();
+    for p in self.pairs.iter().chain(&self.loose_pairs) {
+      let cs: Vec<char> = p.chars().collect();
+      if cs.len() != 2 || cs[0] == cs[1] || !cs.iter().all(|&c| sym(c)) {
+        anyhow::bail!("symbols pairs must be two different ASCII symbols, found {p:?}");
+      }
+      if let Some(c) = cs.iter().find(|c| seen.contains(**c)) { anyhow::bail!("symbol {c:?} is in more than one pair"); }
+      seen.extend(cs);
+    }
+    Ok(())
+  }
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -327,7 +402,7 @@ impl Config {
     if !(sa.cooling > 0.0 && sa.cooling <= 1.0) { anyhow::bail!("sa.cooling must be in (0.0, 1.0]"); }
     if sa.starts_per_batch == 0 || sa.stop_after_hits == 0 { anyhow::bail!("sa.starts_per_batch and sa.stop_after_hits must be > 0"); }
     if sa.max_starts < sa.starts_per_batch { anyhow::bail!("sa.max_starts must be >= sa.starts_per_batch"); }
-    Ok(())
+    self.symbols.validate()
   }
 }
 
@@ -479,6 +554,28 @@ mod tests {
       t
     }).try_into();
     assert!(bad.is_err());
+  }
+
+  #[test]
+  fn symbols_section_defaults_and_validation() {
+    let url = "wikipedia_dump_url = \"https://m.org/a.xml.bz2\"\n";
+    // [symbols]가 없으면 기본값, 일부만 적으면 나머지는 기본값
+    let mut t: toml::Table = toml::from_str(&std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/config.toml")).unwrap()).unwrap();
+    t.remove("symbols");
+    t.extend(toml::from_str::<toml::Table>(url).unwrap());
+    let c: Config = toml::Value::Table(t).try_into().unwrap();
+    c.validate().unwrap();
+    assert_eq!((c.symbols.pairs.len(), c.symbols.loose_pairs[0].as_str(), c.symbols.english_weight), (4, "'\"", 0.5));
+    let c = config(&format!("{url}[symbols]\nenglish_weight = 0.2\n"));
+    c.validate().unwrap();
+    assert_eq!((c.symbols.english_weight, c.symbols.layer_tap, c.symbols.base_slot_extra), (0.2, 1.0, 3.0));
+    // config.toml의 값은 기본값과 같음
+    let file = config(url);
+    assert_eq!(format!("{:?}", file.symbols), format!("{:?}", SymbolsConfig::default()));
+    for bad in [r#"english_weight = 1.5"#, r#"english_punct = "a""#, r#"pairs = ["(("]"#, r#"pairs = ["()"]
+loose_pairs = ["(\""]"#, "steps = 0", "layer_tap = -1.0", r#"pairs = ["(1"]"#] {
+      assert!(config(&format!("{url}[symbols]\n{bad}\n")).validate().is_err(), "{bad}");
+    }
   }
 
   #[test]
