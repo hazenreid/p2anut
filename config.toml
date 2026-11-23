@@ -124,7 +124,7 @@ max_starts = 2000
 code_corpus_file = "code.bin"
 # 코드 코퍼스로 쓸 크레이트: crates.io에서 각각 최신 안정 버전만 받아 <result_path>/crates/에 풂 (의존성은 받지 않음).
 # 크레이트마다 본체 코드(tests·benches·examples·build.rs 제외)를 모두 읽고, 크레이트끼리 같은 무게로 더함.
-# 바꾸면 analyze-code를 다시. 고른 규칙 (2026-11):
+# 바꾸면 symbols가 코드 코퍼스를 다시 만듦. 고른 규칙 (2026-11):
 #   GitHub 스타 순으로 러스트 저장소를 보면서 만든 지 3년 이상, 주인(조직)당 하나, 목록·책·강의 저장소는 뺌.
 #   crates.io에 올라온 본체 크레이트(저장소 이름이 든 크레이트, api·plugin·protocol·types·shared 같은 부속은 뺌)를
 #   실행 파일이 있으면 프로그램, 없으면 라이브러리로 각각 20개까지. 본체 코드가 50KB(주석 제외) 미만이면

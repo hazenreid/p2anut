@@ -205,33 +205,48 @@ fn cmd_analyze_code(result_path: &Path, config: &Config) -> anyhow::Result<Corpu
   let s = &config.symbols;
   let dir = result_path.join("crates");
   println!("[Code Corpus] {} crates from crates.io (latest stable versions, without dependencies) -> {}", s.code_crates.len(), dir.display());
-  let crates = code::fetch_crates(&s.code_crates, &dir)?;
-  let (k, scan) = code::analyze_crates(&crates)?;
+  let fetched = code::fetch_crates(&s.code_crates, &dir)?;
+  anyhow::ensure!(!fetched.crates.is_empty(), "none of the code_crates could be downloaded");
+  let (k, scan) = code::analyze_crates(&fetched.crates)?;
   anyhow::ensure!(scan.files > 0, "no .rs files found in the code_crates");
   let path = result_path.join(&s.code_corpus_file);
   let stats = k.into_stats();
   stats.save_with(path.to_str().context("Invalid corpus path")?, keycorpus::CODE_MAGIC, keycorpus::CODE_VERSION)?;
+  let skipped: Vec<String> = fetched.skipped.iter().map(|(n, _)| n.clone()).collect();
+  code::BuildInfo {
+    version: keycorpus::CODE_VERSION, requested: s.code_crates.clone(),
+    used: fetched.crates.iter().map(|(l, _)| l.clone()).collect(), skipped: skipped.clone(),
+  }.save(&path)?;
   let total: u64 = scan.crates.iter().map(|c| c.1).sum();
   #[allow(clippy::cast_precision_loss)]
   let kb = |b: u64| b as f64 / 1e3;
   println!("[Code Corpus] {} files, {:.0} KB without comments, each crate weighted equally -> {}", scan.files, kb(total), path.display());
   println!("  {}", scan.crates.iter().map(|(c, b)| format!("{c} {:.0}KB", kb(*b))).collect::<Vec<_>>().join("  "));
   keycorpus::print_summary(&stats);
+  if !skipped.is_empty() {
+    println!("[Code Corpus] warning: {} of {} crates were skipped ({}); run analyze-code again to retry", skipped.len(), s.code_crates.len(), skipped.join(", "));
+  }
   Ok(stats)
 }
 
-// 심볼 레이어에 쓰는 코드 코퍼스의 n-gram. 코드 코퍼스가 없으면 만듦
+// 심볼 레이어에 쓰는 코드 코퍼스의 n-gram. 코드 코퍼스가 없거나, code_crates·세는 규칙이 만들 때와 다르면 다시 만듦
 fn symbol_ngrams(result_path: &Path, config: &Config) -> anyhow::Result<symbols::Ngrams> {
   let path = result_path.join(&config.symbols.code_corpus_file);
-  let code = if path.exists() {
-    let (stats, v) = CorpusStats::load_with(path.to_str().context("Invalid corpus path")?, keycorpus::CODE_MAGIC)?;
-    if v != keycorpus::CODE_VERSION {
-      println!("[Symbols] warning: {} was built with rules v{v}, current is v{}; rebuild it with `analyze-code`", path.display(), keycorpus::CODE_VERSION);
+  let info = code::BuildInfo::load(&path);
+  let stale = if path.exists() { code::BuildInfo::stale_reason(info.as_ref(), &config.symbols.code_crates) } else { Some("it does not exist") };
+  let code = match stale {
+    None => {
+      let (stats, v) = CorpusStats::load_with(path.to_str().context("Invalid corpus path")?, keycorpus::CODE_MAGIC)?;
+      anyhow::ensure!(v == keycorpus::CODE_VERSION, "{} has rules v{v} but its crate list says v{}; run analyze-code", path.display(), keycorpus::CODE_VERSION);
+      if let Some(i) = info.as_ref().filter(|i| !i.skipped.is_empty()) {
+        println!("[Code Corpus] note: {} was built without {} (could not be downloaded); run analyze-code to retry", path.display(), i.skipped.join(", "));
+      }
+      stats
     }
-    stats
-  } else {
-    println!("[Code Corpus] {} not found: building it", path.display());
-    cmd_analyze_code(result_path, config)?
+    Some(reason) => {
+      println!("[Code Corpus] building {}: {reason}", path.display());
+      cmd_analyze_code(result_path, config)?
+    }
   };
   Ok(symbols::Ngrams::new(&code, config.bigram_coverage, config.trigram_coverage))
 }
