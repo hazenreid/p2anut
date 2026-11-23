@@ -8,8 +8,8 @@
 // 원샷 레이어: 심볼 레이어 기호는 누를 때마다 엄지로 레이어 키를 먼저 한 번 누름(탭). 엄지가 끼는 두 손가락 누름은
 // 사이에 다른 손가락이 끼는 경우와 같게 봄: 같은 손가락이면 스킵그램(sfs), 인접 손가락 두 줄 차이면 스킵 시저스만
 // 셈 (롤·SFB·시저스 없음). 기호 다음 키는 탭 없이 바로 이어지므로 보통 바이그램·트라이그램. 기호 앞에 탭이 끼면
-// 그 기호가 낀 트라이그램은 롤·리다이렉트로 치지 않음. 탭 한 번은 layer_tap 비용.
-// 베이스 빈칸의 기호는 탭이 없는 대신 노력값에 base_slot_extra를 더함 (layer_tap보다 크면 심볼 레이어가 모자랄 때만 씀).
+// 그 기호가 낀 트라이그램은 롤·리다이렉트로 치지 않음. 탭 한 번의 비용은 노력값 표에서 가장 작은 값 (× [costs] effort).
+// 베이스 빈칸의 기호는 탭이 없는 대신 노력값에 base_slot_extra를 더함 (탭 비용보다 크면 심볼 레이어가 모자랄 때만 씀).
 //
 // 짝: pairs(순서 있음)는 첫 글자가 왼쪽인 같은 줄 나란히, 또는 좌우 대칭(같은 손가락·같은 줄, 첫 글자가 왼손).
 // loose_pairs(순서 없음)는 나란히·좌우 대칭·같은 열 위아래 중 하나. 짝은 심볼 레이어 안에서만.
@@ -242,7 +242,7 @@ impl<'a> Problem<'a> {
     let mut pair_of = vec![None; slots.len()];
     for (i, p) in pairs.iter().enumerate() { pair_of[p.a] = Some(i); pair_of[p.b] = Some(i); }
     let singles = (0..slots.len()).filter(|&i| pair_of[i].is_none()).collect();
-    Ok(Problem { t, g, key_pos, slots, pairs, pair_of, singles, tap_cost: f64::from(cfg.layer_tap), base_extra: f64::from(cfg.base_slot_extra) })
+    Ok(Problem { t, g, key_pos, slots, pairs, pair_of, singles, tap_cost: t.eff.iter().copied().fold(f64::INFINITY, f64::min), base_extra: f64::from(cfg.base_slot_extra) })
   }
 
   fn work(&self) -> Work {
@@ -679,6 +679,12 @@ mod tests {
     let g = ngrams();
     let base = Layout::parse(BASE).unwrap();
     let p = Problem::new(&t, &g, &base, &c.symbols).unwrap();
+    // 탭 비용은 노력값 표에서 가장 작은 값 (기본 설정은 중지·검지 홈 1.0)
+    assert_eq!(p.tap_cost, 1.0);
+    let mut c2 = config();
+    c2.effort.home[3] = 0.8;
+    let t2 = Tables::new(&c2);
+    assert!((Problem::new(&t2, &g, &base, &c2.symbols).unwrap().tap_cost - 0.8).abs() < 1e-6);
     // 베이스 빈칸 3칸 + 심볼 레이어 30칸
     assert_eq!(p.slots.iter().filter(|s| !s.tap).map(|s| s.pos).collect::<Vec<_>>(), vec![4, 14, 24]);
     let mut st = p.random_state(&mut fastrand::Rng::with_seed(1));

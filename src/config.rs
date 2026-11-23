@@ -224,9 +224,8 @@ pub struct SymbolsConfig {
   pub code_crates: Vec<String>,
   // 크레이트 하나에서 읽을 코드 양의 상한 (주석을 뺀 바이트). 큰 크레이트 몇 개가 통계를 독차지하지 않게 함
   pub code_crate_cap: usize,
-  // 원샷 레이어 키를 한 번 누르는 비용 (검지 홈 행 키 한 번 = 1). 심볼 레이어 기호를 누를 때마다 더함
-  pub layer_tap: f32,
-  // 베이스 빈칸에 둔 기호의 추가 노력값 (같은 자리 노력값에 더함). layer_tap보다 크면 심볼 레이어가 모자랄 때만 씀
+  // 베이스 빈칸에 둔 기호의 추가 노력값 (같은 자리 노력값에 더함). 원샷 탭 비용(노력값 표의 가장 작은 값)보다 크면
+  // 심볼 레이어가 모자랄 때만 씀
   pub base_slot_extra: f32,
   // 순서 있는 짝: 첫 글자가 왼쪽. 같은 손 같은 줄에 나란히, 또는 좌우 대칭 (같은 손가락·같은 줄, 첫 글자가 왼손)
   pub pairs: Vec<String>,
@@ -244,7 +243,6 @@ impl Default for SymbolsConfig {
         "crossbeam-channel", "syn", "tracing", "axum", "reqwest", "toml", "chrono", "ignore", "nom", "bevy_ecs", "ratatui"]
         .iter().map(|s| (*s).to_string()).collect(),
       code_crate_cap: 250_000,
-      layer_tap: 1.0,
       base_slot_extra: 3.0,
       pairs: ["()", "[]", "{}", "<>"].iter().map(|s| (*s).to_string()).collect(),
       loose_pairs: vec!["'\"".into()],
@@ -260,7 +258,7 @@ impl SymbolsConfig {
     if let Some(n) = self.code_crates.iter().find(|n| n.is_empty() || !n.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')) {
       anyhow::bail!("symbols.code_crates holds an invalid crate name {n:?}");
     }
-    if !(self.layer_tap >= 0.0 && self.base_slot_extra >= 0.0) { anyhow::bail!("symbols.layer_tap and base_slot_extra must be non-negative"); }
+    if self.base_slot_extra < 0.0 { anyhow::bail!("symbols.base_slot_extra must be non-negative"); }
     if self.steps == 0 || self.code_crate_cap == 0 { anyhow::bail!("symbols.steps and code_crate_cap must be > 0"); }
     let mut seen = String::new();
     for p in self.pairs.iter().chain(&self.loose_pairs) {
@@ -514,12 +512,12 @@ mod tests {
     assert_eq!((c.symbols.pairs.len(), c.symbols.loose_pairs[0].as_str(), c.symbols.code_crates[0].as_str()), (4, "'\"", "serde"));
     let c = config(&format!("{url}[symbols]\ncode_crates = [\"syn\"]\n"));
     c.validate().unwrap();
-    assert_eq!((c.symbols.code_crates.len(), c.symbols.layer_tap, c.symbols.base_slot_extra), (1, 1.0, 3.0));
+    assert_eq!((c.symbols.code_crates.len(), c.symbols.base_slot_extra, c.symbols.steps), (1, 3.0, 100_000));
     // config.toml의 값은 기본값과 같음
     let file = config(url);
     assert_eq!(format!("{:?}", file.symbols), format!("{:?}", SymbolsConfig::default()));
     for bad in ["code_crates = []", r#"code_crates = ["a/b"]"#, r#"pairs = ["(("]"#, r#"pairs = ["()"]
-loose_pairs = ["(\""]"#, "steps = 0", "layer_tap = -1.0", r#"pairs = ["(1"]"#] {
+loose_pairs = ["(\""]"#, "steps = 0", "base_slot_extra = -1.0", r#"pairs = ["(1"]"#] {
       assert!(config(&format!("{url}[symbols]\n{bad}\n")).validate().is_err(), "{bad}");
     }
   }
