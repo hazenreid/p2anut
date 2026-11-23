@@ -14,7 +14,8 @@ pub const KEYS: usize = FIRST_SYM as usize + NSYM;
 
 // 코드 코퍼스 파일의 머리표와 세는 규칙의 버전 (규칙을 바꾸면 올림)
 pub const CODE_MAGIC: &[u8] = b"P2ANUT-CODE\0";
-pub const CODE_VERSION: u32 = 1;
+// 2: 크레이트마다 본체 코드를 모두 읽고 같은 무게로 더함
+pub const CODE_VERSION: u32 = 2;
 
 // 기호의 번호 (0..32)
 pub fn sym_index(ch: char) -> Option<usize> { SYMBOLS.find(ch).filter(|_| ch.is_ascii()) }

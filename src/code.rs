@@ -2,9 +2,10 @@
 // 주석 내용을 빼고 키 연속을 셈.
 // - 받은 크레이트는 <result_path>/crates/<이름>-<버전>/에 풀어 두고, 같은 버전이 있으면 다시 받지 않음.
 //   인터넷이 안 되면 받아 둔 가장 새 버전을 씀
-// - 크레이트마다 code_crate_cap 바이트(주석을 뺀 코드)까지만 읽음: src/ 아래 파일을 먼저, 그다음 나머지(tests, examples 등)를
-//   경로 순서로. 큰 크레이트 몇 개가 통계를 독차지하지 않게
-// - 200KB가 넘는 파일(생성된 표 등)과 숨김·target 폴더는 뺌
+// - 패키지 본체 코드를 모두 읽음: tests·benches·examples·fuzz 폴더와 build.rs, 200KB가 넘는 파일(생성된 표 등),
+//   숨김·target 폴더는 뺌 (src 안의 단위 테스트는 들어감)
+// - 크레이트마다 같은 무게: 크레이트별로 센 뒤 글자 수가 같아지게 늘리거나 줄여서 더함. 큰 크레이트 몇 개가
+//   통계를 독차지하지 않고, 크레이트의 일부만 잘라 읽지도 않음
 // - 주석은 내용을 빼고 표시(//, ///, //!)만 주석 블록당 한 번 남김 (이어지는 줄은 에디터가 이어 쓰는 경우가 많고,
 //   내용은 영어·한국어 문장이라 코드의 기호 통계를 흐림). 문자열은 그대로 (형식 문자열 "{}" 등도 실제로 침)
 #![allow(clippy::cast_precision_loss)]
@@ -15,6 +16,8 @@ use rayon::prelude::*;
 use crate::keycorpus::{self, KeyCorpus};
 
 const MAX_FILE_BYTES: u64 = 200_000;
+// 크레이트 하나를 맞출 글자 수 (반올림 오차가 무시될 만큼 크게)
+const CRATE_LETTERS: f64 = 1e9;
 const INDEX_URL: &str = "https://index.crates.io";
 const DOWNLOAD_URL: &str = "https://static.crates.io/crates";
 
@@ -189,21 +192,35 @@ pub fn fetch_crates(names: &[String], dir: &Path) -> anyhow::Result<Vec<(String,
   Ok(out)
 }
 
-// 폴더 아래 .rs 파일 (숨김·target 폴더 제외, 200KB 이하)을 경로 순서로
-fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+// 크레이트 폴더 아래 본체 코드 .rs 파일을 경로 순서로 (숨김·target 폴더, 패키지 맨 위의 tests·benches·examples·fuzz
+// 폴더와 build.rs, 200KB가 넘는 파일은 뺌). top: 크레이트 폴더 바로 아래인지
+fn rs_files(dir: &Path, top: bool, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
   let mut entries: Vec<_> = std::fs::read_dir(dir)?.filter_map(Result::ok).collect();
   entries.sort_by_key(std::fs::DirEntry::file_name);
   for e in entries {
     let name = e.file_name().to_string_lossy().into_owned();
     let Ok(ft) = e.file_type() else { continue };
     if ft.is_dir() {
-      if name.starts_with('.') || name == "target" { continue; }
-      rs_files(&e.path(), out)?;
-    } else if ft.is_file() && name.ends_with(".rs") && e.metadata().is_ok_and(|m| m.len() <= MAX_FILE_BYTES) {
+      if name.starts_with('.') || name == "target" || (top && matches!(name.as_str(), "tests" | "benches" | "examples" | "fuzz")) { continue; }
+      rs_files(&e.path(), false, out)?;
+    } else if ft.is_file() && name.ends_with(".rs") && !(top && name == "build.rs") && e.metadata().is_ok_and(|m| m.len() <= MAX_FILE_BYTES) {
       out.push(e.path());
     }
   }
   Ok(())
+}
+
+// 글자(a-z) 수가 CRATE_LETTERS가 되게 모든 수를 같은 비율로 늘리거나 줄임
+fn equal_weight(k: &KeyCorpus) -> KeyCorpus {
+  let letters: u64 = k.unigrams[..26].iter().sum();
+  let mut out = KeyCorpus::new();
+  if letters == 0 { return out; }
+  #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+  let scale = |v: &mut [u64], from: &[u64]| for (a, &b) in v.iter_mut().zip(from) { *a = (b as f64 * CRATE_LETTERS / letters as f64).round() as u64; };
+  scale(&mut out.unigrams, &k.unigrams);
+  scale(&mut out.bigrams, &k.bigrams);
+  scale(&mut out.trigrams, &k.trigrams);
+  out
 }
 
 pub struct CodeScan {
@@ -212,24 +229,21 @@ pub struct CodeScan {
   pub files: usize,
 }
 
-// 크레이트 폴더들을 셈: 크레이트마다 src/ 아래 파일을 먼저, 그다음 나머지를 경로 순서로 cap 바이트까지
-pub fn analyze_crates(crates: &[(String, PathBuf)], cap: usize) -> anyhow::Result<(KeyCorpus, CodeScan)> {
+// 크레이트 폴더들을 셈: 크레이트마다 본체 코드를 모두 세고, 크레이트끼리 같은 무게로 더함
+pub fn analyze_crates(crates: &[(String, PathBuf)]) -> anyhow::Result<(KeyCorpus, CodeScan)> {
   let per: Vec<(KeyCorpus, usize, u64)> = crates.par_iter().map(|(_, dir)| -> anyhow::Result<_> {
     let mut files = Vec::new();
-    rs_files(dir, &mut files).with_context(|| format!("reading {}", dir.display()))?;
-    let src = dir.join("src");
-    files.sort_by_key(|f| !f.starts_with(&src));
+    rs_files(dir, true, &mut files).with_context(|| format!("reading {}", dir.display()))?;
     let mut k = KeyCorpus::new();
     let (mut n, mut bytes) = (0usize, 0u64);
     for f in &files {
-      if bytes >= cap as u64 { break; }
       let Ok(code) = std::fs::read(f) else { continue };
       let text = strip_comments(&String::from_utf8_lossy(&code));
       keycorpus::count_text(text.as_bytes(), &mut k);
       n += 1;
       bytes += text.len() as u64;
     }
-    Ok((k, n, bytes))
+    Ok((equal_weight(&k), n, bytes))
   }).collect::<anyhow::Result<_>>()?;
   let mut total = KeyCorpus::new();
   let mut scan = CodeScan { crates: Vec::new(), files: 0 };
@@ -284,13 +298,14 @@ mod tests {
   }
 
   #[test]
-  fn unpack_and_analyze_read_src_first_and_cap_each_crate() {
+  fn unpack_and_analyze_weight_each_crate_equally() {
     let dir = std::env::temp_dir().join(format!("p2anut-code-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    // .crate 흉내: foo-1.0.0/ 아래 benches(경로 순서로는 src보다 앞), src, 생성된 큰 파일
+    // .crate 흉내: foo-1.0.0/ 아래 본체 코드, 벤치·시험 코드, build.rs, 생성된 큰 파일
     let mut ar = tar::Builder::new(flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast()));
     for (path, body) in [("foo-1.0.0/benches/b.rs", "bench(x);".repeat(10)), ("foo-1.0.0/src/lib.rs", "fn foo() -> u8 { a(b) } // note".to_string()),
+                         ("foo-1.0.0/tests/t.rs", "only_test();".to_string()), ("foo-1.0.0/build.rs", "only_build();".to_string()),
                          ("foo-1.0.0/src/big.rs", "x".repeat(MAX_FILE_BYTES as usize + 1))] {
       let mut h = tar::Header::new_gnu();
       h.set_size(body.len() as u64);
@@ -307,13 +322,15 @@ mod tests {
     std::fs::create_dir_all(dir.join("bar-0.10.0")).unwrap();
     assert_eq!(newest_local("bar", &dir).unwrap().0, "0.10.0");
     let crates = vec![("foo-1.0.0".to_string(), foo), ("bar-0.2.0".to_string(), dir.join("bar-0.2.0"))];
-    // 상한 10바이트: foo는 src/lib.rs 하나만 (benches보다 먼저), 큰 파일은 안 읽음
-    let (k, scan) = analyze_crates(&crates, 10).unwrap();
+    let (k, scan) = analyze_crates(&crates).unwrap();
+    // foo는 src/lib.rs만 (벤치·시험·build.rs·큰 파일은 안 읽음), bar는 src/main.rs
     assert_eq!(scan.files, 2);
     let id = |c: char| keycorpus::char_key(c).unwrap() as usize;
-    assert_eq!((k.unigrams[id('h')], k.unigrams[id('x')]), (0, 0));
-    assert_eq!(k.unigrams[id('{')], 2);
-    assert_eq!(k.bigrams[id('"') * keycorpus::KEYS + id('{')], 1);
+    assert_eq!((k.unigrams[id('h')], k.unigrams[id('x')], k.unigrams[id('y')]), (0, 0, 0));
+    // 크레이트마다 글자 수를 같게 맞춰서 더함: foo는 글자 8개에 { 하나, bar는 글자 4개에 { 하나
+    assert_eq!(k.unigrams[..26].iter().sum::<u64>(), 2 * CRATE_LETTERS as u64);
+    assert_eq!(k.unigrams[id('{')], (CRATE_LETTERS / 8.0 + CRATE_LETTERS / 4.0) as u64);
+    assert_eq!(k.bigrams[id('"') * keycorpus::KEYS + id('{')], (CRATE_LETTERS / 4.0) as u64);
     std::fs::remove_dir_all(&dir).unwrap();
   }
 }

@@ -220,10 +220,8 @@ pub struct Config {
 pub struct SymbolsConfig {
   // 러스트 코드 코퍼스 (analyze-code가 만듦, result_path 기준)
   pub code_corpus_file: String,
-  // 코드 코퍼스로 쓸 크레이트. crates.io에서 각각 최신 안정 버전만 받음 (의존성은 받지 않음)
+  // 코드 코퍼스로 쓸 크레이트. crates.io에서 각각 최신 안정 버전만 받음 (의존성은 받지 않음). 크레이트마다 같은 무게
   pub code_crates: Vec<String>,
-  // 크레이트 하나에서 읽을 코드 양의 상한 (주석을 뺀 바이트). 큰 크레이트 몇 개가 통계를 독차지하지 않게 함
-  pub code_crate_cap: usize,
   // 베이스 빈칸에 둔 기호의 추가 노력값 (같은 자리 노력값에 더함). 원샷 탭 비용(노력값 표의 가장 작은 값)보다 크면
   // 심볼 레이어가 모자랄 때만 씀
   pub base_slot_extra: f32,
@@ -239,10 +237,12 @@ impl Default for SymbolsConfig {
   fn default() -> Self {
     Self {
       code_corpus_file: "code.bin".into(),
-      code_crates: ["serde", "serde_json", "tokio", "regex", "clap_builder", "anyhow", "rayon", "itertools", "rand", "bytes", "hashbrown",
-        "crossbeam-channel", "syn", "tracing", "axum", "reqwest", "toml", "chrono", "ignore", "nom", "bevy_ecs", "ratatui"]
+      // 라이브러리 20개 + 프로그램 20개 (고른 규칙은 config.toml)
+      code_crates: ["tauri", "sway-core", "typst-layout", "bevy_ecs", "parcel-resolver", "polars-plan", "servo", "swc", "tokio", "surrealdb",
+        "yew", "jj-lib", "egui", "iced_widget", "pingora-http", "tree-sitter", "rocket", "turso", "actix-web", "oxc_ast",
+        "deno", "uv", "ripgrep", "alacritty", "bat", "starship", "yazi-scheduler", "sniffnet", "zoxide", "just",
+        "mise", "rustfs", "zellij", "git-delta", "atuin", "fnm", "difftastic", "eza", "gitui", "rustpython-codegen"]
         .iter().map(|s| (*s).to_string()).collect(),
-      code_crate_cap: 250_000,
       base_slot_extra: 3.0,
       pairs: ["()", "[]", "{}", "<>"].iter().map(|s| (*s).to_string()).collect(),
       loose_pairs: vec!["'\"".into()],
@@ -259,7 +259,7 @@ impl SymbolsConfig {
       anyhow::bail!("symbols.code_crates holds an invalid crate name {n:?}");
     }
     if self.base_slot_extra < 0.0 { anyhow::bail!("symbols.base_slot_extra must be non-negative"); }
-    if self.steps == 0 || self.code_crate_cap == 0 { anyhow::bail!("symbols.steps and code_crate_cap must be > 0"); }
+    if self.steps == 0 { anyhow::bail!("symbols.steps must be > 0"); }
     let mut seen = String::new();
     for p in self.pairs.iter().chain(&self.loose_pairs) {
       let cs: Vec<char> = p.chars().collect();
@@ -509,7 +509,7 @@ mod tests {
     t.extend(toml::from_str::<toml::Table>(url).unwrap());
     let c: Config = toml::Value::Table(t).try_into().unwrap();
     c.validate().unwrap();
-    assert_eq!((c.symbols.pairs.len(), c.symbols.loose_pairs[0].as_str(), c.symbols.code_crates[0].as_str()), (4, "'\"", "serde"));
+    assert_eq!((c.symbols.pairs.len(), c.symbols.loose_pairs[0].as_str(), c.symbols.code_crates.len(), c.symbols.code_crates[0].as_str()), (4, "'\"", 40, "tauri"));
     let c = config(&format!("{url}[symbols]\ncode_crates = [\"syn\"]\n"));
     c.validate().unwrap();
     assert_eq!((c.symbols.code_crates.len(), c.symbols.base_slot_extra, c.symbols.steps), (1, 3.0, 100_000));

@@ -206,7 +206,7 @@ fn cmd_analyze_code(result_path: &Path, config: &Config) -> anyhow::Result<Corpu
   let dir = result_path.join("crates");
   println!("[Code Corpus] {} crates from crates.io (latest stable versions, without dependencies) -> {}", s.code_crates.len(), dir.display());
   let crates = code::fetch_crates(&s.code_crates, &dir)?;
-  let (k, scan) = code::analyze_crates(&crates, s.code_crate_cap)?;
+  let (k, scan) = code::analyze_crates(&crates)?;
   anyhow::ensure!(scan.files > 0, "no .rs files found in the code_crates");
   let path = result_path.join(&s.code_corpus_file);
   let stats = k.into_stats();
@@ -214,7 +214,7 @@ fn cmd_analyze_code(result_path: &Path, config: &Config) -> anyhow::Result<Corpu
   let total: u64 = scan.crates.iter().map(|c| c.1).sum();
   #[allow(clippy::cast_precision_loss)]
   let kb = |b: u64| b as f64 / 1e3;
-  println!("[Code Corpus] {} files, {:.0} KB without comments -> {}", scan.files, kb(total), path.display());
+  println!("[Code Corpus] {} files, {:.0} KB without comments, each crate weighted equally -> {}", scan.files, kb(total), path.display());
   println!("  {}", scan.crates.iter().map(|(c, b)| format!("{c} {:.0}KB", kb(*b))).collect::<Vec<_>>().join("  "));
   keycorpus::print_summary(&stats);
   Ok(stats)
