@@ -61,17 +61,17 @@ pub struct FastCorpus {
   pub letters: Box<[u64; CHARS]>,
   pub bigrams: Box<[u64; CHARS * CHARS]>,
   pub trigrams: Box<[u64]>,
-  // 공백(연속 공백은 하나로)을 양옆에 따라 나눈 개수. 확인용이며 코퍼스 파일에는 저장하지 않음 (SPACE_CASES 순서)
+  // 공백(연속 공백은 하나로)을 양옆에 따라 나눈 개수. 확인용이며 코퍼스 파일에는 저장하지 않음 (SPACE_CASES 순서). 첫 경우만 셈
   pub space_cases: [u64; SPACE_CASES.len()],
 }
 
-// 공백 경우: 앞 2개는 n-gram도 셈(글자와 이어짐), 다음 2개는 누름 횟수만, 마지막은 세지 않음
+// 공백 경우: 첫 경우(단어 사이)만 누름과 n-gram으로 셈, 나머지는 개수만 보여 줌
 pub const SPACE_CASES: [&str; 5] = [
-  "letter _ letter",
-  "letter _ punctuation/digit (or the reverse)",
-  "punctuation/digit _ punctuation/digit",
-  "double spaces (one press, not linked)",
-  "not counted (line start/end, markup or other symbols)",
+  "letter _ letter (counted)",
+  "letter _ punctuation/digit or the reverse (not counted)",
+  "punctuation/digit _ punctuation/digit (not counted)",
+  "double spaces (not counted)",
+  "line start/end, markup or other symbols (not counted)",
 ];
 
 impl FastCorpus {

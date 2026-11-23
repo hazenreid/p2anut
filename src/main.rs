@@ -25,16 +25,15 @@ use precomp::Precomp;
 use layout::{init_score_norm, save_results, load_results, sort_unique_layouts};
 use optimizer::Optimizer;
 
-// a-z와 실제로 누르는 공백을 셈.
-// - 공백(연속 공백은 하나로)은 양옆이 글자이거나 실제 글의 문장부호·숫자일 때만 누름 1번으로 셈.
-//   줄 처음·끝, 마크업 찌꺼기 같은 그 밖의 기호 옆 공백은 세지 않음 (실제로는 누르지 않는 공백)
-// - n-gram은 배열에 있는 키끼리만 이음: 공백 하나는 옆의 글자와 이어서 셈 (`the end` → he_, e_e, _en,
-//   `. The` → _t, _th). 문장부호·숫자 자체는 n-gram에 넣지 않고 끊음
-// - 연속 공백은 대개 마크업이 지워진 자리라 누름 1번으로만 치고 양옆을 잇지 않음
+// a-z와 단어 사이 공백을 셈.
+// - 공백은 양옆이 글자인 공백 하나(단어 사이)만 셈: `the end` → he_, e_e, _en.
+//   문장부호·숫자 옆(`. The`, `end.` 뒤), 연속 공백, 줄 처음·끝, 마크업 옆 공백은 세지 않고 연속을 끊음
+// - 문장부호·숫자 자체는 n-gram에 넣지 않고 끊음
+// - 세지 않는 공백도 경우별 개수는 따로 셈 (분석 뒤 확인용 출력)
 // - 같은 글자 연속(ll)은 빅그램으로 세지 않고, 그 쌍이 낀 트라이그램도 세지 않음
 pub const SPACE_ID: u8 = 26;
 
-// 공백 옆에 와도 되는 실제 글의 문장부호와 숫자
+// 실제 글의 문장부호와 숫자 (공백 경우별 개수 출력에서 마크업 찌꺼기와 나눠 보이려고 씀)
 fn is_text_punct(b: u8) -> bool {
   b.is_ascii_digit() || matches!(b, b'.' | b',' | b';' | b':' | b'!' | b'?' | b')' | b']' | b'(' | b'[' | b'"' | b'\'')
 }
@@ -71,11 +70,8 @@ impl Counter<'_> {
       match (left, right) { (Side::Letter, Side::Letter) => 0, (Side::Letter, _) | (_, Side::Letter) => 1, _ => 2 }
     };
     self.stats.space_cases[case] += 1;
-    if !counted { self.reset(); return; }
-    if case >= 2 { self.stats.add_letter(SPACE_ID); self.reset(); return; }
-    // 공백 하나: 왼쪽이 글자면 이어 붙이고, 문장부호·숫자면(사슬이 이미 끊김) 공백부터 새로 시작
-    self.commit(SPACE_ID);
-    if right != Side::Letter { self.reset(); }
+    // 단어 사이(글자 _ 글자)만 셈. 왼쪽 글자의 사슬에 이어 붙이고, 오른쪽 글자가 이어서 붙음
+    if case == 0 { self.commit(SPACE_ID); } else { self.reset(); }
   }
 }
 
@@ -146,10 +142,10 @@ fn analyze_dump(result_path: &Path, config: &Config, corpus_path: &Path) -> anyh
 }
 
 // 채점·최적화에 쓸 수 있는 가장 오래된 파서 버전. 4부터 글자 사이 공백을 세서 엄지 방식의 공백 너머 비용을 계산할 수 있고,
-// 5부터 문장부호·숫자 옆 공백까지 세서 스페이스를 배열에 둘 때의 누름 횟수가 맞음.
+// 스페이스를 배열에 둘 때는 단어 사이 공백만 세는 6부터 (5는 문장부호 옆 공백까지 세서 누름 횟수가 다름).
 // 그 전 코퍼스로 채점하면 그 몫이 조용히 빠져 예전·지금 결과를 잘못 비교하게 됨
 const MIN_THUMB_PARSER: u32 = 4;
-const MIN_GRID_PARSER: u32 = 5;
+const MIN_GRID_PARSER: u32 = 6;
 
 fn scoring_parser(config: &Config) -> u32 { if config.space_on_grid() { MIN_GRID_PARSER } else { MIN_THUMB_PARSER } }
 
@@ -431,34 +427,28 @@ mod tests {
   }
 
   #[test]
-  fn spaces_next_to_punctuation_are_presses_linked_to_letters_only() {
-    // 글자 _ 문장부호: b_, ab_ (문장부호는 n-gram에 넣지 않음)
-    let f = run("ab ,cd");
-    assert_eq!((f.letters[26], f.space_cases), (1, [0, 1, 0, 0, 0]));
-    assert_eq!((bi_s(&f, 'b', SP), tri_s(&f, 'a', 'b', SP), bi_s(&f, SP, 'c')), (1, 1, 0));
-    // 문장부호 _ 글자: _c, _cd (". The" → _t, _th)
-    let f = run("ab, cd");
-    assert_eq!((f.letters[26], f.space_cases), (1, [0, 1, 0, 0, 0]));
-    assert_eq!((bi_s(&f, SP, 'c'), tri_s(&f, SP, 'c', 'd'), bi_s(&f, 'b', SP)), (1, 1, 0));
-    // 숫자도 문장부호처럼
-    let f = run("ab 1 cd");
-    assert_eq!((f.letters[26], f.space_cases), (2, [0, 2, 0, 0, 0]));
-    assert_eq!((bi_s(&f, 'b', SP), bi_s(&f, SP, 'c'), tri_s(&f, 'b', SP, 'c')), (1, 1, 0));
-    // 문장부호 _ 문장부호: 누름만 셈
-    let f = run("ab. (cd");
-    assert_eq!((f.letters[26], f.space_cases), (1, [0, 0, 1, 0, 0]));
-    assert!(no_space_ngrams(&f));
+  fn spaces_next_to_punctuation_are_not_counted() {
+    // 글자 _ 문장부호, 문장부호 _ 글자, 숫자 옆, 문장부호끼리: 세지 않고 끊음 (경우별 개수만)
+    for (text, cases) in [("ab ,cd", [0, 1, 0, 0, 0]), ("ab, cd", [0, 1, 0, 0, 0]), ("ab 1 cd", [0, 2, 0, 0, 0]), ("ab. (cd", [0, 0, 1, 0, 0])] {
+      let f = run(text);
+      assert_eq!((f.letters[26], f.space_cases), (0, cases), "{text:?}");
+      assert!(no_space_ngrams(&f), "{text:?}");
+      assert_eq!((bi(&f, "ab"), bi(&f, "cd")), (1, 1), "{text:?}");
+    }
+    // ". The"의 공백은 세지 않지만 뒤 단어 안의 n-gram은 그대로
+    let f = run("end. The");
+    assert_eq!((f.letters[26], tri(&f, "the"), bi(&f, "dt")), (0, 1, 0));
   }
 
   #[test]
-  fn double_spaces_are_one_press_without_linking() {
+  fn double_spaces_are_not_counted() {
+    for text in ["abc  De", "ab,   cd"] {
+      let f = run(text);
+      assert_eq!((f.letters[26], f.space_cases), (0, [0, 0, 0, 1, 0]), "{text:?}");
+      assert!(no_space_ngrams(&f), "{text:?}");
+    }
     let f = run("abc  De");
-    assert_eq!((f.letters[26], f.space_cases), (1, [0, 0, 0, 1, 0]));
-    assert!(no_space_ngrams(&f));
     assert_eq!((bi(&f, "ab"), bi(&f, "bc"), tri(&f, "abc"), bi(&f, "cd"), bi(&f, "de")), (1, 1, 1, 0, 1));
-    let f = run("ab,   cd");
-    assert_eq!((f.letters[26], f.space_cases), (1, [0, 0, 0, 1, 0]));
-    assert!(no_space_ngrams(&f));
   }
 
   #[test]
@@ -472,7 +462,7 @@ mod tests {
 
   #[test]
   fn letter_space_letter_counts_match_a_direct_scan() {
-    // 엄지 방식이 쓰는 "a _ c"는 v4와 같은 규칙: 양옆이 글자인 공백 하나
+    // "a _ c"는 v4와 같은 규칙: 양옆이 글자인 공백 하나
     let text = crate::test_util::TEXT.repeat(2) + " A few, odd  spaces; and an I here. x y z (q) 3 dogs";
     let f = run(&text);
     let b = text.as_bytes();
@@ -483,7 +473,8 @@ mod tests {
       }
     }
     for a in 0..26 { for c in 0..26 { assert_eq!(f.trigrams[(a * CHARS + 26) * CHARS + c], want[a * 26 + c]); } }
-    assert_eq!(f.letters[26], f.space_cases[..4].iter().sum::<u64>());
+    // 누름은 단어 사이 공백만
+    assert_eq!(f.letters[26], f.space_cases[0]);
   }
 
   #[test]
@@ -563,7 +554,7 @@ mod tests {
     assert!(err.contains("does not count spaces") && err.contains("analyze --reset"), "{err}");
     // 통계만 볼 때(analyze)는 읽힘
     assert_eq!(super::load_corpus(&path, 0).unwrap(), stats);
-    // 엄지 방식은 v4부터, 스페이스를 배열에 두면 v5부터
+    // 엄지 방식은 v4부터, 스페이스를 배열에 두면 v6부터
     stats.save(path.to_str().unwrap(), super::MIN_THUMB_PARSER).unwrap();
     assert_eq!(super::load_corpus(&path, super::MIN_THUMB_PARSER).unwrap(), stats);
     assert!(super::load_corpus(&path, super::MIN_GRID_PARSER).is_err());
