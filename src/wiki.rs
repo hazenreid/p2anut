@@ -49,7 +49,7 @@ fn analyze_xml(xml: impl std::io::BufRead, sample: f64, limit: usize, stats: &mu
     if SHUTDOWN.load(Ordering::SeqCst) { return Err(interrupted()); }
     let text = cleaner.clean(raw);
     crate::analyze_bytes(text, &mut stats.letters);
-    crate::keycorpus::count_text(text, &mut stats.punct);
+    crate::keycorpus::count_prose(text, &mut stats.punct);
     n += 1;
     if progress && n.is_multiple_of(10_000) {
       print!("\r[Wikipedia Dump] {n} articles          ");
@@ -349,16 +349,16 @@ mod tests {
 
   #[test]
   fn english_punctuation_comes_from_the_cleaned_text() {
-    let data = multistream(&[page("Quotes", "''Italic'' words, it's \"quoted\" (here). Ok?")], 1);
+    let data = multistream(&[page("Quotes", "''Italic'' words, it's \"quoted\" (here). Ok? The 'term' is John's.")], 1);
     let (s, c) = analyze_sequential(&data[..], 1.0, 0).unwrap();
     assert_eq!(c.articles, 1);
     let id = |ch: char| crate::keycorpus::char_key(ch).unwrap() as usize;
     let bi = |a: char, b: char| s.punct.bigrams[id(a) * crate::keycorpus::KEYS + id(b)];
-    // 기울임 마크업('')은 지워지고 축약형의 '만 남음. 문장부호 옆 공백도 셈
+    // 기울임 마크업('')은 지워지고, 축약형의 '만 셈 (따옴표 'term', 소유격 John's는 세지 않음). 문장부호 옆 공백도 셈
     assert_eq!(s.punct.unigrams[id('\'')], 1);
     assert_eq!((bi('t', '\''), bi(',', ' '), bi(')', '.'), bi('.', ' '), bi('k', '?'), bi(' ', '"')), (1, 1, 1, 1, 1, 1));
-    // 글자 코퍼스는 예전 규칙 그대로 (단어 사이 공백만: Italic_words)
-    assert_eq!(s.letters.letters[26], 1);
+    // 글자 코퍼스는 예전 규칙 그대로 (단어 사이 공백만: Italic_words, is_John)
+    assert_eq!(s.letters.letters[26], 2);
   }
 
   #[test]

@@ -662,11 +662,11 @@ mod tests {
 
   fn ngrams(english_weight: f64) -> Ngrams {
     let mut code = keycorpus::KeyCorpus::new();
-    keycorpus::count_text(crate::code::strip_comments(&CODE.repeat(3)).as_bytes(), &mut code);
+    keycorpus::count_code(crate::code::strip_comments(&CODE.repeat(3)).as_bytes(), &mut code);
     let mut eng = keycorpus::KeyCorpus::new();
-    keycorpus::count_text(PROSE.repeat(5).as_bytes(), &mut eng);
+    keycorpus::count_prose(PROSE.repeat(5).as_bytes(), &mut eng);
     let (code, eng) = (code.into_stats(), eng.into_stats());
-    Ngrams::mix(&[(&code, 1.0 - english_weight, None), (&eng, english_weight, Some(".,'\"?!-():;"))], 1.0, 1.0)
+    Ngrams::mix(&[(&code, 1.0 - english_weight, None), (&eng, english_weight, Some("'"))], 1.0, 1.0)
   }
 
   #[test]

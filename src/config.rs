@@ -233,7 +233,7 @@ pub struct SymbolsConfig {
   pub code_crate_cap: usize,
   // 섞는 비율: 글자 수 기준으로 영어 문장부호 코퍼스가 차지하는 몫 (0 = 코드만, 1 = 영어만)
   pub english_weight: f64,
-  // 영어 코퍼스에서 쓰는 기호. 나머지 기호가 낀 n-gram은 버림 (위키 본문에 남은 마크업 찌꺼기를 빼는 효과도 있음)
+  // 영어 코퍼스에서 쓰는 기호. 나머지 기호가 낀 n-gram은 버림. 기본은 축약형의 '만 (영어 코퍼스는 '를 축약형일 때만 셈)
   pub english_punct: String,
   // 원샷 레이어 키를 한 번 누르는 비용 (검지 홈 행 키 한 번 = 1). 심볼 레이어 기호를 누를 때마다 더함
   pub layer_tap: f32,
@@ -257,7 +257,7 @@ impl Default for SymbolsConfig {
         "encoding_rs", "r-efi", "wasi", "wasip2", "*-sys"].iter().map(|s| (*s).to_string()).collect(),
       code_crate_cap: 250_000,
       english_weight: 0.5,
-      english_punct: ".,'\"?!-():;".into(),
+      english_punct: "'".into(),
       layer_tap: 1.0,
       base_slot_extra: 3.0,
       pairs: ["()", "[]", "{}", "<>"].iter().map(|s| (*s).to_string()).collect(),

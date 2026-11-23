@@ -179,7 +179,7 @@ pub fn analyze_code(dirs: &[String], exclude: &[String], cap: usize) -> anyhow::
         if bytes >= cap as u64 { break; }
         let Ok(src) = std::fs::read(f) else { continue };
         let text = strip_comments(&String::from_utf8_lossy(&src));
-        keycorpus::count_text(text.as_bytes(), &mut k);
+        keycorpus::count_code(text.as_bytes(), &mut k);
         files += 1;
         bytes += text.len() as u64;
       }
