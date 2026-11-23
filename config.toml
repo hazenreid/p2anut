@@ -119,7 +119,9 @@ stop_after_hits = 3
 max_starts = 2000
 
 [symbols]
-# 심볼 레이어 최적화 (symbols 명령): 기호 32개를 원샷 심볼 레이어 30칸과 베이스 배열의 빈칸에 배치. 코드 코퍼스만 씀
+# 심볼 레이어 최적화 (symbols 명령): 기호 32개를 원샷 심볼 레이어 30칸과 베이스 배열의 빈칸에 배치. 코드 코퍼스만 씀.
+# 심볼 레이어 기호가 이어지면 레이어 키를 누른 채로 쳐서 탭은 처음 한 번만 셈 (QMK OSL, ZMK sticky layer처럼 누르고 있으면
+# 보통 레이어 키로 동작하는 펌웨어)
 # 러스트 코드 코퍼스: analyze-code가 만듦 (symbols가 없으면 먼저 만듦)
 code_corpus_file = "code.bin"
 # 코드 코퍼스로 쓸 크레이트: crates.io에서 각각 최신 안정 버전만 받아 <result_path>/crates/에 풂 (의존성은 받지 않음).

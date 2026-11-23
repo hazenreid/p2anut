@@ -5,10 +5,12 @@
 // 러스트 코드 코퍼스(analyze-code)의 n-gram을 씀. 비용은 코드의 글자 100개당이고 기호가 낀 n-gram만 셈
 // (글자·공백끼리는 베이스가 고정이라 어느 배치에서나 같음).
 //
-// 원샷 레이어: 심볼 레이어 기호는 누를 때마다 엄지로 레이어 키를 먼저 한 번 누름(탭). 엄지가 끼는 두 손가락 누름은
-// 사이에 다른 손가락이 끼는 경우와 같게 봄: 같은 손가락이면 스킵그램(sfs), 인접 손가락 두 줄 차이면 스킵 시저스만
-// 셈 (롤·SFB·시저스 없음). 기호 다음 키는 탭 없이 바로 이어지므로 보통 바이그램·트라이그램. 기호 앞에 탭이 끼면
-// 그 기호가 낀 트라이그램은 롤·리다이렉트로 치지 않음. 탭 한 번의 비용은 노력값 표에서 가장 작은 값 (× [costs] effort).
+// 원샷 레이어: 심볼 레이어 기호를 치기 전에 엄지로 레이어 키를 누름(탭). 심볼 레이어 기호가 이어지면(::, ();, ->)
+// 레이어 키를 누른 채로 이어 치므로 탭은 처음 한 번만 (원샷 키를 누르고 있으면 보통 레이어처럼 동작하는 펌웨어:
+// QMK OSL, ZMK sticky layer). 엄지가 새로 끼는 두 손가락 누름은 사이에 다른 손가락이 끼는 경우와 같게 봄:
+// 같은 손가락이면 스킵그램(sfs), 인접 손가락 두 줄 차이면 스킵 시저스만 셈 (롤·SFB·시저스 없음). 이어 치는 기호끼리와
+// 기호 다음 키는 엄지 없이 바로 이어지므로 보통 바이그램·트라이그램. 엄지가 새로 끼는 트라이그램은 롤·리다이렉트로
+// 치지 않음. 탭 한 번의 비용은 노력값 표에서 가장 작은 값 (× [costs] effort).
 // 베이스 빈칸의 기호는 탭이 없는 대신 노력값에 base_slot_extra를 더함 (탭 비용보다 크면 심볼 레이어가 모자랄 때만 씀).
 //
 // 짝: pairs(순서 있음)는 첫 글자가 왼쪽인 같은 줄 나란히, 또는 좌우 대칭(같은 손가락·같은 줄, 첫 글자가 왼손).
@@ -113,7 +115,8 @@ impl Ngrams {
     let key = keycorpus::char_key;
     for (&c, &n) in &stats.letters { if let Some(k) = key(c) { uni[k as usize] += n as f64 * f; } }
     for (&(a, b), &n) in &stats.bigrams {
-      if let (Some(x), Some(y)) = (key(a), key(b)) && x != y && (is_sym(x) || is_sym(y)) { *bi.entry((x, y)).or_default() += n as f64 * f; }
+      // 같은 기호 연속(::)도 둠: 비용은 없지만 레이어 키를 누른 채로 이어 치는 횟수에 들어감
+      if let (Some(x), Some(y)) = (key(a), key(b)) && (x != y || is_sym(x)) && (is_sym(x) || is_sym(y)) { *bi.entry((x, y)).or_default() += n as f64 * f; }
     }
     for (&(a, b, c), &n) in &stats.trigrams {
       if let (Some(x), Some(y), Some(z)) = (key(a), key(b), key(c)) && (is_sym(x) || is_sym(y) || is_sym(z)) {
@@ -267,19 +270,31 @@ impl<'a> Problem<'a> {
     }
   }
 
+  // 심볼 레이어 기호는 누를 때마다 탭 비용을 매기고, 이어 치는 기호(bi)에서 되돌려 줌
   fn uni(&self, st: &State, item: usize) -> f64 {
     if item >= NSYM { return 0.0; }
     let k = FIRST_SYM as usize + item;
     self.g.uni[k] * (self.t.eff[st.pos[k] as usize] + if st.tap[k] { self.tap_cost } else { self.base_extra })
   }
 
-  fn bi(&self, st: &State, a: u8, b: u8) -> f64 {
+  // a 다음 b를 칠 때 엄지가 레이어 키를 새로 누르는지: b가 심볼 레이어 기호이고 a는 아닐 때
+  fn tapped(st: &State, a: u8, b: u8) -> bool { st.tap[b as usize] && !st.tap[a as usize] }
+
+  // 둘 다 심볼 레이어 기호면 레이어 키를 누른 채로 이어 침 (탭 하나를 아낌)
+  fn held(st: &State, a: u8, b: u8) -> bool { st.tap[a as usize] && st.tap[b as usize] }
+
+  // a 다음 b를 누르는 손가락 비용 (엄지가 새로 끼면 탭 너머 쌍). 탭 비용은 뺌
+  fn pair(&self, st: &State, a: u8, b: u8) -> f64 {
     let i = st.pos[a as usize] as usize * N + st.pos[b as usize] as usize;
-    if st.tap[b as usize] { self.t.x[i] } else { self.t.bg[i] }
+    if Self::tapped(st, a, b) { self.t.x[i] } else { self.t.bg[i] }
+  }
+
+  fn bi(&self, st: &State, a: u8, b: u8) -> f64 {
+    self.pair(st, a, b) - if Self::held(st, a, b) { self.tap_cost } else { 0.0 }
   }
 
   fn tri(&self, st: &State, a: u8, b: u8, c: u8) -> f64 {
-    if st.tap[b as usize] || st.tap[c as usize] { return 0.0; }
+    if Self::tapped(st, a, b) || Self::tapped(st, b, c) { return 0.0; }
     let (pa, pb, pc) = (st.pos[a as usize] as usize, st.pos[b as usize] as usize, st.pos[c as usize] as usize);
     self.t.tg[(pa * N + pb) * N + pc]
   }
@@ -470,22 +485,26 @@ impl<'a> Problem<'a> {
     (c, st, hits, starts)
   }
 
+  // 레이어 키 탭 수 (글자 100개당): 심볼 레이어 기호 누름에서 앞 키도 심볼 레이어 기호인 누름(누른 채로 이어 침)을 뺌
+  pub fn layer_taps(&self, st: &State) -> f64 {
+    let presses: f64 = (FIRST_SYM as usize..KEYS).filter(|&k| st.tap[k]).map(|k| self.g.uni[k]).sum();
+    let held: f64 = self.g.bi.iter().filter(|&&(x, y, _)| Self::held(st, x, y)).map(|e| e.2).sum();
+    presses - held
+  }
+
   pub fn breakdown(&self, st: &State) -> Breakdown {
     let t = self.t;
-    let mut b = Breakdown::default();
-    for item in 0..NSYM {
-      let k = FIRST_SYM as usize + item;
-      let u = self.g.uni[k];
-      b.effort += u * (t.eff[st.pos[k] as usize] + if st.tap[k] { 0.0 } else { self.base_extra });
-      if st.tap[k] { b.taps += u * self.tap_cost; }
+    let mut b = Breakdown { taps: self.layer_taps(st) * self.tap_cost, ..Breakdown::default() };
+    for k in FIRST_SYM as usize..KEYS {
+      b.effort += self.g.uni[k] * (t.eff[st.pos[k] as usize] + if st.tap[k] { 0.0 } else { self.base_extra });
     }
     for &(x, y, w) in &self.g.bi {
       let i = st.pos[x as usize] as usize * N + st.pos[y as usize] as usize;
-      if st.tap[y as usize] { b.sfb += w * t.xsfs[i]; b.scissors += w * t.xssc[i]; }
+      if Self::tapped(st, x, y) { b.sfb += w * t.xsfs[i]; b.scissors += w * t.xssc[i]; }
       else { b.sfb += w * t.sfb[i]; b.scissors += w * t.sc[i]; b.rolling += w * t.roll[i]; }
     }
     for &(x, y, z, w) in &self.g.tri {
-      if st.tap[y as usize] || st.tap[z as usize] { continue; }
+      if Self::tapped(st, x, y) || Self::tapped(st, y, z) { continue; }
       let j = (st.pos[x as usize] as usize * N + st.pos[y as usize] as usize) * N + st.pos[z as usize] as usize;
       b.sfb += w * t.sfs[j];
       b.scissors += w * t.ssc[j];
@@ -498,7 +517,7 @@ impl<'a> Problem<'a> {
   fn kind(&self, st: &State, a: u8, b: u8) -> &'static str {
     let (pa, pb) = (st.pos[a as usize], st.pos[b as usize]);
     let i = pa as usize * N + pb as usize;
-    if st.tap[b as usize] {
+    if Self::tapped(st, a, b) {
       return if pa == pb { "tap:same-key" } else if self.t.xsfs[i] > 0.0 { "tap:sfs" } else if self.t.xssc[i] > 0.0 { "tap:skip-sc" } else { "tap" };
     }
     let (ca, cb) = (pa as usize % COLS, pb as usize % COLS);
@@ -512,8 +531,8 @@ impl<'a> Problem<'a> {
 
   pub fn print_report(&self, st: &State) {
     let b = self.breakdown(st);
-    println!("cost={:.2}  effort={:.2}  taps={:.2}  sfb={:.2}  scissors={:.2}  rolling={:.2}   (per 100 letters, n-grams with a symbol; {:.1} symbol presses)",
-      b.total(), b.effort, b.taps, b.sfb, b.scissors, -b.rolling, self.g.symbol_presses());
+    println!("cost={:.2}  effort={:.2}  taps={:.2}  sfb={:.2}  scissors={:.2}  rolling={:.2}   (per 100 letters, n-grams with a symbol; {:.1} symbol presses, {:.1} layer taps)",
+      b.total(), b.effort, b.taps, b.sfb, b.scissors, -b.rolling, self.g.symbol_presses(), self.layer_taps(st));
     let mut kinds: Vec<(&str, f64)> = Vec::new();
     let mut total = 0.0;
     for &(x, y, w) in &self.g.bi {
@@ -525,7 +544,7 @@ impl<'a> Problem<'a> {
     println!("bigrams with a symbol: {}", kinds.iter().map(|(k, w)| format!("{k} {:.1}%", 100.0 * w / total)).collect::<Vec<_>>().join("  "));
     let show = |ids: &[u8]| ids.iter().map(|&k| if k == SPACE { SPACE_TOKEN } else { keycorpus::key_char(k) }).collect::<String>();
     let mut worst: Vec<(f64, String, &str)> = Vec::new();
-    for &(x, y, w) in &self.g.bi { let c = w * self.bi(st, x, y); if c > 0.0 { worst.push((c, show(&[x, y]), self.kind(st, x, y))); } }
+    for &(x, y, w) in &self.g.bi { let c = w * self.pair(st, x, y); if c > 0.0 { worst.push((c, show(&[x, y]), self.kind(st, x, y))); } }
     for &(x, y, z, w) in &self.g.tri { let c = w * self.tri(st, x, y, z); if c > 0.0 { worst.push((c, show(&[x, y, z]), "trigram")); } }
     worst.sort_by(|a, b| b.0.total_cmp(&a.0));
     println!("worst: {}", worst.iter().take(12).map(|(c, s, k)| format!("[{s}] {k} {c:.2}")).collect::<Vec<_>>().join("  "));
@@ -700,6 +719,41 @@ mod tests {
     assert_eq!((st.pos[FIRST_SYM as usize + paren], st.tap[FIRST_SYM as usize + paren]), (14, false));
     let on_base = p.uni(&st, paren);
     assert!((on_base - on_layer - g.uni[(FIRST_SYM as usize) + paren] * (p.base_extra - p.tap_cost)).abs() < 1e-9);
+  }
+
+  #[test]
+  fn consecutive_symbols_hold_the_layer_key() {
+    let c = config();
+    let t = Tables::new(&c);
+    let base = Layout::parse(BASE).unwrap();
+    // 끊김 없는 한 줄: 탭 수는 앞 키가 심볼 레이어 기호가 아닌 심볼 레이어 기호 누름 수
+    let text = "a::b();c->d!=e[f]?;g";
+    let mut code = keycorpus::KeyCorpus::new();
+    keycorpus::count_text(text.as_bytes(), &mut code);
+    let g = Ngrams::new(&code.into_stats(), 1.0, 1.0);
+    // 같은 기호 연속(::)도 빅그램으로 들어옴
+    let colon = FIRST_SYM + keycorpus::sym_index(':').unwrap() as u8;
+    assert!(g.bi.iter().any(|&(x, y, _)| (x, y) == (colon, colon)));
+    let p = Problem::new(&t, &g, &base, &c.symbols).unwrap();
+    let ids: Vec<u8> = text.chars().map(|ch| keycorpus::char_key(ch).unwrap()).collect();
+    let per = 100.0 / text.chars().filter(char::is_ascii_lowercase).count() as f64;
+    let mut seen_mixed = false;
+    for seed in 0..40 {
+      let st = p.random_state(&mut fastrand::Rng::with_seed(seed));
+      let taps = (0..ids.len()).filter(|&i| st.tap[ids[i] as usize] && (i == 0 || !st.tap[ids[i - 1] as usize])).count();
+      assert!((p.layer_taps(&st) - taps as f64 * per).abs() < 1e-9, "seed {seed}");
+      assert!((p.breakdown(&st).taps - p.layer_taps(&st) * p.tap_cost).abs() < 1e-9);
+      // 이어 치면 보통 바이그램에서 탭 하나를 되돌려 받고, 엄지가 새로 끼면 탭 너머 쌍
+      for &(x, y, _) in &g.bi {
+        let i = st.pos[x as usize] as usize * N + st.pos[y as usize] as usize;
+        let want = match (st.tap[x as usize], st.tap[y as usize]) { (true, true) => t.bg[i] - p.tap_cost, (false, true) => t.x[i], _ => t.bg[i] };
+        assert!((p.bi(&st, x, y) - want).abs() < 1e-12);
+      }
+      // 기호 하나는 베이스, 이웃은 심볼 레이어인 경우도 거침
+      seen_mixed |= ids.windows(2).any(|w| is_sym(w[0]) && is_sym(w[1]) && st.tap[w[0] as usize] != st.tap[w[1] as usize]);
+      assert!((p.breakdown(&st).total() - p.total(&st)).abs() < 1e-9);
+    }
+    assert!(seen_mixed);
   }
 
   #[test]

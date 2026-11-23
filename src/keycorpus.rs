@@ -2,7 +2,8 @@
 // - 글자는 소문자로 (Shift는 따로 세지 않음), 기호는 그대로 한 키
 // - 공백은 두 키 사이의 공백 하나만 셈. 연속 공백, 줄 처음·끝의 공백(들여쓰기 포함)은 세지 않고 연속을 끊음
 // - 숫자, 탭, 줄바꿈, 그 밖의 문자는 연속을 끊음
-// - 같은 키 연속은 빅그램으로 세지 않고 그 쌍이 낀 트라이그램도 세지 않음 (글자 코퍼스와 같음)
+// - 같은 키 연속은 그 쌍이 낀 트라이그램을 세지 않음 (글자 코퍼스와 같음). 빅그램도 글자는 세지 않지만, 기호는 셈
+//   (::, //, )) 등: 원샷 레이어 키를 누른 채로 이어 치는지 알려면 필요)
 #![allow(clippy::cast_possible_truncation)]
 use crate::corpus::CorpusStats;
 
@@ -15,7 +16,8 @@ pub const KEYS: usize = FIRST_SYM as usize + NSYM;
 // 코드 코퍼스 파일의 머리표와 세는 규칙의 버전 (규칙을 바꾸면 올림)
 pub const CODE_MAGIC: &[u8] = b"P2ANUT-CODE\0";
 // 2: 크레이트마다 본체 코드를 모두 읽고 같은 무게로 더함
-pub const CODE_VERSION: u32 = 2;
+// 3: 기호의 같은 키 연속(::)도 빅그램으로 셈
+pub const CODE_VERSION: u32 = 3;
 
 // 기호의 번호 (0..32)
 pub fn sym_index(ch: char) -> Option<usize> { SYMBOLS.find(ch).filter(|_| ch.is_ascii()) }
@@ -90,10 +92,8 @@ impl Chain<'_> {
     self.hist = [self.hist[1], self.hist[2], id];
     self.len += 1;
     let h = self.hist.map(usize::from);
-    if self.len >= 2 && h[1] != h[2] {
-      self.c.bigrams[h[1] * KEYS + h[2]] += 1;
-      if self.len >= 3 && h[0] != h[1] { self.c.trigrams[(h[0] * KEYS + h[1]) * KEYS + h[2]] += 1; }
-    }
+    if self.len >= 2 && (h[1] != h[2] || h[2] >= FIRST_SYM as usize) { self.c.bigrams[h[1] * KEYS + h[2]] += 1; }
+    if self.len >= 3 && h[1] != h[2] && h[0] != h[1] { self.c.trigrams[(h[0] * KEYS + h[1]) * KEYS + h[2]] += 1; }
   }
 
   fn reset(&mut self) { self.len = 0; self.hist = [255; 3]; }
@@ -175,9 +175,13 @@ mod tests {
 
   #[test]
   fn repeated_keys_follow_the_letter_corpus_rule() {
+    // 같은 기호 연속(::)은 빅그램으로 세고, 그 쌍이 낀 트라이그램은 세지 않음
     let c = run("a::b");
-    assert_eq!((bi(&c, "::"), tri(&c, "a::"), tri(&c, "::b"), bi(&c, "a:"), bi(&c, ":b")), (0, 0, 0, 1, 1));
+    assert_eq!((bi(&c, "::"), tri(&c, "a::"), tri(&c, "::b"), bi(&c, "a:"), bi(&c, ":b")), (1, 0, 0, 1, 1));
     assert_eq!(c.unigrams[id(':')], 2);
+    // 같은 글자 연속(ll)은 글자 코퍼스처럼 세지 않음
+    let c = run("all in");
+    assert_eq!((bi(&c, "ll"), tri(&c, "all"), bi(&c, "l "), tri(&c, "l i")), (0, 0, 1, 1));
   }
 
   #[test]
