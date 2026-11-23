@@ -108,6 +108,8 @@ impl<'a> Optimizer<'a> {
     Self { corpus_arrays, precomp, norm, elites_len, min_home_diff, sa_params, center_mask }
   }
 
+  pub fn corpus(&self) -> &CorpusArrays { &self.corpus_arrays }
+
   // 이동에 쓰는 칸들이 모두 같은 구역(센터/바깥)인지. 제약이 없으면 항상 true
   fn same_zone(&self, ps: &[usize]) -> bool {
     self.center_mask == 0 || ps.iter().all(|&p| is_center_slot(p) == is_center_slot(ps[0]))
@@ -130,7 +132,7 @@ impl<'a> Optimizer<'a> {
       save_results(&merged, result_file).ok();
       println!("\n[Elite {}/{}] best found {} times in {} starts", i + 1, elites_len, tally.hits, tally.starts);
       elite.print();
-      elite.print_goodness(self.norm);
+      elite.print_goodness(self.norm, &self.corpus_arrays, self.precomp);
       println!();
       if crate::SHUTDOWN.load(std::sync::atomic::Ordering::SeqCst) { break; }
     }
@@ -734,12 +736,13 @@ mod tests {
 
   #[test]
   fn delta_moves_match_full_recompute() {
-    for soft in [false, true] { check_delta_moves(soft); }
+    for soft in [false, true] { for grid in [false, true] { check_delta_moves(soft, grid); } }
   }
 
   // soft_hand: 손 비율 감점이 붙는 구간(40~45%)에서도 delta 계산이 전체 재계산과 같은지
-  fn check_delta_moves(soft_hand: bool) {
-    let arrays = test_util::stats().to_arrays();
+  // grid: 스페이스를 27번째 키로 배열에 둘 때도
+  fn check_delta_moves(soft_hand: bool, grid: bool) {
+    let arrays = test_util::stats().to_arrays(grid);
     let (precomp, norm) = if soft_hand { test_util::precomp_norm_soft_hand(&arrays) } else { test_util::precomp_norm_for(&arrays) };
     let o = Optimizer::new(arrays, &precomp, &norm, 1, 1, test_util::sa(), 0);
     let mut ws = SaWorkspace::new(&o.corpus_arrays);
@@ -766,7 +769,7 @@ mod tests {
 
   #[test]
   fn center_rare_constraint_holds() {
-    let arrays = test_util::stats().to_arrays();
+    let arrays = test_util::stats().to_arrays(false);
     let (precomp, norm) = test_util::precomp_norm_for(&arrays);
     let mask = arrays.rare_mask(4);
     assert_eq!(mask.count_ones(), 4);
@@ -789,7 +792,7 @@ mod tests {
 
   #[test]
   fn descend_reaches_a_deterministic_local_optimum() {
-    let arrays = test_util::stats().to_arrays();
+    let arrays = test_util::stats().to_arrays(false);
     let (precomp, norm) = test_util::precomp_norm_soft_hand(&arrays);
     let mask = arrays.rare_mask(4);
     let o = Optimizer::new(arrays, &precomp, &norm, 1, 1, test_util::sa(), mask);
@@ -812,7 +815,7 @@ mod tests {
   fn sa_improves_and_repairs_penalized_layouts() {
     let stats = test_util::stats();
     let (precomp, norm) = test_util::precomp_norm(&stats);
-    let o = Optimizer::new(stats.to_arrays(), &precomp, &norm, 1, 1, test_util::sa(), 0);
+    let o = Optimizer::new(stats.to_arrays(false), &precomp, &norm, 1, 1, test_util::sa(), 0);
     let start = o.make_scored_excl(&[]);
     let out = o.optimize_sa(start, &[]);
     assert!(out.total >= start.total);
@@ -830,7 +833,7 @@ mod tests {
 
   #[test]
   fn space_off_grid_places_only_letters() {
-    let arrays = test_util::stats().to_arrays();
+    let arrays = test_util::stats().to_arrays(false);
     let (precomp, norm) = test_util::precomp_norm_for(&arrays);
     let o = Optimizer::new(arrays, &precomp, &norm, 1, 1, test_util::sa(), 0);
     let a = o.optimize_sa(o.make_scored_excl(&[]), &[]);
@@ -847,7 +850,7 @@ mod tests {
   fn sa_stays_away_from_excluded_homes() {
     let stats = test_util::stats();
     let (precomp, norm) = test_util::precomp_norm(&stats);
-    let o = Optimizer::new(stats.to_arrays(), &precomp, &norm, 1, 3, test_util::sa(), 0);
+    let o = Optimizer::new(stats.to_arrays(false), &precomp, &norm, 1, 3, test_util::sa(), 0);
     for _ in 0..5 {
       let start = o.make_scored_excl(&[]);
       // 제외 없이 찾은 결과의 홈행을 막고 같은 시작점에서 다시 돌리면, 그 홈행과 3글자 이상 달라야 함
@@ -865,7 +868,7 @@ mod tests {
     let stats = test_util::stats();
     fastrand::seed(7); // 정규화 표본도 고정해야 실행(프로세스)마다 같은 목적함수가 됨
     let (precomp, norm) = test_util::precomp_norm(&stats);
-    let o = Optimizer::new(stats.to_arrays(), &precomp, &norm, 1, 2, test_util::sa(), 0);
+    let o = Optimizer::new(stats.to_arrays(false), &precomp, &norm, 1, 2, test_util::sa(), 0);
     let path = std::env::temp_dir().join(format!("p2anut_seed_{}.bin", std::process::id()));
     let run = |seed: u64| {
       fastrand::seed(seed);
@@ -883,7 +886,7 @@ mod tests {
   fn elites_respect_min_home_diff() {
     let stats = test_util::stats();
     let (precomp, norm) = test_util::precomp_norm(&stats);
-    let o = Optimizer::new(stats.to_arrays(), &precomp, &norm, 3, 2, test_util::sa(), 0);
+    let o = Optimizer::new(stats.to_arrays(false), &precomp, &norm, 3, 2, test_util::sa(), 0);
     let path = std::env::temp_dir().join(format!("p2anut_test_{}.bin", std::process::id()));
     let elites = o.run(&[], path.to_str().unwrap());
     let _ = std::fs::remove_file(&path);
@@ -921,7 +924,7 @@ mod tests {
 
   #[test]
   fn each_elite_stops_once_its_best_repeats() {
-    let arrays = test_util::stats().to_arrays();
+    let arrays = test_util::stats().to_arrays(false);
     let (precomp, norm) = test_util::precomp_norm_for(&arrays);
     // 최고점이 한 번만 나와도 되면 첫 묶음(4번)을 채우고 멈춤 (최소 한 묶음)
     let sa = crate::config::SaParams { starts_per_batch: 4, stop_after_hits: 1, max_starts: 400, ..test_util::sa() };
@@ -935,7 +938,7 @@ mod tests {
     assert!(again.total >= best.total);
     // 최고점이 다시 안 나오면(목표가 너무 높음) 상한에서 멈춤
     let sa = crate::config::SaParams { starts_per_batch: 4, stop_after_hits: 1000, max_starts: 12, ..test_util::sa() };
-    let o = Optimizer::new(test_util::stats().to_arrays(), &precomp, &norm, 1, 1, sa, 0);
+    let o = Optimizer::new(test_util::stats().to_arrays(false), &precomp, &norm, 1, 1, sa, 0);
     let (_, t) = o.find_one(1, 1, &[], None, std::time::Instant::now());
     assert_eq!(t.starts, 12);
   }

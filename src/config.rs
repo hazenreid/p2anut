@@ -200,6 +200,9 @@ pub struct Config {
   // 0(기본) = 제약 없음. 2~6 (센터는 6칸, 나머지 24칸에 26-n글자가 들어가야 하므로 2 이상)
   #[serde(default)]
   pub center_rare: usize,
+  // 스페이스를 어디에 둘지. thumb(기본) = 엄지 키 (배열에는 a-z 26키), grid = 배열의 한 칸 (27키)
+  #[serde(default)]
+  pub space_key: SpaceKey,
   pub weights: Weights,
   // 예전 설정의 score_normalization, [rates]는 더 이상 쓰지 않으며 남아 있어도 무시됨
   #[serde(default)]
@@ -218,6 +221,14 @@ pub enum UrlList {
 }
 
 // URL의 마지막 경로 부분 (쿼리·조각 제외)
+#[derive(Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SpaceKey {
+  #[default]
+  Thumb,
+  Grid,
+}
+
 fn url_file_name(url: &str) -> Option<&str> {
   let path = url.split(['?', '#']).next()?;
   path.rsplit('/').next().filter(|s| !s.is_empty())
@@ -225,6 +236,18 @@ fn url_file_name(url: &str) -> Option<&str> {
 
 impl Config {
   pub fn hand_hard_limit(&self) -> f32 { self.hand_hard_limit.unwrap_or(self.min_hand_usage) }
+
+  // 스페이스를 배열에 두는지
+  pub fn space_on_grid(&self) -> bool { self.space_key == SpaceKey::Grid }
+
+  // 결과 파일 이름: 스페이스를 배열에 두면 "-grid"를 붙여 엄지 방식 결과와 섞이지 않게 함 (result.bin → result-grid.bin)
+  pub fn result_file_for_mode(&self) -> String {
+    if !self.space_on_grid() { return self.result_file.clone(); }
+    match self.result_file.rsplit_once('.') {
+      Some((stem, ext)) if !stem.is_empty() && !ext.contains('/') => format!("{stem}-grid.{ext}"),
+      _ => format!("{}-grid", self.result_file),
+    }
+  }
 
   // 비어 있지 않은 덤프 주소들 (적은 순서대로)
   pub fn dump_urls(&self) -> Vec<String> {
@@ -423,6 +446,25 @@ mod tests {
     assert!(config(&format!("{url}trigram_coverage = 0.0")).validate().is_err());
     assert!(config(&format!("{url}bigram_coverage = 1.0")).validate().is_ok());
     assert!(config("wikipedia_dump_url = \"https://m.org/\"\nwikipedia_download = true").validate().is_err());
+  }
+
+  #[test]
+  fn space_key_mode_and_result_file() {
+    let c = config("wikipedia_dump_url = \"https://m.org/a.xml.bz2\"\n");
+    assert_eq!(c.space_key, SpaceKey::Thumb);
+    assert_eq!(c.result_file_for_mode(), c.result_file);
+    let g = config("wikipedia_dump_url = \"https://m.org/a.xml.bz2\"\nspace_key = \"grid\"\nresult_file = \"result.bin\"");
+    assert!(g.space_on_grid());
+    assert_eq!(g.result_file_for_mode(), "result-grid.bin");
+    let g = config("wikipedia_dump_url = \"https://m.org/a.xml.bz2\"\nspace_key = \"grid\"\nresult_file = \"res\"");
+    assert_eq!(g.result_file_for_mode(), "res-grid");
+    assert!(toml::from_str::<toml::Table>("space_key = \"keyboard\"").unwrap().get("space_key").is_some());
+    let bad: Result<Config, _> = toml::Value::Table({
+      let mut t: toml::Table = toml::from_str(&std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/config.toml")).unwrap()).unwrap();
+      t.insert("space_key".into(), toml::Value::String("keyboard".into()));
+      t
+    }).try_into();
+    assert!(bad.is_err());
   }
 
   #[test]

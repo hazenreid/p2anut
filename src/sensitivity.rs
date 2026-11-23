@@ -119,14 +119,16 @@ pub fn evaluate(arrays: &CorpusArrays, c: &Config, cands: &[Layout], base: usize
   let o = Optimizer::new(arrays.clone(), &precomp, &norm, 1, 1, c.sa.clone(), center_mask);
   let start = cands[base];
   let descended = o.descend(start);
-  let moved = (0..arrays.keys.len()).filter(|&i| descended.pos[i] != start.pos[i]).map(|i| arrays.keys[i]).collect();
+  let moved = (0..arrays.keys.len()).filter(|&i| descended.pos[i] != start.pos[i]).map(|i| shown(arrays.keys[i])).collect();
   Outcome { winner, rival_lead, descended, moved, gain: cost_per_100(totals[base]) - cost_per_100(descended.total) }
 }
 
+// 글자 목록 표시용: 스페이스는 '_'
+fn shown(ch: char) -> char { if ch == ' ' { '_' } else { ch } }
+
 pub fn compact(l: &Layout) -> String {
   (0..ROWS).map(|r| (0..COLS).map(|c| {
-    let id = l.slots[r * COLS + c];
-    if id < 26 { (b'a' + id) as char } else { '.' }
+    crate::layout::key_char(l.slots[r * COLS + c])
   }).collect::<String>()).collect::<Vec<_>>().join("/")
 }
 
@@ -152,7 +154,7 @@ pub fn diff_letters(arrays: &CorpusArrays, base: &Layout, other: &Layout) -> (Ve
   [*other, mirror_layout(other)].iter().map(|o| {
     let ids: Vec<usize> = (0..arrays.keys.len()).filter(|&i| o.pos[i] != base.pos[i]).collect();
     let share = ids.iter().map(|&i| arrays.freq[i] as f64).sum::<f64>() * 100.0 / total.max(1) as f64;
-    (ids.iter().map(|&i| arrays.keys[i]).collect::<Vec<char>>(), share)
+    (ids.iter().map(|&i| shown(arrays.keys[i])).collect::<Vec<char>>(), share)
   }).min_by(|a, b| a.1.total_cmp(&b.1)).unwrap_or_default()
 }
 
@@ -318,7 +320,7 @@ mod tests {
 
   #[test]
   fn unscaled_settings_keep_every_score() {
-    let arrays = test_util::stats().to_arrays();
+    let arrays = test_util::stats().to_arrays(false);
     let c = config();
     let precomp = Precomp::new(&arrays.freq, &c.weights, &c.costs, &c.effort, c.hand_hard_limit());
     let norm = crate::layout::init_score_norm(&arrays, &precomp, &c.costs, HandRule::from_config(&c));
@@ -336,7 +338,7 @@ mod tests {
 
   #[test]
   fn every_setting_changes_some_score() {
-    let arrays = test_util::stats().to_arrays();
+    let arrays = test_util::stats().to_arrays(false);
     let mut c = config();
     c.min_hand_usage = 0.5; // 손 비율 감점이 거의 모든 배열에 붙게 해서 hand_penalty도 확인
     let ls = random_layouts(&arrays, 30);
@@ -379,7 +381,7 @@ mod tests {
 
   #[test]
   fn evaluate_reports_no_change_at_a_local_optimum() {
-    let arrays = test_util::stats().to_arrays();
+    let arrays = test_util::stats().to_arrays(false);
     let c = config();
     let mask = arrays.rare_mask(c.center_rare);
     let (p, n) = scoring(&arrays, &c);
@@ -406,7 +408,7 @@ mod tests {
 
   #[test]
   fn diff_letters_counts_typing_share_and_ignores_mirroring() {
-    let arrays = test_util::stats().to_arrays();
+    let arrays = test_util::stats().to_arrays(false);
     let base = Layout::make_random(&arrays.keys, &[], 0);
     let total: u64 = arrays.freq.iter().sum();
     let (letters, share) = diff_letters(&arrays, &base, &swapped(&base, 'e', 'q'));
@@ -425,7 +427,7 @@ mod tests {
 
   #[test]
   fn report_groups_the_same_layout_and_keeps_the_bigger_saving() {
-    let arrays = test_util::stats().to_arrays();
+    let arrays = test_util::stats().to_arrays(false);
     let base = Layout::make_random(&arrays.keys, &[], 0);
     let near = swapped(&base, 'q', 'z'); // 드문 글자만 다름
     let far = swapped(&swapped(&base, 'e', 't'), 'a', 'o');
@@ -452,7 +454,7 @@ mod tests {
 
   #[test]
   fn dedupe_drops_mirrors() {
-    let arrays = test_util::stats().to_arrays();
+    let arrays = test_util::stats().to_arrays(false);
     let a = Layout::make_random(&arrays.keys, &[], 0);
     let mut m = Layout::new();
     m.slots = mirrored(&a);

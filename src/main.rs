@@ -25,43 +25,79 @@ use precomp::Precomp;
 use layout::{init_score_norm, save_results, load_results, sort_unique_layouts};
 use optimizer::Optimizer;
 
-// a-z를 세고, 글자 사이에 공백이 정확히 하나 있으면 그 공백도 엄지 키(id 26)로 함께 셈.
-// 예: "the end"는 the, he_, e_e, _en, end. 문장부호·숫자·줄바꿈과 연속 공백은 연속을 끊고,
-// 그 옆의 공백은 세지 않음 (". The"의 공백, "a  b"의 공백). 공백 두 칸은 대개 마크업이 지워진 자리라 끊음.
-// 같은 글자 연속(ll)은 빅그램으로 세지 않고, 그 쌍이 낀 트라이그램도 세지 않음
+// a-z와 실제로 누르는 공백을 셈.
+// - 공백(연속 공백은 하나로)은 양옆이 글자이거나 실제 글의 문장부호·숫자일 때만 누름 1번으로 셈.
+//   줄 처음·끝, 마크업 찌꺼기 같은 그 밖의 기호 옆 공백은 세지 않음 (실제로는 누르지 않는 공백)
+// - n-gram은 배열에 있는 키끼리만 이음: 공백 하나는 옆의 글자와 이어서 셈 (`the end` → he_, e_e, _en,
+//   `. The` → _t, _th). 문장부호·숫자 자체는 n-gram에 넣지 않고 끊음
+// - 연속 공백은 대개 마크업이 지워진 자리라 누름 1번으로만 치고 양옆을 잇지 않음
+// - 같은 글자 연속(ll)은 빅그램으로 세지 않고, 그 쌍이 낀 트라이그램도 세지 않음
 pub const SPACE_ID: u8 = 26;
 
-fn analyze_bytes(bytes: &[u8], stats: &mut corpus::FastCorpus) {
-  let mut hist = [255u8; 3];
-  let mut valid_len = 0usize;
-  // 글자 뒤에 공백 하나를 봤고, 다음이 글자인지 아직 모름
-  let mut pending_space = false;
+// 공백 옆에 와도 되는 실제 글의 문장부호와 숫자
+fn is_text_punct(b: u8) -> bool {
+  b.is_ascii_digit() || matches!(b, b'.' | b',' | b';' | b':' | b'!' | b'?' | b')' | b']' | b'(' | b'[' | b'"' | b'\'')
+}
 
-  macro_rules! commit {
-    ($id:expr) => {
-      stats.add_letter($id);
-      hist[0] = hist[1]; hist[1] = hist[2]; hist[2] = $id;
-      valid_len += 1;
-      if valid_len >= 2 && hist[1] != 255 && hist[1] != hist[2] {
-        stats.add_bigram(hist[1], hist[2]);
-        if valid_len >= 3 && hist[0] != 255 && hist[0] != hist[1] {
-          stats.add_trigram(hist[0], hist[1], hist[2]);
-        }
-      }
-    };
-  }
+// 공백 옆에 오는 것의 종류. Other = 줄 처음·끝, 마크업이나 그 밖의 기호
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Side { Letter, Punct, Other }
 
-  for &b in bytes {
-    let lch = b.to_ascii_lowercase();
-    if lch.is_ascii_lowercase() {
-      if pending_space { commit!(SPACE_ID); pending_space = false; }
-      commit!(lch - b'a');
-    } else if b == b' ' && valid_len > 0 && !pending_space {
-      pending_space = true;
-    } else {
-      valid_len = 0; hist = [255, 255, 255]; pending_space = false;
+// 키 연속(사슬)을 이어 가며 n-gram을 셈
+struct Counter<'a> {
+  stats: &'a mut corpus::FastCorpus,
+  hist: [u8; 3],
+  len: usize,
+}
+
+impl Counter<'_> {
+  fn commit(&mut self, id: u8) {
+    self.stats.add_letter(id);
+    self.hist = [self.hist[1], self.hist[2], id];
+    self.len += 1;
+    let h = self.hist;
+    if self.len >= 2 && h[1] != 255 && h[1] != h[2] {
+      self.stats.add_bigram(h[1], h[2]);
+      if self.len >= 3 && h[0] != 255 && h[0] != h[1] { self.stats.add_trigram(h[0], h[1], h[2]); }
     }
   }
+
+  fn reset(&mut self) { self.len = 0; self.hist = [255; 3]; }
+
+  // 공백 run개가 left와 right 사이에서 끝남
+  fn spaces(&mut self, left: Side, right: Side, run: usize) {
+    let counted = left != Side::Other && right != Side::Other;
+    let case = if !counted { 4 } else if run > 1 { 3 } else {
+      match (left, right) { (Side::Letter, Side::Letter) => 0, (Side::Letter, _) | (_, Side::Letter) => 1, _ => 2 }
+    };
+    self.stats.space_cases[case] += 1;
+    if !counted { self.reset(); return; }
+    if case >= 2 { self.stats.add_letter(SPACE_ID); self.reset(); return; }
+    // 공백 하나: 왼쪽이 글자면 이어 붙이고, 문장부호·숫자면(사슬이 이미 끊김) 공백부터 새로 시작
+    self.commit(SPACE_ID);
+    if right != Side::Letter { self.reset(); }
+  }
+}
+
+fn analyze_bytes(bytes: &[u8], stats: &mut corpus::FastCorpus) {
+  let mut c = Counter { stats, hist: [255; 3], len: 0 };
+  let mut prev = Side::Other; // 마지막으로 본 공백이 아닌 문자 (글 처음은 Other)
+  let mut left = Side::Other;
+  let mut run = 0usize;
+  for &b in bytes {
+    if b == b' ' {
+      if run == 0 { left = prev; }
+      run += 1;
+      continue;
+    }
+    let lch = b.to_ascii_lowercase();
+    let cur = if lch.is_ascii_lowercase() { Side::Letter } else if is_text_punct(b) { Side::Punct } else { Side::Other };
+    if run > 0 { c.spaces(left, cur, run); run = 0; }
+    if cur == Side::Letter { c.commit(lch - b'a'); } else { c.reset(); }
+    prev = cur;
+  }
+  // 글 끝의 공백은 세지 않음
+  if run > 0 { c.spaces(left, Side::Other, run); }
 }
 
 // 덤프 분석: 받아 둔 파일이 있으면 병렬(멀티스트림)·이어서 분석, 아니면 스트리밍 순차 분석.
@@ -102,22 +138,27 @@ fn analyze_dump(result_path: &Path, config: &Config, corpus_path: &Path) -> anyh
   };
   println!("[Wikipedia Dump] used {} articles; skipped {} redirects, {} list/disambiguation pages, {} outside sample",
     counts.articles, counts.redirects, counts.lists, counts.sampled_out);
+  fast.print_space_cases();
   let stats = fast.into_stats();
   stats.save(corpus_path.to_str().context("Invalid corpus path")?, dump::PARSER_VERSION)?;
   if parallel && checkpoint.exists() { fs::remove_file(&checkpoint)?; }
   Ok(stats)
 }
 
-// 공백(엄지)을 세기 시작한 파서 버전. 점수에 공백 너머 스킵그램·스킵 시저스가 들어가므로, 그 전 코퍼스로는 채점하지 않음
-// (공백 데이터가 없어 그 비용이 조용히 0이 되면 예전·지금 결과를 잘못 비교하게 됨)
-const MIN_SCORING_PARSER: u32 = 4;
+// 채점·최적화에 쓸 수 있는 가장 오래된 파서 버전. 4부터 글자 사이 공백을 세서 엄지 방식의 공백 너머 비용을 계산할 수 있고,
+// 5부터 문장부호·숫자 옆 공백까지 세서 스페이스를 배열에 둘 때의 누름 횟수가 맞음.
+// 그 전 코퍼스로 채점하면 그 몫이 조용히 빠져 예전·지금 결과를 잘못 비교하게 됨
+const MIN_THUMB_PARSER: u32 = 4;
+const MIN_GRID_PARSER: u32 = 5;
 
-// 저장된 코퍼스 불러오기 (전체 통계). scoring: 채점·최적화에 쓸지 (그러면 공백을 세기 전 코퍼스는 거부). 그 밖에 파서가 다르면 경고
-fn load_corpus(corpus_path: &Path, scoring: bool) -> anyhow::Result<CorpusStats> {
+fn scoring_parser(config: &Config) -> u32 { if config.space_on_grid() { MIN_GRID_PARSER } else { MIN_THUMB_PARSER } }
+
+// 저장된 코퍼스 불러오기 (전체 통계). min_parser보다 오래된 파서로 만든 것은 거부 (0 = 통계만 볼 때). 그 밖에 파서가 다르면 경고
+fn load_corpus(corpus_path: &Path, min_parser: u32) -> anyhow::Result<CorpusStats> {
   println!("[Load Corpus] {}", corpus_path.display());
   let (stats, parser_version) = CorpusStats::load(corpus_path.to_str().context("Invalid corpus path")?)?;
-  if scoring && parser_version < MIN_SCORING_PARSER {
-    anyhow::bail!("{} was built with parser v{parser_version}, before spaces were counted, so scores would miss the cross-space costs; rebuild it with `analyze --reset`",
+  if parser_version < min_parser {
+    anyhow::bail!("{} was built with parser v{parser_version}, which does not count spaces the way this mode needs (v{min_parser}+); rebuild it with `analyze --reset`",
       corpus_path.display());
   }
   if parser_version != dump::PARSER_VERSION {
@@ -127,9 +168,9 @@ fn load_corpus(corpus_path: &Path, scoring: bool) -> anyhow::Result<CorpusStats>
 }
 
 // 전체 통계. 코퍼스 파일이 없거나 --reset이면 덤프를 분석해서 저장
-fn load_or_analyze(result_path: &Path, config: &Config, reset: bool, scoring: bool) -> anyhow::Result<CorpusStats> {
+fn load_or_analyze(result_path: &Path, config: &Config, reset: bool, min_parser: u32) -> anyhow::Result<CorpusStats> {
   let corpus_path = result_path.join(&config.corpus_file);
-  if !reset && corpus_path.exists() { load_corpus(&corpus_path, scoring) } else { analyze_dump(result_path, config, &corpus_path) }
+  if !reset && corpus_path.exists() { load_corpus(&corpus_path, min_parser) } else { analyze_dump(result_path, config, &corpus_path) }
 }
 
 // 최적화·채점용: 빈도가 낮은 빅/트라이그램을 config 기준으로 잘라 냄
@@ -138,17 +179,17 @@ fn for_scoring(mut stats: CorpusStats, config: &Config) -> CorpusStats {
   stats
 }
 
-fn print_results(results: &[layout::Layout], norm: Option<&score::ScoreNorm>) {
+fn print_results(results: &[layout::Layout], scoring: Option<(&corpus::CorpusArrays, &Precomp, &score::ScoreNorm)>) {
   for (i, l) in results.iter().enumerate() {
     println!("[{}]", i + 1);
     l.print();
-    if let Some(n) = norm { l.print_goodness(n); }
+    if let Some((arrays, precomp, norm)) = scoring { l.print_goodness(norm, arrays, precomp); }
     println!();
   }
 }
 
 fn cmd_analyze(result_path: &Path, config: &Config, reset: bool) -> anyhow::Result<()> {
-  let stats = load_or_analyze(result_path, config, reset, false)?;
+  let stats = load_or_analyze(result_path, config, reset, 0)?;
   let used = for_scoring(stats.clone(), config);
   // (글자끼리, 공백이 낀 것) 개수
   let split = |s: &CorpusStats| {
@@ -165,7 +206,7 @@ fn cmd_analyze(result_path: &Path, config: &Config, reset: bool) -> anyhow::Resu
 }
 
 fn cmd_results(result_path: &Path, config: &Config) -> anyhow::Result<()> {
-  let result_file = result_path.join(&config.result_file);
+  let result_file = result_path.join(config.result_file_for_mode());
   let result_file_str = result_file.to_str().context("Invalid result file path")?;
   if !result_file.exists() {
     eprintln!("No results found at {}", result_file.display());
@@ -173,10 +214,10 @@ fn cmd_results(result_path: &Path, config: &Config) -> anyhow::Result<()> {
   }
   let mut results = load_results(result_file_str)?;
   let corpus_path = result_path.join(&config.corpus_file);
-  let mut norm = None;
+  let mut scoring = None;
   if corpus_path.exists() {
-    let stats = for_scoring(load_corpus(&corpus_path, true)?, config);
-    let arrays = stats.to_arrays();
+    let stats = for_scoring(load_corpus(&corpus_path, scoring_parser(config))?, config);
+    let arrays = stats.to_arrays(config.space_on_grid());
     results.retain(|l| l.key_count() == arrays.keys.len());
     let precomp = Precomp::new(&arrays.freq, &config.weights, &config.costs, &config.effort, config.hand_hard_limit());
     let n = init_score_norm(&arrays, &precomp, &config.costs, score::HandRule::from_config(config));
@@ -185,9 +226,9 @@ fn cmd_results(result_path: &Path, config: &Config) -> anyhow::Result<()> {
       l.calc_total_score(&n);
     }
     layout::sort_layouts(&mut results);
-    norm = Some(n);
+    scoring = Some((arrays, precomp, n));
   }
-  print_results(&results, norm.as_ref());
+  print_results(&results, scoring.as_ref().map(|(a, p, n)| (a, p, n)));
   Ok(())
 }
 
@@ -195,16 +236,16 @@ fn cmd_results(result_path: &Path, config: &Config) -> anyhow::Result<()> {
 fn cmd_score(result_path: &Path, config: &Config, files: &[String]) -> anyhow::Result<()> {
   anyhow::ensure!(!files.is_empty(), "usage: <result_path> score <layout_file>...");
   let corpus_path = result_path.join(&config.corpus_file);
-  let full = load_corpus(&corpus_path, true)?;
-  let full_arrays = full.to_arrays();
+  let full = load_corpus(&corpus_path, scoring_parser(config))?;
+  let full_arrays = full.to_arrays(config.space_on_grid());
   let windows = full.windows();
-  let arrays = for_scoring(full, config).to_arrays();
+  let arrays = for_scoring(full, config).to_arrays(config.space_on_grid());
   let precomp = Precomp::new(&arrays.freq, &config.weights, &config.costs, &config.effort, config.hand_hard_limit());
   let center_mask = arrays.rare_mask(config.center_rare);
   let norm = init_score_norm(&arrays, &precomp, &config.costs, score::HandRule::from_config(config));
 
   let mut entries: Vec<(String, layout::Layout)> = Vec::new();
-  let result_file = result_path.join(&config.result_file);
+  let result_file = result_path.join(config.result_file_for_mode());
   if result_file.exists() {
     let mut results = load_results(result_file.to_str().context("Invalid result file path")?)?;
     results.retain(|l| l.key_count() == arrays.keys.len());
@@ -213,7 +254,7 @@ fn cmd_score(result_path: &Path, config: &Config, files: &[String]) -> anyhow::R
     if let Some(best) = results.first() { entries.push(("best saved result".to_string(), *best)); }
   }
   for f in files {
-    let mut l = layout::Layout::parse(&fs::read_to_string(f).with_context(|| format!("reading {f}"))?)
+    let mut l = layout::Layout::parse(&fs::read_to_string(f).with_context(|| format!("reading {f}"))?, config.space_on_grid())
       .with_context(|| format!("parsing {f}"))?;
     anyhow::ensure!(l.key_count() == arrays.keys.len(), "{f} has {} letters, the corpus has {}", l.key_count(), arrays.keys.len());
     if !l.center_ok(center_mask) { println!("[Score] note: {f} does not follow center_rare ({} letters)", config.center_rare); }
@@ -224,7 +265,7 @@ fn cmd_score(result_path: &Path, config: &Config, files: &[String]) -> anyhow::R
   for (name, l) in &entries {
     println!("[{name}]");
     l.print();
-    l.print_goodness(&norm);
+    l.print_goodness(&norm, &arrays, &precomp);
     l.print_stats(&full_arrays, &precomp, &windows);
     println!();
   }
@@ -233,12 +274,12 @@ fn cmd_score(result_path: &Path, config: &Config, files: &[String]) -> anyhow::R
 
 // 점수 설정값을 하나씩 흔들어 저장된 결과와 배열 파일들의 1등이 바뀌는지 점검 (설정·결과 파일은 바꾸지 않음)
 fn cmd_sensitivity(result_path: &Path, config: &Config, files: &[String]) -> anyhow::Result<()> {
-  let arrays = for_scoring(load_corpus(&result_path.join(&config.corpus_file), true)?, config).to_arrays();
+  let arrays = for_scoring(load_corpus(&result_path.join(&config.corpus_file), scoring_parser(config))?, config).to_arrays(config.space_on_grid());
   let precomp = Precomp::new(&arrays.freq, &config.weights, &config.costs, &config.effort, config.hand_hard_limit());
   let center_mask = arrays.rare_mask(config.center_rare);
   let norm = init_score_norm(&arrays, &precomp, &config.costs, score::HandRule::from_config(config));
   let mut cands: Vec<(String, layout::Layout)> = Vec::new();
-  let result_file = result_path.join(&config.result_file);
+  let result_file = result_path.join(config.result_file_for_mode());
   if result_file.exists() {
     let mut results = load_results(result_file.to_str().context("Invalid result file path")?)?;
     results.retain(|l| l.key_count() == arrays.keys.len());
@@ -247,7 +288,7 @@ fn cmd_sensitivity(result_path: &Path, config: &Config, files: &[String]) -> any
     cands.extend(results.into_iter().enumerate().map(|(i, l)| (format!("saved #{}", i + 1), l)));
   }
   for f in files {
-    let l = layout::Layout::parse(&fs::read_to_string(f).with_context(|| format!("reading {f}"))?)
+    let l = layout::Layout::parse(&fs::read_to_string(f).with_context(|| format!("reading {f}"))?, config.space_on_grid())
       .with_context(|| format!("parsing {f}"))?;
     anyhow::ensure!(l.key_count() == arrays.keys.len(), "{f} has {} letters, the corpus has {}", l.key_count(), arrays.keys.len());
     if !l.center_ok(center_mask) { println!("[Sensitivity] note: {f} does not follow center_rare ({} letters)", config.center_rare); }
@@ -259,7 +300,7 @@ fn cmd_sensitivity(result_path: &Path, config: &Config, files: &[String]) -> any
 }
 
 fn run_optimize(result_path: &Path, config: &Config, stats: &corpus::CorpusStats, reset: bool) -> anyhow::Result<()> {
-  let arrays = stats.to_arrays();
+  let arrays = stats.to_arrays(config.space_on_grid());
   print!("[Precomp] ..."); let _ = std::io::stdout().flush();
   let precomp = Precomp::new(&arrays.freq, &config.weights, &config.costs, &config.effort, config.hand_hard_limit());
   println!(" done");
@@ -271,15 +312,15 @@ fn run_optimize(result_path: &Path, config: &Config, stats: &corpus::CorpusStats
     let letters: String = (0..arrays.keys.len()).filter(|&i| center_mask >> i & 1 == 1).map(|i| arrays.keys[i]).collect();
     println!("[Center] least frequent {} letters forced into the center columns: {letters}", config.center_rare);
   }
-  let result_file = result_path.join(&config.result_file);
+  let result_file = result_path.join(config.result_file_for_mode());
   let result_file_str = result_file.to_str().context("Invalid result file path")?;
   let base_layouts = if !reset && result_file.exists() {
     let mut layouts = load_results(result_file_str)?;
-    // 공백을 그리드에 두던 예전 결과(27키)는 키 구성이 달라 시드로 쓰지 않음
+    // 키 구성이 다른 결과(스페이스 방식이 다를 때)는 시드로 쓰지 않음
     let before = layouts.len();
     layouts.retain(|l| l.key_count() == arrays.keys.len());
     if layouts.len() < before {
-      println!("[Results] skipped {} saved layouts with a different key set (old 27-key layouts with space)", before - layouts.len());
+      println!("[Results] skipped {} saved layouts with a different key set (made with the other space_key setting)", before - layouts.len());
     }
     // center_rare를 어기는 배열은 구역 안에서만 움직이는 SA로는 못 고치므로 시드로 쓰지 않음
     let before = layouts.len();
@@ -298,12 +339,12 @@ fn run_optimize(result_path: &Path, config: &Config, stats: &corpus::CorpusStats
   let best = sort_unique_layouts(combined, config.elites, &[], config.min_home_diff);
   save_results(&best, result_file_str)?;
   println!("\n[Results]");
-  print_results(&best, Some(&norm));
+  print_results(&best, Some((optimizer.corpus(), &precomp, &norm)));
   Ok(())
 }
 
 fn cmd_run(result_path: &Path, config: &Config, reset: bool) -> anyhow::Result<()> {
-  let stats = for_scoring(load_or_analyze(result_path, config, reset, true)?, config);
+  let stats = for_scoring(load_or_analyze(result_path, config, reset, scoring_parser(config))?, config);
   run_optimize(result_path, config, &stats, reset)
 }
 
@@ -334,7 +375,7 @@ fn main() -> anyhow::Result<()> {
   match cmd {
     Some("analyze")  => cmd_analyze(result_path, &config, reset),
     Some("optimize") => {
-      let stats = for_scoring(load_corpus(&result_path.join(&config.corpus_file), true)?, &config);
+      let stats = for_scoring(load_corpus(&result_path.join(&config.corpus_file), scoring_parser(&config))?, &config);
       run_optimize(result_path, &config, &stats, reset)
     },
     Some("run")      => cmd_run(result_path, &config, reset),
@@ -383,16 +424,66 @@ mod tests {
     assert_eq!(f.letters[26], 2);
   }
 
+  // 공백이 낀 n-gram이 하나도 없는지
+  fn no_space_ngrams(f: &FastCorpus) -> bool {
+    f.bigrams.iter().skip(26).step_by(CHARS).all(|&c| c == 0) && f.bigrams[26 * CHARS..27 * CHARS].iter().all(|&c| c == 0)
+      && f.trigrams.iter().enumerate().all(|(k, &c)| c == 0 || (k % CHARS != 26 && k / CHARS % CHARS != 26 && k / (CHARS * CHARS) != 26))
+  }
+
   #[test]
-  fn double_spaces_punctuation_and_edges_break_without_counting_space() {
-    for text in ["abc  De", "ab, cd", "ab ,cd", " ab ", "ab\tcd", "ab \ncd", "ab 1 cd"] {
-      let f = run(text);
-      assert_eq!(f.letters[26], 0, "{text:?}");
-      assert!(f.bigrams.iter().skip(26).step_by(CHARS).all(|&c| c == 0), "{text:?}");
-      assert!(f.bigrams[26 * CHARS..27 * CHARS].iter().all(|&c| c == 0), "{text:?}");
-    }
+  fn spaces_next_to_punctuation_are_presses_linked_to_letters_only() {
+    // 글자 _ 문장부호: b_, ab_ (문장부호는 n-gram에 넣지 않음)
+    let f = run("ab ,cd");
+    assert_eq!((f.letters[26], f.space_cases), (1, [0, 1, 0, 0, 0]));
+    assert_eq!((bi_s(&f, 'b', SP), tri_s(&f, 'a', 'b', SP), bi_s(&f, SP, 'c')), (1, 1, 0));
+    // 문장부호 _ 글자: _c, _cd (". The" → _t, _th)
+    let f = run("ab, cd");
+    assert_eq!((f.letters[26], f.space_cases), (1, [0, 1, 0, 0, 0]));
+    assert_eq!((bi_s(&f, SP, 'c'), tri_s(&f, SP, 'c', 'd'), bi_s(&f, 'b', SP)), (1, 1, 0));
+    // 숫자도 문장부호처럼
+    let f = run("ab 1 cd");
+    assert_eq!((f.letters[26], f.space_cases), (2, [0, 2, 0, 0, 0]));
+    assert_eq!((bi_s(&f, 'b', SP), bi_s(&f, SP, 'c'), tri_s(&f, 'b', SP, 'c')), (1, 1, 0));
+    // 문장부호 _ 문장부호: 누름만 셈
+    let f = run("ab. (cd");
+    assert_eq!((f.letters[26], f.space_cases), (1, [0, 0, 1, 0, 0]));
+    assert!(no_space_ngrams(&f));
+  }
+
+  #[test]
+  fn double_spaces_are_one_press_without_linking() {
     let f = run("abc  De");
+    assert_eq!((f.letters[26], f.space_cases), (1, [0, 0, 0, 1, 0]));
+    assert!(no_space_ngrams(&f));
     assert_eq!((bi(&f, "ab"), bi(&f, "bc"), tri(&f, "abc"), bi(&f, "cd"), bi(&f, "de")), (1, 1, 1, 0, 1));
+    let f = run("ab,   cd");
+    assert_eq!((f.letters[26], f.space_cases), (1, [0, 0, 0, 1, 0]));
+    assert!(no_space_ngrams(&f));
+  }
+
+  #[test]
+  fn spaces_at_line_edges_or_next_to_markup_are_not_counted() {
+    for (text, cases) in [(" ab ", 2), ("ab \ncd", 1), ("ab\n cd", 1), ("ab | cd", 2), ("ab =cd", 1), ("ab\tcd", 0)] {
+      let f = run(text);
+      assert_eq!((f.letters[26], f.space_cases), (0, [0, 0, 0, 0, cases]), "{text:?}");
+      assert!(no_space_ngrams(&f), "{text:?}");
+    }
+  }
+
+  #[test]
+  fn letter_space_letter_counts_match_a_direct_scan() {
+    // 엄지 방식이 쓰는 "a _ c"는 v4와 같은 규칙: 양옆이 글자인 공백 하나
+    let text = crate::test_util::TEXT.repeat(2) + " A few, odd  spaces; and an I here. x y z (q) 3 dogs";
+    let f = run(&text);
+    let b = text.as_bytes();
+    let mut want = vec![0u64; 26 * 26];
+    for i in 1..b.len() - 1 {
+      if b[i] == b' ' && b[i - 1].is_ascii_alphabetic() && b[i + 1].is_ascii_alphabetic() {
+        want[id(b[i - 1].to_ascii_lowercase() as char) * 26 + id(b[i + 1].to_ascii_lowercase() as char)] += 1;
+      }
+    }
+    for a in 0..26 { for c in 0..26 { assert_eq!(f.trigrams[(a * CHARS + 26) * CHARS + c], want[a * 26 + c]); } }
+    assert_eq!(f.letters[26], f.space_cases[..4].iter().sum::<u64>());
   }
 
   #[test]
@@ -467,13 +558,17 @@ mod tests {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("corpus.bin");
     let stats = crate::test_util::stats();
-    stats.save(path.to_str().unwrap(), super::MIN_SCORING_PARSER - 1).unwrap();
-    let err = super::load_corpus(&path, true).unwrap_err().to_string();
-    assert!(err.contains("before spaces were counted") && err.contains("analyze --reset"), "{err}");
+    stats.save(path.to_str().unwrap(), super::MIN_THUMB_PARSER - 1).unwrap();
+    let err = super::load_corpus(&path, super::MIN_THUMB_PARSER).unwrap_err().to_string();
+    assert!(err.contains("does not count spaces") && err.contains("analyze --reset"), "{err}");
     // 통계만 볼 때(analyze)는 읽힘
-    assert_eq!(super::load_corpus(&path, false).unwrap(), stats);
+    assert_eq!(super::load_corpus(&path, 0).unwrap(), stats);
+    // 엄지 방식은 v4부터, 스페이스를 배열에 두면 v5부터
+    stats.save(path.to_str().unwrap(), super::MIN_THUMB_PARSER).unwrap();
+    assert_eq!(super::load_corpus(&path, super::MIN_THUMB_PARSER).unwrap(), stats);
+    assert!(super::load_corpus(&path, super::MIN_GRID_PARSER).is_err());
     stats.save(path.to_str().unwrap(), crate::dump::PARSER_VERSION).unwrap();
-    assert_eq!(super::load_corpus(&path, true).unwrap(), stats);
+    assert_eq!(super::load_corpus(&path, super::MIN_GRID_PARSER).unwrap(), stats);
     std::fs::remove_dir_all(&dir).unwrap();
   }
 

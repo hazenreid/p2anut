@@ -126,6 +126,7 @@ struct Checkpoint {
   letters: Vec<u64>,
   bigrams: Vec<u64>,
   trigrams: Vec<u64>,
+  space_cases: Vec<u64>,
 }
 
 impl Checkpoint {
@@ -162,7 +163,7 @@ pub fn analyze_file_parallel(path: &Path, sample: f64, checkpoint: &Path) -> any
     println!("[Wikipedia Dump] ignoring {} (different dump, parser or sample)", checkpoint.display());
   }
   let (boundaries, progress) = if let Some(c) = resumed {
-    let stats = FastCorpus::from_vecs(&c.letters, &c.bigrams, &c.trigrams)?;
+    let stats = FastCorpus::from_vecs(&c.letters, &c.bigrams, &c.trigrams, &c.space_cases)?;
     let done_n = c.done.iter().filter(|&&d| d).count();
     println!("[Wikipedia Dump] resuming: {done_n}/{} chunks already done (delete {} to start over)", c.done.len(), checkpoint.display());
     (c.boundaries, Progress { stats, counts: c.counts, done: c.done })
@@ -191,10 +192,10 @@ pub fn analyze_file_parallel(path: &Path, sample: f64, checkpoint: &Path) -> any
     p.stats.merge(&stats);
     p.counts.add(&counts);
     p.done[k] = true;
-    let (letters, bigrams, trigrams) = p.stats.to_vecs();
+    let (letters, bigrams, trigrams, space_cases) = p.stats.to_vecs();
     Checkpoint {
       parser_version: dump::PARSER_VERSION, dump_len: len, sample_bits: sample.to_bits(),
-      boundaries: boundaries.clone(), done: p.done.clone(), counts: p.counts, letters, bigrams, trigrams,
+      boundaries: boundaries.clone(), done: p.done.clone(), counts: p.counts, letters, bigrams, trigrams, space_cases,
     }.save(checkpoint)?;
     let done_n = p.done.iter().filter(|&&d| d).count();
     print!("\r[Wikipedia Dump] {done_n}/{total} chunks ({:.1}%), {} articles          ",
@@ -296,11 +297,11 @@ mod tests {
     let (s0, c0) = analyze_range(&path, b[0], b[1], 1.0).unwrap();
     let mut doubled = s0.clone();
     doubled.merge(&s0);
-    let (letters, bigrams, trigrams) = doubled.to_vecs();
+    let (letters, bigrams, trigrams, space_cases) = doubled.to_vecs();
     let mut done = vec![false; n];
     done[0] = true;
     let checkpoint = Checkpoint { parser_version: dump::PARSER_VERSION, dump_len: len, sample_bits: 1.0f64.to_bits(),
-      boundaries: b.clone(), done, counts: c0, letters, bigrams, trigrams };
+      boundaries: b.clone(), done, counts: c0, letters, bigrams, trigrams, space_cases };
     checkpoint.save(&cp).unwrap();
 
     let (seq, _) = analyze_sequential(&data[..], 1.0, 0).unwrap();

@@ -1,5 +1,8 @@
 corpus_file = "corpus.bin"
 result_file = "result.bin"
+# 스페이스 위치: "thumb" = 엄지 키 (배열 밖, 기본), "grid" = 3×10 배열 안에 27번째 키로 함께 배치.
+# grid 결과는 result_file 이름에 -grid를 붙여 따로 저장 (result.bin → result-grid.bin). grid는 파서 v5 이상 코퍼스가 필요
+space_key = "thumb"
 elites = 5
 # 각 손(왼손·오른손)이 최소 이 비율 이상 치면 감점 없음 (0.45 = 45~55%)
 min_hand_usage = 0.45

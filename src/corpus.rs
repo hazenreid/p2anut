@@ -61,7 +61,18 @@ pub struct FastCorpus {
   pub letters: Box<[u64; CHARS]>,
   pub bigrams: Box<[u64; CHARS * CHARS]>,
   pub trigrams: Box<[u64]>,
+  // 공백(연속 공백은 하나로)을 양옆에 따라 나눈 개수. 확인용이며 코퍼스 파일에는 저장하지 않음 (SPACE_CASES 순서)
+  pub space_cases: [u64; SPACE_CASES.len()],
 }
+
+// 공백 경우: 앞 2개는 n-gram도 셈(글자와 이어짐), 다음 2개는 누름 횟수만, 마지막은 세지 않음
+pub const SPACE_CASES: [&str; 5] = [
+  "letter _ letter",
+  "letter _ punctuation/digit (or the reverse)",
+  "punctuation/digit _ punctuation/digit",
+  "double spaces (one press, not linked)",
+  "not counted (line start/end, markup or other symbols)",
+];
 
 impl FastCorpus {
   pub fn new() -> Self {
@@ -69,6 +80,7 @@ impl FastCorpus {
       letters: Box::new([0; CHARS]),
       bigrams: Box::new([0; CHARS * CHARS]),
       trigrams: vec![0u64; CHARS * CHARS * CHARS].into_boxed_slice(),
+      space_cases: [0; SPACE_CASES.len()],
     }
   }
 
@@ -92,21 +104,33 @@ impl FastCorpus {
     for (a, b) in self.letters.iter_mut().zip(other.letters.iter()) { *a += b; }
     for (a, b) in self.bigrams.iter_mut().zip(other.bigrams.iter()) { *a += b; }
     for (a, b) in self.trigrams.iter_mut().zip(other.trigrams.iter()) { *a += b; }
+    for (a, b) in self.space_cases.iter_mut().zip(other.space_cases.iter()) { *a += b; }
   }
 
   // 중간 저장용 (고정 길이 배열은 serde가 직접 못 다뤄서 Vec으로)
-  pub fn to_vecs(&self) -> (Vec<u64>, Vec<u64>, Vec<u64>) {
-    (self.letters.to_vec(), self.bigrams.to_vec(), self.trigrams.to_vec())
+  pub fn to_vecs(&self) -> (Vec<u64>, Vec<u64>, Vec<u64>, Vec<u64>) {
+    (self.letters.to_vec(), self.bigrams.to_vec(), self.trigrams.to_vec(), self.space_cases.to_vec())
   }
 
-  pub fn from_vecs(letters: &[u64], bigrams: &[u64], trigrams: &[u64]) -> anyhow::Result<Self> {
-    anyhow::ensure!(letters.len() == CHARS && bigrams.len() == CHARS * CHARS && trigrams.len() == CHARS * CHARS * CHARS,
-      "corpus array sizes do not match");
+  pub fn from_vecs(letters: &[u64], bigrams: &[u64], trigrams: &[u64], space_cases: &[u64]) -> anyhow::Result<Self> {
+    anyhow::ensure!(letters.len() == CHARS && bigrams.len() == CHARS * CHARS && trigrams.len() == CHARS * CHARS * CHARS
+      && space_cases.len() == SPACE_CASES.len(), "corpus array sizes do not match");
     let mut f = Self::new();
     f.letters.copy_from_slice(letters);
     f.bigrams.copy_from_slice(bigrams);
     f.trigrams.copy_from_slice(trigrams);
+    f.space_cases.copy_from_slice(space_cases);
     Ok(f)
+  }
+
+  // 분석 뒤 공백 경우별 개수 출력 (공백 규칙이 생각대로 동작하는지 확인용)
+  pub fn print_space_cases(&self) {
+    let letters: u64 = self.letters[..26].iter().sum();
+    let per = |n: u64| n as f64 * 100.0 / letters.max(1) as f64;
+    println!("[Spaces] presses per 100 letters by neighbours:");
+    for (name, &n) in SPACE_CASES.iter().zip(&self.space_cases) {
+      println!("  {name:<55} {:>6.2}  ({n})", per(n));
+    }
   }
 
   pub fn into_stats(self) -> CorpusStats {
@@ -142,11 +166,13 @@ impl CorpusStats {
     }
   }
 
-  // 배치할 키는 a-z 26개. 공백은 엄지 키라 그리드에 두지 않으므로, 공백이 낀 빅/트라이그램은 nz_bigrams·nz_trigrams에서 빼고
-  // "a _ c" 창만 nz_cross로 따로 둠
-  pub fn to_arrays(&self) -> CorpusArrays {
-    let keys: Vec<char> = ('a'..='z').collect();
-    let lu = |ch: char| ch.is_ascii_lowercase().then(|| ch as u8 - b'a');
+  // space_on_grid = false: 배치할 키는 a-z 26개. 공백은 엄지 키라 그리드에 두지 않으므로, 공백이 낀 빅/트라이그램은
+  // nz_bigrams·nz_trigrams에서 빼고 "a _ c" 창만 nz_cross로 따로 둠.
+  // true: 공백도 배치할 키(id 26, 27번째 키)라 공백이 낀 n-gram을 모두 일반 n-gram으로 씀 (nz_cross는 비움)
+  pub fn to_arrays(&self, space_on_grid: bool) -> CorpusArrays {
+    let keys: Vec<char> = ('a'..='z').chain(space_on_grid.then_some(' ')).collect();
+    let letter = |ch: char| ch.is_ascii_lowercase().then(|| ch as u8 - b'a');
+    let lu = |ch: char| if ch == ' ' && space_on_grid { Some(26) } else { letter(ch) };
 
     let mut freq = vec![0u64; CHARS].into_boxed_slice();
     for (&ch, &cnt) in &self.letters {
@@ -170,10 +196,12 @@ impl CorpusStats {
     let (bigram_flat, bigram_offsets) = index_lists(nz_bigrams.iter().map(|&(a, b, _)| vec![a, b]));
     let (trigram_flat, trigram_offsets) = index_lists(nz_trigrams.iter().map(|&(a, b, c, _)| vec![a, b, c]));
 
-    let mut nz_cross: Vec<(u8, u8, u64)> = self.trigrams.iter()
-      .filter(|&(&(_, b, _), _)| b == ' ')
-      .filter_map(|(&(a, _, c), &cnt)| Some((lu(a)?, lu(c)?, cnt)))
-      .collect();
+    let mut nz_cross: Vec<(u8, u8, u64)> = if space_on_grid { Vec::new() } else {
+      self.trigrams.iter()
+        .filter(|&(&(_, b, _), _)| b == ' ')
+        .filter_map(|(&(a, _, c), &cnt)| Some((letter(a)?, letter(c)?, cnt)))
+        .collect()
+    };
     nz_cross.sort_unstable_by_key(|&(a, c, _)| (a, c));
     let (cross_flat, cross_offsets) = index_lists(nz_cross.iter().map(|&(a, c, _)| vec![a, c]));
 
@@ -259,7 +287,9 @@ impl CorpusStats {
       println!("  {}: {:>12}  ({:.2}%)", ch, count, **count as f64 / total_letters as f64 * 100.0);
     }
     let spaces = self.letters.get(&' ').copied().unwrap_or(0);
-    println!("  space between letters (thumb): {spaces:>12}  ({:.1} per 100 letters)", spaces as f64 / total_letters.max(1) as f64 * 100.0);
+    let between: u64 = self.trigrams.iter().filter(|(k, _)| k.1 == ' ' && k.0 != ' ' && k.2 != ' ').map(|(_, n)| n).sum();
+    let per = |n: u64| n as f64 / total_letters.max(1) as f64 * 100.0;
+    println!("  space presses: {spaces:>12}  ({:.1} per 100 letters; between two letters {:.1})", per(spaces), per(between));
 
     fn top<K: Ord + Clone>(map: &HashMap<K, u64>, pick: impl Fn(&K) -> bool) -> Vec<(K, u64)> {
       let mut v: Vec<(K, u64)> = map.iter().filter(|(k, _)| pick(k)).map(|(k, &n)| (k.clone(), n)).collect();
@@ -363,16 +393,16 @@ mod tests {
     crate::analyze_bytes(b"hello world\nother text", &mut both);
     a.merge(&b);
     assert_eq!(a, both);
-    let (l, bi, tri) = a.to_vecs();
-    assert_eq!(FastCorpus::from_vecs(&l, &bi, &tri).unwrap(), a);
-    assert!(FastCorpus::from_vecs(&l[..3], &bi, &tri).is_err());
+    let (l, bi, tri, sp) = a.to_vecs();
+    assert_eq!(FastCorpus::from_vecs(&l, &bi, &tri, &sp).unwrap(), a);
+    assert!(FastCorpus::from_vecs(&l[..3], &bi, &tri, &sp).is_err());
   }
 
   #[test]
   fn cross_space_pairs_come_from_letter_space_letter_windows() {
     let mut f = FastCorpus::new();
     crate::analyze_bytes(b"the end. a cat at sea", &mut f);
-    let a = f.into_stats().to_arrays();
+    let a = f.into_stats().to_arrays(false);
     let id = |c: char| c as u8 - b'a';
     let get = |x: char, y: char| a.nz_cross.iter().find(|&&(p, q, _)| (p, q) == (id(x), id(y))).map_or(0, |e| e.2);
     // e_e, a_c, t_a(cat at), t_s(at sea). 마침표 뒤 공백은 세지 않음 (d_a 없음)
@@ -383,13 +413,28 @@ mod tests {
     assert_eq!(list('e').len(), 1);
     assert_eq!(list('t').len(), 2);
     assert!(list('z').is_empty());
-    assert!(!crate::test_util::stats().to_arrays().nz_cross.is_empty());
+    assert!(!crate::test_util::stats().to_arrays(false).nz_cross.is_empty());
+  }
+
+  #[test]
+  fn space_on_grid_is_the_27th_key() {
+    let stats = crate::test_util::stats();
+    let g = stats.to_arrays(true);
+    assert_eq!(g.keys.len(), 27);
+    assert_eq!(g.keys[26], ' ');
+    assert_eq!(g.freq[26], stats.letters[&' ']);
+    assert!(g.nz_cross.is_empty());
+    // 공백이 낀 n-gram이 일반 n-gram으로 들어감, 글자끼리는 그대로
+    let spaced = stats.bigrams.keys().filter(|k| k.0 == ' ' || k.1 == ' ').count();
+    assert_eq!(g.nz_bigrams.len(), stats.to_arrays(false).nz_bigrams.len() + spaced);
+    assert!(g.nz_trigrams.iter().any(|&(a, b, c, _)| b == 26 && a < 26 && c < 26));
+    assert!(g.bigram_offsets[27] > g.bigram_offsets[26]);
   }
 
   #[test]
   fn to_arrays_places_letters_and_keeps_space_out_of_the_grid() {
     let stats = crate::test_util::stats();
-    let a = stats.to_arrays();
+    let a = stats.to_arrays(false);
     assert_eq!(a.keys, ('a'..='z').collect::<Vec<_>>());
     assert_eq!(a.freq[26], 0);
     assert!(a.nz_bigrams.iter().all(|&(x, y, _)| x < 26 && y < 26));

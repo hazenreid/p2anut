@@ -108,9 +108,10 @@ impl Layout {
     }
   }
 
-  // 배열 텍스트 읽기: 행마다 10칸, 글자는 a-z, 빈칸은 '.' 또는 '_'(예전 출력). 공백은 무시 (print() 출력도 그대로 읽힘).
-  // 빈 줄은 건너뛰고, 정확히 3행이어야 하며 각 글자는 한 번씩만
-  pub fn parse(text: &str) -> anyhow::Result<Self> {
+  // 배열 텍스트 읽기: 행마다 10칸, 글자는 a-z, 빈칸은 '.'. 공백은 무시 (print() 출력도 그대로 읽힘).
+  // '_'는 grid(스페이스를 배열에 둠)면 스페이스 키, 아니면 빈칸 (예전 출력은 빈칸을 '_'로 씀).
+  // 빈 줄은 건너뛰고, 정확히 3행이어야 하며 각 키는 한 번씩만
+  pub fn parse(text: &str, grid: bool) -> anyhow::Result<Self> {
     let rows: Vec<Vec<char>> = text.lines()
       .map(|l| l.chars().filter(|c| !c.is_whitespace()).collect::<Vec<char>>())
       .filter(|r| !r.is_empty())
@@ -121,10 +122,10 @@ impl Layout {
       anyhow::ensure!(row.len() == COLS, "row {} must have {COLS} keys, found {}: {}", r + 1, row.len(), row.iter().collect::<String>());
       for (c, &ch) in row.iter().enumerate() {
         let ch = ch.to_ascii_lowercase();
-        if ch == '.' || ch == '_' { continue; }
-        anyhow::ensure!(ch.is_ascii_lowercase(), "unexpected character {ch:?} in row {}", r + 1);
-        let id = ch as u8 - b'a';
-        anyhow::ensure!(l.pos[id as usize] == EMPTY, "letter {ch} appears more than once");
+        if ch == '.' || (ch == '_' && !grid) { continue; }
+        anyhow::ensure!(ch.is_ascii_lowercase() || ch == '_', "unexpected character {ch:?} in row {}", r + 1);
+        let id = if ch == '_' { crate::SPACE_ID } else { ch as u8 - b'a' };
+        anyhow::ensure!(l.pos[id as usize] == EMPTY, "key {ch} appears more than once");
         let p = r * COLS + c;
         l.slots[p] = id;
         l.pos[id as usize] = p as u8;
@@ -175,8 +176,9 @@ impl Layout {
   // 창 기준 통계: 세 키(공백은 엄지)를 하나씩 밀며 나눈 분류의 비율. 스킵그램은 다른 분류와 겹쳐서 따로 셈
   fn print_window_stats(&self, precomp: &Precomp, windows: &[(u8, u8, u8, u64)]) {
     use crate::precomp::{finger, Window};
+    let thumb = self.pos[crate::SPACE_ID as usize] == EMPTY;
     let at = |id: u8| -> Option<Option<usize>> {
-      if id as usize == crate::SPACE_ID as usize { return Some(None); } // 엄지
+      if id == crate::SPACE_ID && thumb { return Some(None); } // 엄지
       let p = self.pos[id as usize];
       (p != EMPTY).then_some(Some(p as usize))
     };
@@ -196,7 +198,8 @@ impl Layout {
       }
     }
     let pct = |a: u64| if total == 0 { 0.0 } else { a as f64 * 100.0 / total as f64 };
-    println!("windows (space = thumb): alternate={:.1}%  roll2 in={:.1}% out={:.1}%  roll3 in={:.1}% out={:.1}%  redirect={:.2}%  bad-redirect={:.2}%  same-hand-other={:.1}%  skipgram={:.2}% (across space {:.2}%)",
+    let mode = if thumb { "space = thumb" } else { "space on the grid" };
+    println!("windows ({mode}): alternate={:.1}%  roll2 in={:.1}% out={:.1}%  roll3 in={:.1}% out={:.1}%  redirect={:.2}%  bad-redirect={:.2}%  same-hand-other={:.1}%  skipgram={:.2}% (across space {:.2}%)",
       pct(counts[0]), pct(counts[1]), pct(counts[2]), pct(counts[3]), pct(counts[4]), pct(counts[5]), pct(counts[6]), pct(counts[7]),
       pct(skip), pct(skip_space));
   }
@@ -282,7 +285,7 @@ impl Layout {
       let mut s = String::new();
       for c in 0..COLS {
         let char_idx = self.slots[r * COLS + c];
-        let ch = if char_idx < 26 { (b'a' + char_idx) as char } else { '.' };
+        let ch = key_char(char_idx);
         if c == 5 { s.push_str("  "); }
         s.push(' ');
         s.push(ch);
@@ -291,8 +294,37 @@ impl Layout {
     }
   }
 
-  // 글자 100개당 항목별 비용 (손 비율 감점이 있으면 함께)
-  pub fn print_goodness(&self, norm: &ScoreNorm) {
+  // 스페이스를 배열에 뒀을 때 그 몫의 비용 (글자 100개당, 총점에 이미 들어 있음): 스페이스 누름의 노력과
+  // 스페이스가 낀 빅/트라이그램의 sfb·시저스·롤. 엄지 방식이면 None
+  pub fn space_cost(&self, corpus: &CorpusArrays, precomp: &Precomp, norm: &ScoreNorm) -> Option<f64> {
+    let sp = crate::SPACE_ID;
+    let ps = self.pos[sp as usize];
+    if ps == EMPTY { return None; }
+    let mut sc = Score { effort: precomp.effort(ps as usize, sp as usize), ..Score::default() };
+    for &(a, b, n) in &corpus.nz_bigrams {
+      if a != sp && b != sp { continue; }
+      let (p1, p2) = (self.pos[a as usize], self.pos[b as usize]);
+      if p1 == EMPTY || p2 == EMPTY { continue; }
+      let e = precomp.bigram(p1 as usize, p2 as usize);
+      sc.sfb += n as f64 * f64::from(e.sfb_base);
+      sc.rolling += n as f64 * f64::from(e.rolling_base);
+      sc.scissors += n as f64 * f64::from(e.scissors_base);
+    }
+    for &(a, b, c, n) in &corpus.nz_trigrams {
+      if a != sp && b != sp && c != sp { continue; }
+      let (p1, p2, p3) = (self.pos[a as usize], self.pos[b as usize], self.pos[c as usize]);
+      if p1 == EMPTY || p2 == EMPTY || p3 == EMPTY { continue; }
+      let e = precomp.trigram(p1 as usize, p2 as usize, p3 as usize);
+      sc.sfb += n as f64 * f64::from(e.sfs_base);
+      sc.rolling += n as f64 * f64::from(e.roll_base);
+      sc.scissors += n as f64 * f64::from(e.skip_scissors_base);
+    }
+    let c = norm.cost_breakdown(&sc);
+    Some(c.effort + c.sfb + c.scissors + c.rolling)
+  }
+
+  // 글자 100개당 항목별 비용 (손 비율 감점이 있으면 함께, 스페이스를 배열에 두면 그 몫도 따로)
+  pub fn print_goodness(&self, norm: &ScoreNorm, corpus: &CorpusArrays, precomp: &Precomp) {
     if self.total <= PENALTY_SCORE {
       println!("DISQUALIFIED: one hand types less than hand_hard_limit (costs below are for reference only)");
     }
@@ -300,7 +332,8 @@ impl Layout {
     let hand = norm.hand_cost(self.left_usage, self.right_usage);
     let total = c.effort + c.sfb + c.rolling + c.scissors + hand;
     let hand_part = if hand > 0.0 { format!("  hand-balance={hand:.1}") } else { String::new() };
-    println!("total={total:.1}  effort={:.1}  sfb={:.1}  scissors={:.1}  rolling={:.1}{hand_part}", c.effort, c.sfb, c.scissors, c.rolling);
+    let space_part = self.space_cost(corpus, precomp, norm).map_or(String::new(), |sp| format!("  (space key {sp:.1} of the total)"));
+    println!("total={total:.1}  effort={:.1}  sfb={:.1}  scissors={:.1}  rolling={:.1}{hand_part}{space_part}", c.effort, c.sfb, c.scissors, c.rolling);
   }
 
   pub fn calc_total_score(&mut self, norm: &ScoreNorm) {
@@ -332,6 +365,11 @@ impl Layout {
   }
 }
 
+// 배열 출력용 글자: a-z, 스페이스 '_', 빈칸 '.'
+pub fn key_char(id: u8) -> char {
+  if id < 26 { (b'a' + id) as char } else if id == crate::SPACE_ID { '_' } else { '.' }
+}
+
 // 쓰는 도중에 강제 종료돼도 기존 결과가 깨지지 않게 임시 파일에 쓰고 바꿔치기
 pub fn save_results(layouts: &[Layout], path: &str) -> anyhow::Result<()> {
   let bytes = bincode::serialize(layouts)?;
@@ -361,7 +399,8 @@ const REF_MIDDLE_BOTTOM: usize = 2 * COLS + 2;
 // [costs]의 대표 사건 비용을 원래 점수 1단위당 비용으로 환산
 pub fn abs_weights(arrays: &CorpusArrays, precomp: &Precomp, c: &crate::config::Costs) -> crate::score::AbsWeights {
   let per = |cost: f32, base: f32| if base > 0.0 { f64::from(cost) / f64::from(base) } else { 0.0 };
-  let letters: u64 = arrays.freq.iter().sum();
+  // 비용은 글자(a-z) 100개당. 스페이스를 배열에 두면 스페이스 누름 비용도 이 분모로 나눔
+  let letters: u64 = arrays.freq.iter().take(26).sum();
   crate::score::AbsWeights {
     effort: f64::from(c.effort),
     sfb: per(c.sfb, precomp.bigram(REF_INDEX_HOME, REF_INDEX_TOP).sfb_base),
@@ -441,7 +480,7 @@ mod tests {
 
   #[test]
   fn cross_space_pairs_add_to_sfb_and_scissors_only() {
-    let arrays = test_util::stats().to_arrays();
+    let arrays = test_util::stats().to_arrays(false);
     assert!(!arrays.nz_cross.is_empty());
     let mut no_cross = arrays.clone();
     no_cross.nz_cross.clear();
@@ -466,7 +505,7 @@ mod tests {
   #[test]
   fn sort_unique_respects_min_diff() {
     let stats = test_util::stats();
-    let arrays = stats.to_arrays();
+    let arrays = stats.to_arrays(false);
     let (precomp, norm) = test_util::precomp_norm(&stats);
     let layouts: Vec<Layout> = (0..50).map(|_| {
       let mut l = Layout::make_random(&arrays.keys, &[], 0);
@@ -481,24 +520,64 @@ mod tests {
 
   #[test]
   fn parse_reads_files_and_print_output() {
-    let l = Layout::parse(".blyx.foup\nmanijzreht\ncgkdq.s.vw\n").unwrap();
+    let l = Layout::parse(".blyx.foup\nmanijzreht\ncgkdq.s.vw\n", false).unwrap();
     assert_eq!(l.key_count(), 26);
     l.assert_invariants();
     assert_eq!(l.slots[1], b'b' - b'a');
     assert_eq!(l.slots[COLS], b'm' - b'a');
     assert_eq!(l.slots[5], EMPTY);
-    // print() 형식(공백, 가운데 간격, '_')도 읽힘
-    let printed = Layout::parse(" . b l y x   _ f o u p\n m a n i j   z r e h t\n\n c g k d q   . s . v w").unwrap();
+    // print() 형식(공백, 가운데 간격)과 예전 출력의 빈칸 '_'도 읽힘
+    let printed = Layout::parse(" . b l y x   _ f o u p\n m a n i j   z r e h t\n\n c g k d q   . s . v w", false).unwrap();
     assert_eq!(printed.slots, l.slots);
-    assert!(Layout::parse("abc").is_err());
-    assert!(Layout::parse(".blyx.foup\nmanijzreht\ncgkdq.s.va\n").err().unwrap().to_string().contains("more than once"));
-    assert!(Layout::parse(".blyx.foup\nmanijzreht\ncgkdq.s.v\n").is_err());
+    assert!(Layout::parse("abc", false).is_err());
+    assert!(Layout::parse(".blyx.foup\nmanijzreht\ncgkdq.s.va\n", false).err().unwrap().to_string().contains("more than once"));
+    assert!(Layout::parse(".blyx.foup\nmanijzreht\ncgkdq.s.v\n", false).is_err());
+  }
+
+  #[test]
+  fn grid_mode_reads_and_prints_underscore_as_space() {
+    let g = Layout::parse(".blyx_foup\nmanijzreht\ncgkdq.s.vw\n", true).unwrap();
+    assert_eq!(g.key_count(), 27);
+    g.assert_invariants();
+    assert_eq!((g.slots[5], g.pos[crate::SPACE_ID as usize]), (crate::SPACE_ID, 5));
+    assert_eq!(key_char(g.slots[5]), '_');
+    assert_eq!(key_char(g.slots[0]), '.');
+    // 같은 파일을 엄지 방식으로 읽으면 '_'는 빈칸
+    assert_eq!(Layout::parse(".blyx_foup\nmanijzreht\ncgkdq.s.vw\n", false).unwrap().key_count(), 26);
+    assert!(Layout::parse("_blyx_foup\nmanijzreht\ncgkdq.s.vw\n", true).err().unwrap().to_string().contains("more than once"));
+  }
+
+  #[test]
+  fn space_cost_is_the_part_of_the_total_that_the_space_key_adds() {
+    let stats = test_util::stats();
+    let g = stats.to_arrays(true);
+    let (precomp, norm) = test_util::precomp_norm_for(&g);
+    // 비용 분모는 글자 수: 스페이스를 배열에 둬도 엄지 방식과 같음
+    let t = stats.to_arrays(false);
+    let (tp, _) = test_util::precomp_norm_for(&t);
+    assert_eq!(abs_weights(&g, &precomp, &crate::config::Costs::default()).per_letter,
+      abs_weights(&t, &tp, &crate::config::Costs::default()).per_letter);
+    let cost = |l: &Layout| { let c = norm.cost_breakdown(&l.score); c.effort + c.sfb + c.scissors + c.rolling };
+    for _ in 0..20 {
+      let mut l = Layout::make_random(&g.keys, &[], 0);
+      l.calc_scores(&g, &precomp);
+      let space = l.space_cost(&g, &precomp, &norm).unwrap();
+      // 스페이스를 빼면 그 몫만큼 줄어듦
+      let mut without = l;
+      without.slots[l.pos[crate::SPACE_ID as usize] as usize] = EMPTY;
+      without.pos[crate::SPACE_ID as usize] = EMPTY;
+      without.calc_scores(&g, &precomp);
+      assert!((cost(&l) - cost(&without) - space).abs() < 1e-9 * cost(&l).abs().max(1.0), "{} {} {space}", cost(&l), cost(&without));
+      assert!(without.space_cost(&g, &precomp, &norm).is_none());
+      // 손 비율에 스페이스 누름도 들어감
+      assert_eq!(l.left_usage + l.right_usage, g.freq.iter().sum::<u64>());
+    }
   }
 
   #[test]
   fn absolute_costs_match_reference_events() {
     let stats = test_util::stats();
-    let arrays = stats.to_arrays();
+    let arrays = stats.to_arrays(false);
     let (precomp, _) = test_util::precomp_norm_for(&arrays);
     let c = crate::config::Costs::default();
     let a = abs_weights(&arrays, &precomp, &c);
@@ -510,13 +589,13 @@ mod tests {
     // 대표 사건이 실제로 그 종류인지
     assert!(precomp.bigram(REF_MIDDLE_BOTTOM, REF_INDEX_TOP).rolling_base == 0.0);
     assert!(precomp.bigram(REF_MIDDLE_HOME, REF_INDEX_HOME).scissors_base == 0.0);
-    assert!((a.per_letter * arrays.freq.iter().sum::<u64>() as f64 - 1.0).abs() < 1e-12);
+    assert!((a.per_letter * arrays.freq.iter().take(26).sum::<u64>() as f64 - 1.0).abs() < 1e-12);
   }
 
   #[test]
   fn changing_effort_keeps_reference_event_costs() {
     let stats = test_util::stats();
-    let arrays = stats.to_arrays();
+    let arrays = stats.to_arrays(false);
     let costs = crate::config::Costs::default();
     let mut effort = crate::config::EffortGrid::default();
     let base = Precomp::new(&arrays.freq, &test_util::weights(), &costs, &effort, 0.45);
@@ -541,7 +620,7 @@ mod tests {
   #[test]
   fn absolute_mode_ranks_by_lower_cost() {
     let stats = test_util::stats();
-    let arrays = stats.to_arrays();
+    let arrays = stats.to_arrays(false);
     let (precomp, _) = test_util::precomp_norm_for(&arrays);
     let norm = init_score_norm(&arrays, &precomp, &crate::config::Costs::default(), crate::score::HandRule::default());
     let mut ls: Vec<Layout> = (0..30).map(|_| {
@@ -559,7 +638,7 @@ mod tests {
 
   #[test]
   fn soft_hand_limit_penalizes_instead_of_disqualifying() {
-    let arrays = test_util::stats().to_arrays();
+    let arrays = test_util::stats().to_arrays(false);
     let (precomp, norm) = test_util::precomp_norm_soft_hand(&arrays);
     let (mut soft_seen, mut hard_seen) = (false, false);
     for _ in 0..3000 {
@@ -592,7 +671,7 @@ mod tests {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("result.bin");
     let path = path.to_str().unwrap();
-    let ls = vec![Layout::make_random(&test_util::stats().to_arrays().keys, &[], 0); 2];
+    let ls = vec![Layout::make_random(&test_util::stats().to_arrays(false).keys, &[], 0); 2];
     save_results(&ls, path).unwrap();
     save_results(&ls[..1], path).unwrap();
     assert_eq!(load_results(path).unwrap().len(), 1);
@@ -603,7 +682,7 @@ mod tests {
   #[test]
   fn penalized_layout_keeps_real_scores_and_recovers() {
     let stats = test_util::stats();
-    let arrays = stats.to_arrays();
+    let arrays = stats.to_arrays(false);
     let (precomp, norm) = test_util::precomp_norm(&stats);
     let (mut checked, mut sides) = (0, [false; 2]);
     for _ in 0..1000 {
