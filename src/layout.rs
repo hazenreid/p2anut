@@ -300,7 +300,7 @@ impl Layout {
     let hand = norm.hand_cost(self.left_usage, self.right_usage);
     let total = c.effort + c.sfb + c.rolling + c.scissors + hand;
     let hand_part = if hand > 0.0 { format!("  hand-balance={hand:.1}") } else { String::new() };
-    println!("cost per 100 letters (lower is better): total={total:.1}  effort={:.1}  sfb={:.1}  scissors={:.1}  rolling={:.1}{hand_part}", c.effort, c.sfb, c.scissors, c.rolling);
+    println!("total={total:.1}  effort={:.1}  sfb={:.1}  scissors={:.1}  rolling={:.1}{hand_part}", c.effort, c.sfb, c.scissors, c.rolling);
   }
 
   pub fn calc_total_score(&mut self, norm: &ScoreNorm) {
