@@ -109,7 +109,7 @@ fn analyze_dump(result_path: &Path, config: &Config, corpus_path: &Path) -> anyh
   let checkpoint = std::path::PathBuf::from(format!("{}.partial", corpus_path.display()));
   // 중간 저장은 병렬 분석을 끝까지 마쳤을 때만 지움 (앞쪽 N개만 보는 빠른 확인이 전체 분석의 진행을 지우지 않도록)
   let mut parallel = false;
-  let (dump_stats, counts) = if let Some(dump_path) = config.dump_path(result_path) {
+  let (fast, counts) = if let Some(dump_path) = config.dump_path(result_path) {
     if !dump_path.exists() {
       if urls.is_empty() { anyhow::bail!("dump file {} not found and wikipedia_dump_url is empty", dump_path.display()); }
       if let Some(dir) = dump_path.parent() { fs::create_dir_all(dir)?; }
@@ -137,14 +137,9 @@ fn analyze_dump(result_path: &Path, config: &Config, corpus_path: &Path) -> anyh
   };
   println!("[Wikipedia Dump] used {} articles; skipped {} redirects, {} list/disambiguation pages, {} outside sample",
     counts.articles, counts.redirects, counts.lists, counts.sampled_out);
-  let wiki::DumpStats { letters: fast, punct } = dump_stats;
   fast.print_space_cases();
   let stats = fast.into_stats();
   stats.save(corpus_path.to_str().context("Invalid corpus path")?, dump::PARSER_VERSION)?;
-  // 같은 본문에서 센 영어 문장부호 코퍼스 (심볼 레이어용)
-  let english_path = result_path.join(&config.symbols.english_corpus_file);
-  punct.into_stats().save_with(english_path.to_str().context("Invalid corpus path")?, keycorpus::ENGLISH_MAGIC, keycorpus::ENGLISH_VERSION)?;
-  println!("[English Punctuation] saved {} (symbol layer corpus from the same articles)", english_path.display());
   if parallel && checkpoint.exists() { fs::remove_file(&checkpoint)?; }
   Ok(stats)
 }
@@ -167,16 +162,9 @@ fn load_corpus(corpus_path: &Path, min_parser: u32) -> anyhow::Result<CorpusStat
   Ok(stats)
 }
 
-// 전체 통계. 코퍼스 파일이 없거나 --reset이면 덤프를 분석해서 저장.
-// need_english: 영어 문장부호 코퍼스도 있어야 함 (analyze 명령). 없으면 덤프를 다시 분석해서 둘 다 저장
-fn load_or_analyze(result_path: &Path, config: &Config, reset: bool, min_parser: u32, need_english: bool) -> anyhow::Result<CorpusStats> {
+// 전체 통계. 코퍼스 파일이 없거나 --reset이면 덤프를 분석해서 저장
+fn load_or_analyze(result_path: &Path, config: &Config, reset: bool, min_parser: u32) -> anyhow::Result<CorpusStats> {
   let corpus_path = result_path.join(&config.corpus_file);
-  let english_path = result_path.join(&config.symbols.english_corpus_file);
-  if !reset && corpus_path.exists() && need_english && !english_path.exists() {
-    println!("[English Punctuation] {} not found: analyzing the dump again (it is counted in the same pass; {} is rebuilt with the same rules)",
-      english_path.display(), corpus_path.display());
-    return analyze_dump(result_path, config, &corpus_path);
-  }
   if !reset && corpus_path.exists() { load_corpus(&corpus_path, min_parser) } else { analyze_dump(result_path, config, &corpus_path) }
 }
 
@@ -196,7 +184,7 @@ fn print_results(results: &[layout::Layout], scoring: Option<(&corpus::CorpusArr
 }
 
 fn cmd_analyze(result_path: &Path, config: &Config, reset: bool) -> anyhow::Result<()> {
-  let stats = load_or_analyze(result_path, config, reset, 0, true)?;
+  let stats = load_or_analyze(result_path, config, reset, 0)?;
   let used = for_scoring(stats.clone(), config);
   // (글자끼리, 공백이 낀 것) 개수
   let split = |s: &CorpusStats| {
@@ -209,61 +197,43 @@ fn cmd_analyze(result_path: &Path, config: &Config, reset: bool) -> anyhow::Resu
   println!("letters: {}, bigrams: {b} letters-only + {bs} with space (scoring uses {ub} + {ubs} at {}% coverage), trigrams: {t} + {ts} (scoring uses {ut} + {uts} at {}% coverage)",
     stats.letters.keys().filter(|&&c| c != ' ').count(), config.bigram_coverage * 100.0, config.trigram_coverage * 100.0);
   stats.print();
-  let english_path = result_path.join(&config.symbols.english_corpus_file);
-  if english_path.exists() {
-    let (english, _) = CorpusStats::load_with(english_path.to_str().context("Invalid corpus path")?, keycorpus::ENGLISH_MAGIC)?;
-    println!("\n[English Punctuation] {} (symbols used by the symbol layer: {})", english_path.display(), config.symbols.english_punct);
-    keycorpus::print_summary(&english, Some(&config.symbols.english_punct));
-  }
   Ok(())
 }
 
-// 러스트 코드 코퍼스: code_dirs의 .rs 파일을 읽어 저장
+// 러스트 코드 코퍼스: code_crates를 crates.io에서 받아(<result_path>/crates, 의존성은 받지 않음) 세고 저장
 fn cmd_analyze_code(result_path: &Path, config: &Config) -> anyhow::Result<CorpusStats> {
   let s = &config.symbols;
-  println!("[Code Corpus] reading .rs files under {}", s.code_dirs.join(", "));
-  let (k, scan) = code::analyze_code(&s.code_dirs, &s.code_exclude, s.code_crate_cap)?;
-  anyhow::ensure!(scan.files > 0, "no .rs files found under {}", s.code_dirs.join(", "));
-  fs::create_dir_all(result_path)?;
+  let dir = result_path.join("crates");
+  println!("[Code Corpus] {} crates from crates.io (latest stable versions, without dependencies) -> {}", s.code_crates.len(), dir.display());
+  let crates = code::fetch_crates(&s.code_crates, &dir)?;
+  let (k, scan) = code::analyze_crates(&crates, s.code_crate_cap)?;
+  anyhow::ensure!(scan.files > 0, "no .rs files found in the code_crates");
   let path = result_path.join(&s.code_corpus_file);
   let stats = k.into_stats();
   stats.save_with(path.to_str().context("Invalid corpus path")?, keycorpus::CODE_MAGIC, keycorpus::CODE_VERSION)?;
+  let total: u64 = scan.crates.iter().map(|c| c.1).sum();
   #[allow(clippy::cast_precision_loss)]
-  let mb = scan.bytes as f64 / 1e6;
-  println!("[Code Corpus] {} crates ({} left out by code_exclude), {} files, {mb:.1} MB without comments -> {}",
-    scan.crates, scan.excluded, scan.files, path.display());
-  keycorpus::print_summary(&stats, None);
+  let kb = |b: u64| b as f64 / 1e3;
+  println!("[Code Corpus] {} files, {:.0} KB without comments -> {}", scan.files, kb(total), path.display());
+  println!("  {}", scan.crates.iter().map(|(c, b)| format!("{c} {:.0}KB", kb(*b))).collect::<Vec<_>>().join("  "));
+  keycorpus::print_summary(&stats);
   Ok(stats)
 }
 
-// 심볼 레이어 코퍼스 (코드, 영어 문장부호)를 english_weight로 섞은 n-gram. 코드 코퍼스가 없으면 만듦
+// 심볼 레이어에 쓰는 코드 코퍼스의 n-gram. 코드 코퍼스가 없으면 만듦
 fn symbol_ngrams(result_path: &Path, config: &Config) -> anyhow::Result<symbols::Ngrams> {
-  let s = &config.symbols;
-  let load = |file: &str, magic: &[u8], version: u32, rebuild: &str| -> anyhow::Result<CorpusStats> {
-    let path = result_path.join(file);
-    let (stats, v) = CorpusStats::load_with(path.to_str().context("Invalid corpus path")?, magic)?;
-    if v != version { println!("[Symbols] warning: {} was built with rules v{v}, current is v{version}; rebuild it with `{rebuild}`", path.display()); }
-    Ok(stats)
+  let path = result_path.join(&config.symbols.code_corpus_file);
+  let code = if path.exists() {
+    let (stats, v) = CorpusStats::load_with(path.to_str().context("Invalid corpus path")?, keycorpus::CODE_MAGIC)?;
+    if v != keycorpus::CODE_VERSION {
+      println!("[Symbols] warning: {} was built with rules v{v}, current is v{}; rebuild it with `analyze-code`", path.display(), keycorpus::CODE_VERSION);
+    }
+    stats
+  } else {
+    println!("[Code Corpus] {} not found: building it", path.display());
+    cmd_analyze_code(result_path, config)?
   };
-  let code = if s.english_weight < 1.0 {
-    Some(if result_path.join(&s.code_corpus_file).exists() {
-      load(&s.code_corpus_file, keycorpus::CODE_MAGIC, keycorpus::CODE_VERSION, "analyze-code")?
-    } else {
-      println!("[Code Corpus] {} not found: building it", result_path.join(&s.code_corpus_file).display());
-      cmd_analyze_code(result_path, config)?
-    })
-  } else { None };
-  let english = if s.english_weight > 0.0 {
-    let path = result_path.join(&s.english_corpus_file);
-    anyhow::ensure!(path.exists(), "{} not found: run `analyze` (it counts English punctuation from the dump in the same pass), or set [symbols] english_weight = 0",
-      path.display());
-    Some(load(&s.english_corpus_file, keycorpus::ENGLISH_MAGIC, keycorpus::ENGLISH_VERSION, "analyze --reset")?)
-  } else { None };
-  let mut sources: Vec<(&CorpusStats, f64, Option<&str>)> = Vec::new();
-  if let Some(c) = &code { sources.push((c, 1.0 - s.english_weight, None)); }
-  if let Some(e) = &english { sources.push((e, s.english_weight, Some(s.english_punct.as_str()))); }
-  println!("[Symbols] n-grams: Rust code {:.0}% + English punctuation {:.0}% (by letters)", (1.0 - s.english_weight) * 100.0, s.english_weight * 100.0);
-  Ok(symbols::Ngrams::mix(&sources, config.bigram_coverage, config.trigram_coverage))
+  Ok(symbols::Ngrams::new(&code, config.bigram_coverage, config.trigram_coverage))
 }
 
 // 저장된 결과를 results 명령과 같은 순서로 (코퍼스가 있으면 지금 설정으로 다시 채점해서 정렬)
@@ -481,7 +451,7 @@ fn run_optimize(result_path: &Path, config: &Config, stats: &corpus::CorpusStats
 }
 
 fn cmd_run(result_path: &Path, config: &Config, reset: bool) -> anyhow::Result<()> {
-  let stats = for_scoring(load_or_analyze(result_path, config, reset, MIN_SCORING_PARSER, false)?, config);
+  let stats = for_scoring(load_or_analyze(result_path, config, reset, MIN_SCORING_PARSER)?, config);
   run_optimize(result_path, config, &stats, reset)
 }
 

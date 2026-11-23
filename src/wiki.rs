@@ -15,7 +15,6 @@ use rayon::prelude::*;
 use serde::{Serialize, Deserialize};
 use crate::corpus::FastCorpus;
 use crate::dump::{self, ArticleCleaner, ScanCounts};
-use crate::keycorpus::KeyCorpus;
 use crate::SHUTDOWN;
 
 // 병렬 분석 덩어리 크기 (압축 상태 기준). 27GB 덤프면 약 400개. 중간 저장 단위이기도 함
@@ -25,31 +24,13 @@ const SCAN_BYTES: usize = 4 << 20;
 
 fn interrupted() -> anyhow::Error { anyhow::anyhow!("interrupted") }
 
-// 덤프 한 번으로 세는 두 통계: 글자 코퍼스(배열 최적화용)와 영어 문장부호 코퍼스(심볼 레이어용, 같은 본문에서 셈)
-#[derive(Clone, PartialEq, Debug)]
-pub struct DumpStats {
-  pub letters: FastCorpus,
-  pub punct: KeyCorpus,
-}
-
-impl DumpStats {
-  pub fn new() -> Self { Self { letters: FastCorpus::new(), punct: KeyCorpus::new() } }
-
-  pub fn merge(&mut self, other: &DumpStats) {
-    self.letters.merge(&other.letters);
-    self.punct.merge(&other.punct);
-  }
-}
-
 // 압축 해제된 XML에서 문서를 골라 통계에 더함
-fn analyze_xml(xml: impl std::io::BufRead, sample: f64, limit: usize, stats: &mut DumpStats, progress: bool) -> anyhow::Result<ScanCounts> {
+fn analyze_xml(xml: impl std::io::BufRead, sample: f64, limit: usize, stats: &mut FastCorpus, progress: bool) -> anyhow::Result<ScanCounts> {
   let mut cleaner = ArticleCleaner::new();
   let mut n = 0usize;
   dump::scan_articles(xml, sample, |_, raw| {
     if SHUTDOWN.load(Ordering::SeqCst) { return Err(interrupted()); }
-    let text = cleaner.clean(raw);
-    crate::analyze_bytes(text, &mut stats.letters);
-    crate::keycorpus::count_prose(text, &mut stats.punct);
+    crate::analyze_bytes(cleaner.clean(raw), stats);
     n += 1;
     if progress && n.is_multiple_of(10_000) {
       print!("\r[Wikipedia Dump] {n} articles          ");
@@ -60,9 +41,9 @@ fn analyze_xml(xml: impl std::io::BufRead, sample: f64, limit: usize, stats: &mu
 }
 
 // bz2 덤프를 처음부터 순차 분석 (HTTP 스트림 또는 파일). limit > 0이면 앞쪽 limit개 문서만
-pub fn analyze_sequential(source: impl Read, sample: f64, limit: usize) -> anyhow::Result<(DumpStats, ScanCounts)> {
+pub fn analyze_sequential(source: impl Read, sample: f64, limit: usize) -> anyhow::Result<(FastCorpus, ScanCounts)> {
   let decoder = MultiBzDecoder::new(BufReader::with_capacity(1 << 20, source));
-  let mut stats = DumpStats::new();
+  let mut stats = FastCorpus::new();
   let counts = analyze_xml(BufReader::with_capacity(1 << 20, decoder), sample, limit, &mut stats, true)
     .map_err(|e| if SHUTDOWN.load(Ordering::SeqCst) { anyhow::anyhow!("corpus analysis interrupted") } else { e })?;
   println!("\r[Wikipedia Dump] done: {} articles          ", counts.articles);
@@ -124,11 +105,11 @@ pub fn chunk_boundaries(path: &Path, len: u64, chunk: u64) -> anyhow::Result<Vec
 }
 
 // 파일의 [start, end) 바이트(스트림 경계로 자른 덩어리)를 분석
-fn analyze_range(path: &Path, start: u64, end: u64, sample: f64) -> anyhow::Result<(DumpStats, ScanCounts)> {
+fn analyze_range(path: &Path, start: u64, end: u64, sample: f64) -> anyhow::Result<(FastCorpus, ScanCounts)> {
   let mut f = File::open(path)?;
   f.seek(SeekFrom::Start(start))?;
   let decoder = MultiBzDecoder::new(BufReader::with_capacity(1 << 20, f.take(end - start)));
-  let mut stats = DumpStats::new();
+  let mut stats = FastCorpus::new();
   let counts = analyze_xml(BufReader::with_capacity(1 << 20, decoder), sample, 0, &mut stats, false)?;
   Ok((stats, counts))
 }
@@ -146,10 +127,6 @@ struct Checkpoint {
   bigrams: Vec<u64>,
   trigrams: Vec<u64>,
   space_cases: Vec<u64>,
-  // 영어 문장부호 코퍼스 (예전 형식의 중간 저장에는 없어서 읽지 못하고 처음부터 다시 분석함)
-  punct_unigrams: Vec<u64>,
-  punct_bigrams: Vec<u64>,
-  punct_trigrams: Vec<u64>,
 }
 
 impl Checkpoint {
@@ -171,14 +148,14 @@ impl Checkpoint {
 }
 
 struct Progress {
-  stats: DumpStats,
+  stats: FastCorpus,
   counts: ScanCounts,
   done: Vec<bool>,
 }
 
 // 덤프 파일을 덩어리로 나눠 병렬 분석. 덩어리마다 checkpoint에 저장하고, 중단 후 다시 실행하면 이어서 분석.
 // 다 끝나도 checkpoint는 남김 (호출한 쪽이 코퍼스를 저장한 뒤 지움)
-pub fn analyze_file_parallel(path: &Path, sample: f64, checkpoint: &Path) -> anyhow::Result<(DumpStats, ScanCounts)> {
+pub fn analyze_file_parallel(path: &Path, sample: f64, checkpoint: &Path) -> anyhow::Result<(FastCorpus, ScanCounts)> {
   let len = std::fs::metadata(path)?.len();
 
   let resumed = Checkpoint::load(checkpoint).filter(|c| c.matches(len, sample));
@@ -186,10 +163,7 @@ pub fn analyze_file_parallel(path: &Path, sample: f64, checkpoint: &Path) -> any
     println!("[Wikipedia Dump] ignoring {} (different dump, parser or sample)", checkpoint.display());
   }
   let (boundaries, progress) = if let Some(c) = resumed {
-    let stats = DumpStats {
-      letters: FastCorpus::from_vecs(&c.letters, &c.bigrams, &c.trigrams, &c.space_cases)?,
-      punct: KeyCorpus::from_vecs(&c.punct_unigrams, &c.punct_bigrams, &c.punct_trigrams)?,
-    };
+    let stats = FastCorpus::from_vecs(&c.letters, &c.bigrams, &c.trigrams, &c.space_cases)?;
     let done_n = c.done.iter().filter(|&&d| d).count();
     println!("[Wikipedia Dump] resuming: {done_n}/{} chunks already done (delete {} to start over)", c.done.len(), checkpoint.display());
     (c.boundaries, Progress { stats, counts: c.counts, done: c.done })
@@ -202,7 +176,7 @@ pub fn analyze_file_parallel(path: &Path, sample: f64, checkpoint: &Path) -> any
       println!("                 Use *-pages-articles-multistream.xml.bz2 for parallel analysis.");
     }
     let n = b.len() - 1;
-    (b, Progress { stats: DumpStats::new(), counts: ScanCounts::default(), done: vec![false; n] })
+    (b, Progress { stats: FastCorpus::new(), counts: ScanCounts::default(), done: vec![false; n] })
   };
 
   let total = boundaries.len() - 1;
@@ -218,12 +192,10 @@ pub fn analyze_file_parallel(path: &Path, sample: f64, checkpoint: &Path) -> any
     p.stats.merge(&stats);
     p.counts.add(&counts);
     p.done[k] = true;
-    let (letters, bigrams, trigrams, space_cases) = p.stats.letters.to_vecs();
-    let (punct_unigrams, punct_bigrams, punct_trigrams) = p.stats.punct.to_vecs();
+    let (letters, bigrams, trigrams, space_cases) = p.stats.to_vecs();
     Checkpoint {
       parser_version: dump::PARSER_VERSION, dump_len: len, sample_bits: sample.to_bits(),
       boundaries: boundaries.clone(), done: p.done.clone(), counts: p.counts, letters, bigrams, trigrams, space_cases,
-      punct_unigrams, punct_bigrams, punct_trigrams,
     }.save(checkpoint)?;
     let done_n = p.done.iter().filter(|&&d| d).count();
     print!("\r[Wikipedia Dump] {done_n}/{total} chunks ({:.1}%), {} articles          ",
@@ -295,7 +267,7 @@ mod tests {
     // 작은 덩어리로 잘라 경계를 여러 개 만듦
     let b = chunk_boundaries(&path, data.len() as u64, 200).unwrap();
     assert!(b.len() > 4, "{b:?}");
-    let mut merged = DumpStats::new();
+    let mut merged = FastCorpus::new();
     let mut counts = ScanCounts::default();
     for w in b.windows(2) {
       let (s, c) = analyze_range(&path, w[0], w[1], 1.0).unwrap();
@@ -325,12 +297,11 @@ mod tests {
     let (s0, c0) = analyze_range(&path, b[0], b[1], 1.0).unwrap();
     let mut doubled = s0.clone();
     doubled.merge(&s0);
-    let (letters, bigrams, trigrams, space_cases) = doubled.letters.to_vecs();
-    let (punct_unigrams, punct_bigrams, punct_trigrams) = doubled.punct.to_vecs();
+    let (letters, bigrams, trigrams, space_cases) = doubled.to_vecs();
     let mut done = vec![false; n];
     done[0] = true;
     let checkpoint = Checkpoint { parser_version: dump::PARSER_VERSION, dump_len: len, sample_bits: 1.0f64.to_bits(),
-      boundaries: b.clone(), done, counts: c0, letters, bigrams, trigrams, space_cases, punct_unigrams, punct_bigrams, punct_trigrams };
+      boundaries: b.clone(), done, counts: c0, letters, bigrams, trigrams, space_cases };
     checkpoint.save(&cp).unwrap();
 
     let (seq, _) = analyze_sequential(&data[..], 1.0, 0).unwrap();
@@ -345,20 +316,6 @@ mod tests {
     let (seq_half, _) = analyze_sequential(&data[..], 0.5, 0).unwrap();
     assert_eq!(fresh, seq_half);
     std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
-  }
-
-  #[test]
-  fn english_punctuation_comes_from_the_cleaned_text() {
-    let data = multistream(&[page("Quotes", "''Italic'' words, it's \"quoted\" (here). Ok? The 'term' is John's.")], 1);
-    let (s, c) = analyze_sequential(&data[..], 1.0, 0).unwrap();
-    assert_eq!(c.articles, 1);
-    let id = |ch: char| crate::keycorpus::char_key(ch).unwrap() as usize;
-    let bi = |a: char, b: char| s.punct.bigrams[id(a) * crate::keycorpus::KEYS + id(b)];
-    // 기울임 마크업('')은 지워지고, 축약형의 '만 셈 (따옴표 'term', 소유격 John's는 세지 않음). 문장부호 옆 공백도 셈
-    assert_eq!(s.punct.unigrams[id('\'')], 1);
-    assert_eq!((bi('t', '\''), bi(',', ' '), bi(')', '.'), bi('.', ' '), bi('k', '?'), bi(' ', '"')), (1, 1, 1, 1, 1, 1));
-    // 글자 코퍼스는 예전 규칙 그대로 (단어 사이 공백만: Italic_words, is_John)
-    assert_eq!(s.letters.letters[26], 2);
   }
 
   #[test]

@@ -119,23 +119,15 @@ stop_after_hits = 3
 max_starts = 2000
 
 [symbols]
-# 심볼 레이어 최적화 (symbols 명령): 기호 32개를 원샷 심볼 레이어 30칸과 베이스 배열의 빈칸에 배치
-# 영어 문장부호 코퍼스: analyze가 위키 덤프를 분석할 때 같은 본문에서 함께 만듦 (문장부호 옆 공백도 셈)
-english_corpus_file = "english-punct.bin"
-# 러스트 코드 코퍼스: analyze-code가 code_dirs의 .rs 파일에서 만듦 (symbols가 없으면 먼저 만듦)
+# 심볼 레이어 최적화 (symbols 명령): 기호 32개를 원샷 심볼 레이어 30칸과 베이스 배열의 빈칸에 배치. 코드 코퍼스만 씀
+# 러스트 코드 코퍼스: analyze-code가 만듦 (symbols가 없으면 먼저 만듦)
 code_corpus_file = "code.bin"
-# 코드 코퍼스로 읽을 폴더 (~는 홈 폴더). 기본은 cargo가 받아 둔 크레이트 소스
-code_dirs = ["~/.cargo/registry/src"]
-# 뺄 크레이트: "abc"는 정확히, "abc*"는 앞부분, "*abc"는 끝부분이 같으면 뺌 (자동 생성된 OS·웹 바인딩, 표 데이터 등)
-code_exclude = ["windows*", "winapi*", "linux-raw-sys", "libc", "web-sys", "js-sys", "wasm-bindgen*", "icu_*", "unicode-*", "encoding_rs", "r-efi", "wasi", "wasip2", "*-sys"]
-# 크레이트 하나에서 읽을 코드 양의 상한 (주석을 뺀 바이트). 큰 크레이트 몇 개가 통계를 독차지하지 않게 함
+# 코드 코퍼스로 쓸 크레이트. crates.io에서 각각 최신 안정 버전만 받아 <result_path>/crates/에 풂 (의존성은 받지 않음).
+# clap·crossbeam은 코드가 하위 크레이트에 있어서 clap_builder·crossbeam-channel을 씀. 바꾸면 analyze-code를 다시
+code_crates = ["serde", "serde_json", "tokio", "regex", "clap_builder", "anyhow", "rayon", "itertools", "rand", "bytes", "hashbrown",
+  "crossbeam-channel", "syn", "tracing", "axum", "reqwest", "toml", "chrono", "ignore", "nom", "bevy_ecs", "ratatui"]
+# 크레이트 하나에서 읽을 코드 양의 상한 (주석을 뺀 바이트, src/ 먼저). 큰 크레이트 몇 개가 통계를 독차지하지 않게 함
 code_crate_cap = 250000
-# 섞는 비율: 글자 수 기준으로 영어가 차지하는 몫 (0 = 코드만, 1 = 영어만)
-english_weight = 0.5
-# 영어 코퍼스에서 쓸 기호. 나머지 기호가 낀 n-gram은 버림. 기본은 축약형의 '만
-# (영어 코퍼스는 '를 축약형 n't, 're, 've, 'll, 'd, I'm, it's 등일 때만 셈. 따옴표·소유격·이름의 '는 세지 않음).
-# 다른 문장부호도 쓰려면 예: ".,'\"?!-():;" (위키 본문이라 ?와 !는 거의 없음)
-english_punct = "'"
 # 원샷 레이어 키를 한 번 누르는 비용 (검지 홈 행 키 한 번 = 1). 심볼 레이어 기호를 누를 때마다 더함
 layer_tap = 1.0
 # 베이스 빈칸에 둔 기호의 추가 노력값 (같은 자리 노력값에 더함). layer_tap보다 크면 심볼 레이어가 모자랄 때

@@ -239,7 +239,7 @@ impl CorpusStats {
     self.save_with(path, CORPUS_MAGIC, parser_version)
   }
 
-  // 머리표가 다른 코퍼스(심볼 레이어용 영어 문장부호·코드 코퍼스)도 같은 형식으로 저장
+  // 머리표가 다른 코퍼스(심볼 레이어용 코드 코퍼스)도 같은 형식으로 저장
   pub fn save_with(&self, path: &str, magic: &[u8], parser_version: u32) -> anyhow::Result<()> {
     let mut bytes = magic.to_vec();
     bytes.extend_from_slice(&CORPUS_FORMAT.to_le_bytes());

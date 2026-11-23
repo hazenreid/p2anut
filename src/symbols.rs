@@ -2,8 +2,8 @@
 //
 // 베이스 배열(저장된 결과나 배열 파일)은 고정하고, ASCII 기호 32개를 원샷 심볼 레이어 30칸과 베이스의 빈칸에 배치함.
 // 채점은 배열 최적화와 같은 점수 모델(노력값, SFB·스킵그램, 시저스·LSB, 롤·리다이렉트, [costs] 단위)에
-// 코드 코퍼스와 영어 문장부호 코퍼스를 글자 수 기준 english_weight로 섞은 n-gram을 씀. 비용은 글자 100개당이고
-// 기호가 낀 n-gram만 셈 (글자·공백끼리는 베이스가 고정이라 어느 배치에서나 같음).
+// 러스트 코드 코퍼스(analyze-code)의 n-gram을 씀. 비용은 코드의 글자 100개당이고 기호가 낀 n-gram만 셈
+// (글자·공백끼리는 베이스가 고정이라 어느 배치에서나 같음).
 //
 // 원샷 레이어: 심볼 레이어 기호는 누를 때마다 엄지로 레이어 키를 먼저 한 번 누름(탭). 엄지가 끼는 두 손가락 누름은
 // 사이에 다른 손가락이 끼는 경우와 같게 봄: 같은 손가락이면 스킵그램(sfs), 인접 손가락 두 줄 차이면 스킵 시저스만
@@ -82,7 +82,7 @@ impl Tables {
   }
 }
 
-// 섞은 n-gram (글자 100개당 횟수). 기호가 하나라도 낀 것만
+// 코드 코퍼스의 n-gram (글자 100개당 횟수). 기호가 하나라도 낀 것만
 pub struct Ngrams {
   uni: [f64; KEYS],
   bi: Vec<(u8, u8, f64)>,
@@ -104,26 +104,20 @@ fn trim<K: Ord + Copy>(v: &mut Vec<(K, f64)>, coverage: f64) {
 }
 
 impl Ngrams {
-  // sources: (코퍼스, 몫, 쓸 기호 (None = 전부)). 몫은 글자 수 기준 (각 코퍼스를 글자 100개당으로 맞춘 뒤 곱함)
-  pub fn mix(sources: &[(&CorpusStats, f64, Option<&str>)], bigram_coverage: f64, trigram_coverage: f64) -> Self {
+  pub fn new(stats: &CorpusStats, bigram_coverage: f64, trigram_coverage: f64) -> Self {
     let mut uni = [0.0; KEYS];
     let mut bi: HashMap<(u8, u8), f64> = HashMap::new();
     let mut tri: HashMap<(u8, u8, u8), f64> = HashMap::new();
-    for &(stats, w, only) in sources {
-      let letters: u64 = stats.letters.iter().filter(|(c, _)| c.is_ascii_lowercase()).map(|(_, n)| n).sum();
-      if w <= 0.0 || letters == 0 { continue; }
-      let f = w * 100.0 / letters as f64;
-      let key = |c: char| keycorpus::char_key(c).filter(|&k| !is_sym(k) || only.is_none_or(|o| o.contains(c)));
-      for (&c, &n) in &stats.letters { if let Some(k) = key(c) { uni[k as usize] += n as f64 * f; } }
-      for (&(a, b), &n) in &stats.bigrams {
-        if let (Some(x), Some(y)) = (key(a), key(b)) && x != y && (is_sym(x) || is_sym(y)) {
-          *bi.entry((x, y)).or_default() += n as f64 * f;
-        }
-      }
-      for (&(a, b, c), &n) in &stats.trigrams {
-        if let (Some(x), Some(y), Some(z)) = (key(a), key(b), key(c)) && (is_sym(x) || is_sym(y) || is_sym(z)) {
-          *tri.entry((x, y, z)).or_default() += n as f64 * f;
-        }
+    let letters: u64 = stats.letters.iter().filter(|(c, _)| c.is_ascii_lowercase()).map(|(_, n)| n).sum();
+    let f = 100.0 / letters.max(1) as f64;
+    let key = keycorpus::char_key;
+    for (&c, &n) in &stats.letters { if let Some(k) = key(c) { uni[k as usize] += n as f64 * f; } }
+    for (&(a, b), &n) in &stats.bigrams {
+      if let (Some(x), Some(y)) = (key(a), key(b)) && x != y && (is_sym(x) || is_sym(y)) { *bi.entry((x, y)).or_default() += n as f64 * f; }
+    }
+    for (&(a, b, c), &n) in &stats.trigrams {
+      if let (Some(x), Some(y), Some(z)) = (key(a), key(b), key(c)) && (is_sym(x) || is_sym(y) || is_sym(z)) {
+        *tri.entry((x, y, z)).or_default() += n as f64 * f;
       }
     }
     let mut bv: Vec<((u8, u8), f64)> = bi.into_iter().collect();
@@ -642,21 +636,17 @@ mod tests {
   const CODE: &str = "fn new(&self, name: &str) -> Result<(), Error> {\nlet v: Vec<_> = items.iter().map(|x| x * 2).collect();\n\
     match self.kind { Some(k) => k, None => return Ok(()) }\n#[derive(Debug, Clone)]\nprintln!(\"{:?} {}\\n\", a, b);\n\
     if a != b && c == d || !e { x += y[i] - z / 2; }\nuse std::io::{self, Read}; // note\nlet s = 'c'; let t = \"it's\";\nx ^= y % 3; @ ~ $ `\n";
-  const PROSE: &str = "It's a test, isn't it? Yes: the (old) well-known \"quote\"; done! Don't stop.";
 
-  fn ngrams(english_weight: f64) -> Ngrams {
+  fn ngrams() -> Ngrams {
     let mut code = keycorpus::KeyCorpus::new();
-    keycorpus::count_code(crate::code::strip_comments(&CODE.repeat(3)).as_bytes(), &mut code);
-    let mut eng = keycorpus::KeyCorpus::new();
-    keycorpus::count_prose(PROSE.repeat(5).as_bytes(), &mut eng);
-    let (code, eng) = (code.into_stats(), eng.into_stats());
-    Ngrams::mix(&[(&code, 1.0 - english_weight, None), (&eng, english_weight, Some("'"))], 1.0, 1.0)
+    keycorpus::count_text(crate::code::strip_comments(&CODE.repeat(3)).as_bytes(), &mut code);
+    Ngrams::new(&code.into_stats(), 1.0, 1.0)
   }
 
   #[test]
   fn delta_matches_full_recompute() {
     let c = config();
-    let (t, g) = (Tables::new(&c), ngrams(0.4));
+    let (t, g) = (Tables::new(&c), ngrams());
     let base = Layout::parse(BASE).unwrap();
     let p = Problem::new(&t, &g, &base, &c.symbols).unwrap();
     let mut rng = fastrand::Rng::with_seed(7);
@@ -686,7 +676,7 @@ mod tests {
     assert!(t.bg[mid_home * N + e_pos] < 0.0); // 안쪽 롤 보너스는 탭 없이 이어질 때만
     // 같은 키는 레이어가 달라도 비용 없음
     assert_eq!((t.x[e_pos * N + e_pos], t.bg[e_pos * N + e_pos]), (0.0, 0.0));
-    let g = ngrams(0.0);
+    let g = ngrams();
     let base = Layout::parse(BASE).unwrap();
     let p = Problem::new(&t, &g, &base, &c.symbols).unwrap();
     // 베이스 빈칸 3칸 + 심볼 레이어 30칸
@@ -713,7 +703,7 @@ mod tests {
     c.sa.starts_per_batch = 4;
     c.sa.stop_after_hits = 1;
     c.sa.max_starts = 4;
-    let (t, g) = (Tables::new(&c), ngrams(0.3));
+    let (t, g) = (Tables::new(&c), ngrams());
     // 모든 기호가 코퍼스에 있음 (빈도 0인 기호는 어디에 둬도 비용이 같아서 빈칸 표시와 자리를 바꿔도 같은 점수)
     assert!((0..NSYM).all(|i| g.uni[FIRST_SYM as usize + i] > 0.0));
     let base = Layout::parse(BASE).unwrap();
@@ -742,7 +732,7 @@ mod tests {
   #[test]
   fn text_roundtrip_and_parse_errors() {
     let c = config();
-    let (t, g) = (Tables::new(&c), ngrams(0.5));
+    let (t, g) = (Tables::new(&c), ngrams());
     let base = Layout::parse(BASE).unwrap();
     let p = Problem::new(&t, &g, &base, &c.symbols).unwrap();
     let st = p.random_state(&mut fastrand::Rng::with_seed(3));

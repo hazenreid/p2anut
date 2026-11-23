@@ -218,20 +218,12 @@ pub struct Config {
 #[derive(Deserialize, Clone, Debug)]
 #[serde(default)]
 pub struct SymbolsConfig {
-  // 영어 문장부호 코퍼스 (analyze가 위키 덤프를 분석할 때 같은 본문에서 함께 만듦, result_path 기준)
-  pub english_corpus_file: String,
-  // 러스트 코드 코퍼스 (analyze-code가 code_dirs에서 만듦, result_path 기준)
+  // 러스트 코드 코퍼스 (analyze-code가 만듦, result_path 기준)
   pub code_corpus_file: String,
-  // 코드 코퍼스로 읽을 폴더들 (아래의 .rs 파일 전부, ~는 홈 폴더)
-  pub code_dirs: Vec<String>,
-  // 뺄 크레이트 이름: "abc"는 정확히, "abc*"는 앞부분, "*abc"는 끝부분이 같으면 뺌 (자동 생성된 바인딩 등)
-  pub code_exclude: Vec<String>,
+  // 코드 코퍼스로 쓸 크레이트. crates.io에서 각각 최신 안정 버전만 받음 (의존성은 받지 않음)
+  pub code_crates: Vec<String>,
   // 크레이트 하나에서 읽을 코드 양의 상한 (주석을 뺀 바이트). 큰 크레이트 몇 개가 통계를 독차지하지 않게 함
   pub code_crate_cap: usize,
-  // 섞는 비율: 글자 수 기준으로 영어 문장부호 코퍼스가 차지하는 몫 (0 = 코드만, 1 = 영어만)
-  pub english_weight: f64,
-  // 영어 코퍼스에서 쓰는 기호. 나머지 기호가 낀 n-gram은 버림. 기본은 축약형의 '만 (영어 코퍼스는 '를 축약형일 때만 셈)
-  pub english_punct: String,
   // 원샷 레이어 키를 한 번 누르는 비용 (검지 홈 행 키 한 번 = 1). 심볼 레이어 기호를 누를 때마다 더함
   pub layer_tap: f32,
   // 베이스 빈칸에 둔 기호의 추가 노력값 (같은 자리 노력값에 더함). layer_tap보다 크면 심볼 레이어가 모자랄 때만 씀
@@ -247,14 +239,11 @@ pub struct SymbolsConfig {
 impl Default for SymbolsConfig {
   fn default() -> Self {
     Self {
-      english_corpus_file: "english-punct.bin".into(),
       code_corpus_file: "code.bin".into(),
-      code_dirs: vec!["~/.cargo/registry/src".into()],
-      code_exclude: ["windows*", "winapi*", "linux-raw-sys", "libc", "web-sys", "js-sys", "wasm-bindgen*", "icu_*", "unicode-*",
-        "encoding_rs", "r-efi", "wasi", "wasip2", "*-sys"].iter().map(|s| (*s).to_string()).collect(),
+      code_crates: ["serde", "serde_json", "tokio", "regex", "clap_builder", "anyhow", "rayon", "itertools", "rand", "bytes", "hashbrown",
+        "crossbeam-channel", "syn", "tracing", "axum", "reqwest", "toml", "chrono", "ignore", "nom", "bevy_ecs", "ratatui"]
+        .iter().map(|s| (*s).to_string()).collect(),
       code_crate_cap: 250_000,
-      english_weight: 0.5,
-      english_punct: "'".into(),
       layer_tap: 1.0,
       base_slot_extra: 3.0,
       pairs: ["()", "[]", "{}", "<>"].iter().map(|s| (*s).to_string()).collect(),
@@ -267,9 +256,9 @@ impl Default for SymbolsConfig {
 impl SymbolsConfig {
   pub fn validate(&self) -> anyhow::Result<()> {
     let sym = |c: char| c.is_ascii_punctuation();
-    if !(0.0..=1.0).contains(&self.english_weight) { anyhow::bail!("symbols.english_weight must be in [0.0, 1.0]"); }
-    if let Some(c) = self.english_punct.chars().find(|&c| !sym(c)) {
-      anyhow::bail!("symbols.english_punct may only hold ASCII symbols, found {c:?}");
+    if self.code_crates.is_empty() { anyhow::bail!("symbols.code_crates must name at least one crate"); }
+    if let Some(n) = self.code_crates.iter().find(|n| n.is_empty() || !n.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')) {
+      anyhow::bail!("symbols.code_crates holds an invalid crate name {n:?}");
     }
     if !(self.layer_tap >= 0.0 && self.base_slot_extra >= 0.0) { anyhow::bail!("symbols.layer_tap and base_slot_extra must be non-negative"); }
     if self.steps == 0 || self.code_crate_cap == 0 { anyhow::bail!("symbols.steps and code_crate_cap must be > 0"); }
@@ -522,14 +511,14 @@ mod tests {
     t.extend(toml::from_str::<toml::Table>(url).unwrap());
     let c: Config = toml::Value::Table(t).try_into().unwrap();
     c.validate().unwrap();
-    assert_eq!((c.symbols.pairs.len(), c.symbols.loose_pairs[0].as_str(), c.symbols.english_weight), (4, "'\"", 0.5));
-    let c = config(&format!("{url}[symbols]\nenglish_weight = 0.2\n"));
+    assert_eq!((c.symbols.pairs.len(), c.symbols.loose_pairs[0].as_str(), c.symbols.code_crates[0].as_str()), (4, "'\"", "serde"));
+    let c = config(&format!("{url}[symbols]\ncode_crates = [\"syn\"]\n"));
     c.validate().unwrap();
-    assert_eq!((c.symbols.english_weight, c.symbols.layer_tap, c.symbols.base_slot_extra), (0.2, 1.0, 3.0));
+    assert_eq!((c.symbols.code_crates.len(), c.symbols.layer_tap, c.symbols.base_slot_extra), (1, 1.0, 3.0));
     // config.toml의 값은 기본값과 같음
     let file = config(url);
     assert_eq!(format!("{:?}", file.symbols), format!("{:?}", SymbolsConfig::default()));
-    for bad in [r#"english_weight = 1.5"#, r#"english_punct = "a""#, r#"pairs = ["(("]"#, r#"pairs = ["()"]
+    for bad in ["code_crates = []", r#"code_crates = ["a/b"]"#, r#"pairs = ["(("]"#, r#"pairs = ["()"]
 loose_pairs = ["(\""]"#, "steps = 0", "layer_tap = -1.0", r#"pairs = ["(1"]"#] {
       assert!(config(&format!("{url}[symbols]\n{bad}\n")).validate().is_err(), "{bad}");
     }

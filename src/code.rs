@@ -1,16 +1,22 @@
-// 러스트 코드 코퍼스 (analyze-code): code_dirs 아래의 .rs 파일에서 주석 내용을 빼고 키 연속을 셈.
-// - 크레이트는 Cargo.toml이 있는 폴더 단위. 이름 끝의 버전(-1.2.3)을 떼고 같은 이름은 한 크레이트로 봄 (여러 버전이 받아져 있어도 한 번)
-// - 크레이트마다 code_crate_cap 바이트까지만 읽음 (경로 순서). 큰 크레이트 몇 개가 통계를 독차지하지 않게
-// - code_exclude에 맞는 크레이트(자동 생성된 바인딩 등)와 200KB가 넘는 파일(생성된 표 등)은 뺌
-// - 숨김 폴더와 target 폴더는 들어가지 않음
+// 러스트 코드 코퍼스 (analyze-code): code_crates에 적은 크레이트만 crates.io에서 최신 안정 버전으로 받아(의존성은 받지 않음)
+// 주석 내용을 빼고 키 연속을 셈.
+// - 받은 크레이트는 <result_path>/crates/<이름>-<버전>/에 풀어 두고, 같은 버전이 있으면 다시 받지 않음.
+//   인터넷이 안 되면 받아 둔 가장 새 버전을 씀
+// - 크레이트마다 code_crate_cap 바이트(주석을 뺀 코드)까지만 읽음: src/ 아래 파일을 먼저, 그다음 나머지(tests, examples 등)를
+//   경로 순서로. 큰 크레이트 몇 개가 통계를 독차지하지 않게
+// - 200KB가 넘는 파일(생성된 표 등)과 숨김·target 폴더는 뺌
 // - 주석은 내용을 빼고 표시(//, ///, //!)만 주석 블록당 한 번 남김 (이어지는 줄은 에디터가 이어 쓰는 경우가 많고,
 //   내용은 영어·한국어 문장이라 코드의 기호 통계를 흐림). 문자열은 그대로 (형식 문자열 "{}" 등도 실제로 침)
 #![allow(clippy::cast_precision_loss)]
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use anyhow::Context;
 use rayon::prelude::*;
 use crate::keycorpus::{self, KeyCorpus};
 
 const MAX_FILE_BYTES: u64 = 200_000;
+const INDEX_URL: &str = "https://index.crates.io";
+const DOWNLOAD_URL: &str = "https://static.crates.io/crates";
 
 fn is_ident(b: u8) -> bool { b.is_ascii_alphanumeric() || b == b'_' }
 
@@ -96,97 +102,143 @@ pub fn strip_comments(src: &str) -> String {
   lines.join("\n")
 }
 
-// 폴더 이름에서 끝의 버전을 뗀 크레이트 이름 (serde-1.0.210 → serde, tokio-macros-2.1.0 → tokio-macros)
-pub fn crate_name(dir: &str) -> &str {
-  match dir.rmatch_indices('-').find(|(i, _)| dir[i + 1..].starts_with(|c: char| c.is_ascii_digit())) {
-    Some((i, _)) if i > 0 => &dir[..i],
-    _ => dir,
+// crates.io 색인(sparse index)에서 크레이트 파일의 경로: 1/a, 2/ab, 3/a/abc, ab/cd/abcd...
+pub fn index_path(name: &str) -> String {
+  let n = name.to_ascii_lowercase();
+  match n.len() {
+    1 => format!("1/{n}"),
+    2 => format!("2/{n}"),
+    3 => format!("3/{}/{n}", &n[..1]),
+    _ => format!("{}/{}/{n}", &n[..2], &n[2..4]),
   }
 }
 
-// "abc" 정확히, "abc*" 앞부분, "*abc" 끝부분
-pub fn excluded(name: &str, patterns: &[String]) -> bool {
-  patterns.iter().any(|p| match (p.strip_prefix('*'), p.strip_suffix('*')) {
-    (Some(suffix), _) => name.ends_with(suffix),
-    (_, Some(prefix)) => name.starts_with(prefix),
-    _ => name == p,
-  })
+// 버전 비교용 숫자 (1.0.210 → [1, 0, 210]). 빌드 정보(+...)는 무시
+fn version_key(v: &str) -> Vec<u64> {
+  v.split('+').next().unwrap_or(v).split('.').map(|x| x.parse().unwrap_or(0)).collect()
 }
 
-pub fn expand_home(dir: &str) -> PathBuf {
-  match (dir.strip_prefix("~/"), std::env::var_os("HOME")) {
-    (Some(rest), Some(home)) => Path::new(&home).join(rest),
-    _ if dir == "~" => std::env::var_os("HOME").map_or_else(|| PathBuf::from(dir), PathBuf::from),
-    _ => PathBuf::from(dir),
+// 색인 파일(버전마다 JSON 한 줄)에서 회수(yank)되지 않은 가장 새 안정 버전의 (이름, 버전)
+pub fn latest_stable(index: &str) -> Option<(String, String)> {
+  index.lines()
+    .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+    .filter(|v| v["yanked"].as_bool() != Some(true))
+    .filter_map(|v| Some((v["name"].as_str()?.to_string(), v["vers"].as_str()?.to_string())))
+    .filter(|(_, vers)| !vers.contains('-'))
+    .max_by_key(|(_, vers)| version_key(vers))
+}
+
+// dir에 받아 둔 이 크레이트의 가장 새 버전 폴더
+fn newest_local(name: &str, dir: &Path) -> Option<(String, PathBuf)> {
+  let prefix = format!("{name}-");
+  std::fs::read_dir(dir).ok()?.filter_map(Result::ok)
+    .filter_map(|e| {
+      let f = e.file_name().to_string_lossy().into_owned();
+      let vers = f.strip_prefix(&prefix)?.to_string();
+      (vers.starts_with(|c: char| c.is_ascii_digit()) && e.path().is_dir()).then(|| (vers, e.path()))
+    })
+    .max_by_key(|(vers, _)| version_key(vers))
+}
+
+// .crate(gzip으로 묶은 tar)를 dir에 풂. 안의 <이름>-<버전>/ 폴더가 그대로 생김.
+// 중간에 끊겨도 반쯤 풀린 폴더가 남지 않게 임시 폴더에 풀고 옮김
+pub fn unpack(bytes: &[u8], dir: &Path, folder: &str) -> anyhow::Result<PathBuf> {
+  let tmp = dir.join(format!(".tmp-{folder}"));
+  let _ = std::fs::remove_dir_all(&tmp);
+  std::fs::create_dir_all(&tmp)?;
+  tar::Archive::new(flate2::read::GzDecoder::new(bytes)).unpack(&tmp)?;
+  let target = dir.join(folder);
+  std::fs::rename(tmp.join(folder), &target).with_context(|| format!("the archive has no {folder}/ folder"))?;
+  std::fs::remove_dir_all(&tmp)?;
+  Ok(target)
+}
+
+// 이름마다 최신 안정 버전을 받아 dir/<이름>-<버전>/에 풀고 (이름-버전, 폴더)를 돌려줌. 의존성은 받지 않음
+pub fn fetch_crates(names: &[String], dir: &Path) -> anyhow::Result<Vec<(String, PathBuf)>> {
+  std::fs::create_dir_all(dir)?;
+  let client = crate::download::http_client()?;
+  let get = |url: &str| -> anyhow::Result<Vec<u8>> {
+    let mut body = Vec::new();
+    client.get(url).send()?.error_for_status()?.read_to_end(&mut body)?;
+    Ok(body)
+  };
+  let mut out = Vec::new();
+  for name in names {
+    let latest = get(&format!("{INDEX_URL}/{}", index_path(name)))
+      .with_context(|| format!("looking up {name} on crates.io"))
+      .and_then(|idx| latest_stable(&String::from_utf8_lossy(&idx)).ok_or_else(|| anyhow::anyhow!("{name} has no stable version on crates.io")));
+    let (label, path) = match latest {
+      Ok((real, vers)) => {
+        let folder = format!("{real}-{vers}");
+        let path = dir.join(&folder);
+        if !path.is_dir() {
+          println!("[Code Corpus] downloading {folder}");
+          let bytes = get(&format!("{DOWNLOAD_URL}/{real}/{folder}.crate")).with_context(|| format!("downloading {folder}"))?;
+          unpack(&bytes, dir, &folder)?;
+        }
+        (folder, path)
+      }
+      Err(e) => {
+        let (vers, path) = newest_local(name, dir).ok_or(e)?;
+        println!("[Code Corpus] warning: could not reach crates.io for {name}; using the downloaded {name}-{vers}");
+        (format!("{name}-{vers}"), path)
+      }
+    };
+    out.push((label, path));
   }
+  Ok(out)
 }
 
-struct Crate {
-  name: String,
-  files: Vec<PathBuf>,
-}
-
-// 폴더를 돌며 (크레이트 이름, .rs 파일)을 경로 순서대로 모음. crate_of: 지금 폴더가 속한 크레이트 이름
-fn walk(dir: &Path, crate_of: &str, files: &mut Vec<(String, PathBuf)>) -> std::io::Result<()> {
+// 폴더 아래 .rs 파일 (숨김·target 폴더 제외, 200KB 이하)을 경로 순서로
+fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
   let mut entries: Vec<_> = std::fs::read_dir(dir)?.filter_map(Result::ok).collect();
   entries.sort_by_key(std::fs::DirEntry::file_name);
-  let here = if entries.iter().any(|e| e.file_name() == "Cargo.toml") {
-    crate_name(&dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()).to_string()
-  } else { crate_of.to_string() };
   for e in entries {
     let name = e.file_name().to_string_lossy().into_owned();
     let Ok(ft) = e.file_type() else { continue };
     if ft.is_dir() {
       if name.starts_with('.') || name == "target" { continue; }
-      walk(&e.path(), &here, files)?;
+      rs_files(&e.path(), out)?;
     } else if ft.is_file() && name.ends_with(".rs") && e.metadata().is_ok_and(|m| m.len() <= MAX_FILE_BYTES) {
-      files.push((here.clone(), e.path()));
+      out.push(e.path());
     }
   }
   Ok(())
 }
 
 pub struct CodeScan {
-  pub crates: usize,
-  pub excluded: usize,
+  // 크레이트마다 (이름-버전, 읽은 바이트)
+  pub crates: Vec<(String, u64)>,
   pub files: usize,
-  pub bytes: u64,
 }
 
-pub fn analyze_code(dirs: &[String], exclude: &[String], cap: usize) -> anyhow::Result<(KeyCorpus, CodeScan)> {
-  let mut all: Vec<(String, PathBuf)> = Vec::new();
-  for d in dirs {
-    let path = expand_home(d);
-    anyhow::ensure!(path.is_dir(), "code_dirs entry {} is not a folder", path.display());
-    let top = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    walk(&path, crate_name(&top), &mut all)?;
+// 크레이트 폴더들을 셈: 크레이트마다 src/ 아래 파일을 먼저, 그다음 나머지를 경로 순서로 cap 바이트까지
+pub fn analyze_crates(crates: &[(String, PathBuf)], cap: usize) -> anyhow::Result<(KeyCorpus, CodeScan)> {
+  let per: Vec<(KeyCorpus, usize, u64)> = crates.par_iter().map(|(_, dir)| -> anyhow::Result<_> {
+    let mut files = Vec::new();
+    rs_files(dir, &mut files).with_context(|| format!("reading {}", dir.display()))?;
+    let src = dir.join("src");
+    files.sort_by_key(|f| !f.starts_with(&src));
+    let mut k = KeyCorpus::new();
+    let (mut n, mut bytes) = (0usize, 0u64);
+    for f in &files {
+      if bytes >= cap as u64 { break; }
+      let Ok(code) = std::fs::read(f) else { continue };
+      let text = strip_comments(&String::from_utf8_lossy(&code));
+      keycorpus::count_text(text.as_bytes(), &mut k);
+      n += 1;
+      bytes += text.len() as u64;
+    }
+    Ok((k, n, bytes))
+  }).collect::<anyhow::Result<_>>()?;
+  let mut total = KeyCorpus::new();
+  let mut scan = CodeScan { crates: Vec::new(), files: 0 };
+  for ((label, _), (k, n, bytes)) in crates.iter().zip(per) {
+    total.merge(&k);
+    scan.files += n;
+    scan.crates.push((label.clone(), bytes));
   }
-  // 같은 이름(다른 버전·다른 폴더)은 하나로: 경로 순서대로 이어 붙이고 상한은 함께 적용
-  let mut merged: Vec<Crate> = Vec::new();
-  let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-  for (name, file) in all {
-    let k = *index.entry(name.clone()).or_insert_with(|| { merged.push(Crate { name, files: Vec::new() }); merged.len() - 1 });
-    merged[k].files.push(file);
-  }
-  let total = merged.len();
-  merged.retain(|c| !excluded(&c.name, exclude));
-  let skipped = total - merged.len();
-  let (corpus, files, bytes) = merged.par_iter()
-    .map(|c| {
-      let mut k = KeyCorpus::new();
-      let (mut files, mut bytes) = (0usize, 0u64);
-      for f in &c.files {
-        if bytes >= cap as u64 { break; }
-        let Ok(src) = std::fs::read(f) else { continue };
-        let text = strip_comments(&String::from_utf8_lossy(&src));
-        keycorpus::count_code(text.as_bytes(), &mut k);
-        files += 1;
-        bytes += text.len() as u64;
-      }
-      (k, files, bytes)
-    })
-    .reduce(|| (KeyCorpus::new(), 0, 0), |mut a, b| { a.0.merge(&b.0); (a.0, a.1 + b.1, a.2 + b.2) });
-  Ok((corpus, CodeScan { crates: merged.len(), excluded: skipped, files, bytes }))
+  Ok((total, scan))
 }
 
 #[cfg(test)]
@@ -219,41 +271,47 @@ mod tests {
   }
 
   #[test]
-  fn crate_names_drop_versions_and_match_exclusions() {
-    assert_eq!(crate_name("serde-1.0.210"), "serde");
-    assert_eq!(crate_name("tokio-macros-2.1.0"), "tokio-macros");
-    assert_eq!(crate_name("utf-8-0.7.6"), "utf-8");
-    assert_eq!(crate_name("x25519-dalek-2.0.0"), "x25519-dalek");
-    assert_eq!(crate_name("p2anut"), "p2anut");
-    let pats: Vec<String> = ["windows*", "*-sys", "libc"].iter().map(|s| (*s).to_string()).collect();
-    assert!(excluded("windows_x86_64_gnu", &pats) && excluded("openssl-sys", &pats) && excluded("libc", &pats));
-    assert!(!excluded("libcrux", &pats) && !excluded("serde", &pats));
+  fn index_paths_and_latest_stable_version() {
+    assert_eq!((index_path("a"), index_path("ab"), index_path("syn"), index_path("Serde")), ("1/a".into(), "2/ab".into(), "3/s/syn".into(), "se/rd/serde".into()));
+    let idx = r#"{"name":"foo","vers":"1.2.0","yanked":false}
+{"name":"foo","vers":"1.10.0","yanked":false}
+{"name":"foo","vers":"2.0.0-rc.1","yanked":false}
+{"name":"foo","vers":"1.11.0","yanked":true}
+{"name":"foo","vers":"1.9.9+build","yanked":false}"#;
+    // 1.10.0 > 1.9.9 (숫자로 비교), 회수된 1.11.0과 시험판 2.0.0-rc.1은 뺌
+    assert_eq!(latest_stable(idx), Some(("foo".into(), "1.10.0".into())));
+    assert_eq!(latest_stable("{\"name\":\"foo\",\"vers\":\"0.1.0-alpha\",\"yanked\":false}"), None);
   }
 
   #[test]
-  fn analyze_code_groups_by_crate_and_caps_each() {
+  fn unpack_and_analyze_read_src_first_and_cap_each_crate() {
     let dir = std::env::temp_dir().join(format!("p2anut-code-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    let make = |rel: &str, body: &str| {
-      let p = dir.join(rel);
-      std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-      std::fs::write(p, body).unwrap();
-    };
-    make("reg/foo-1.0.0/Cargo.toml", "");
-    make("reg/foo-1.0.0/src/lib.rs", "fn foo() -> u8 { a(b); } // note");
-    make("reg/foo-2.0.0/Cargo.toml", "");
-    make("reg/foo-2.0.0/src/lib.rs", &"x(y);\n".repeat(100));
-    make("reg/bar-sys-0.1.0/Cargo.toml", "");
-    make("reg/bar-sys-0.1.0/src/lib.rs", "extern { fn bar(); }");
-    make("reg/baz-0.3.0/Cargo.toml", "");
-    make("reg/baz-0.3.0/target/debug/gen.rs", "ignored();");
-    make("reg/baz-0.3.0/src/main.rs", "let s = \"{}\";");
-    let pats = vec!["*-sys".to_string()];
-    let (k, scan) = analyze_code(&[dir.join("reg").to_string_lossy().into_owned()], &pats, 10).unwrap();
-    // foo의 두 버전은 한 크레이트 (상한 10바이트라 첫 파일만), bar-sys는 제외, target 폴더는 안 읽음
-    assert_eq!((scan.crates, scan.excluded, scan.files), (2, 1, 2));
+    std::fs::create_dir_all(&dir).unwrap();
+    // .crate 흉내: foo-1.0.0/ 아래 benches(경로 순서로는 src보다 앞), src, 생성된 큰 파일
+    let mut ar = tar::Builder::new(flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast()));
+    for (path, body) in [("foo-1.0.0/benches/b.rs", "bench(x);".repeat(10)), ("foo-1.0.0/src/lib.rs", "fn foo() -> u8 { a(b) } // note".to_string()),
+                         ("foo-1.0.0/src/big.rs", "x".repeat(MAX_FILE_BYTES as usize + 1))] {
+      let mut h = tar::Header::new_gnu();
+      h.set_size(body.len() as u64);
+      h.set_mode(0o644);
+      h.set_cksum();
+      ar.append_data(&mut h, path, body.as_bytes()).unwrap();
+    }
+    let bytes = ar.into_inner().unwrap().finish().unwrap();
+    let foo = unpack(&bytes, &dir, "foo-1.0.0").unwrap();
+    assert!(foo.join("src/lib.rs").is_file() && !dir.join(".tmp-foo-1.0.0").exists());
+    std::fs::create_dir_all(dir.join("bar-0.2.0/src")).unwrap();
+    std::fs::write(dir.join("bar-0.2.0/src/main.rs"), "let s = \"{}\";").unwrap();
+    // 받아 둔 버전 찾기 (인터넷이 안 될 때)
+    std::fs::create_dir_all(dir.join("bar-0.10.0")).unwrap();
+    assert_eq!(newest_local("bar", &dir).unwrap().0, "0.10.0");
+    let crates = vec![("foo-1.0.0".to_string(), foo), ("bar-0.2.0".to_string(), dir.join("bar-0.2.0"))];
+    // 상한 10바이트: foo는 src/lib.rs 하나만 (benches보다 먼저), 큰 파일은 안 읽음
+    let (k, scan) = analyze_crates(&crates, 10).unwrap();
+    assert_eq!(scan.files, 2);
     let id = |c: char| keycorpus::char_key(c).unwrap() as usize;
-    assert_eq!(k.unigrams[id('x')], 0);
+    assert_eq!((k.unigrams[id('h')], k.unigrams[id('x')]), (0, 0));
     assert_eq!(k.unigrams[id('{')], 2);
     assert_eq!(k.bigrams[id('"') * keycorpus::KEYS + id('{')], 1);
     std::fs::remove_dir_all(&dir).unwrap();
