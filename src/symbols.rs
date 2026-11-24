@@ -16,6 +16,8 @@
 // 짝: pairs(순서 있음)는 같은 줄에만. 한 손 안이면 떨어져 있어도 되고 첫 글자가 왼쪽, 양손에 나뉘면 좌우 대칭(같은 손가락)에
 // 첫 글자가 왼손. loose_pairs(순서 없음)는 거기에 더해 한 손 같은 열(떨어져 있어도 됨)도 되고 어느 쪽이 먼저든.
 // 짝은 심볼 레이어 안에서만.
+// 괄호 묶음 (외우기 쉽게): pairs끼리는 한 손 짝끼리, 좌우 대칭 짝끼리 각각 모두 같은 손가락(오른손은 거울 자리)이거나 모두
+// 같은 줄이어야 함. 담금질은 어긴 쌍마다 GROUP_PENALTY를 더한 채 거쳐 갈 수 있고, 결과는 지키는 배치에서만 고름.
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 use std::collections::HashMap;
 use std::path::Path;
@@ -33,6 +35,9 @@ pub const SPACE_TOKEN: char = '␣';
 // 담금질 온도 (글자 100개당 비용 단위): 처음에는 이 정도 악화를 자주 받아들이고 끝에는 거의 안 받아들임
 const T_START: f64 = 3.0;
 const T_END: f64 = 0.0005;
+// 괄호 묶음 규칙을 어긴 쌍 하나의 벌점 (글자 100개당 비용 단위). 담금질 초반에는 어긴 배치를 거쳐 갈 수 있고 끝에는 거의 못 감.
+// 결과는 규칙을 지키는 배치에서만 고르므로 벌점은 탐색에만 씀
+const GROUP_PENALTY: f64 = 5.0;
 
 // 30칸 물리 위치의 비용 표 (비용 단위: 검지 홈 행 키 한 번 = 1). 배열 최적화의 Precomp에서 그대로 가져옴
 pub struct Tables {
@@ -182,6 +187,8 @@ pub struct Problem<'a> {
   key_pos: [u8; KEYS],
   slots: Vec<Slot>,
   pairs: Vec<Pair>,
+  // pairs의 앞쪽 n_ordered개가 순서 있는 짝(괄호)
+  n_ordered: usize,
   pair_of: Vec<Option<usize>>,
   singles: Vec<usize>,
   tap_cost: f64,
@@ -229,6 +236,38 @@ fn placements(ordered: bool) -> Vec<(u8, u8)> {
   v
 }
 
+// 괄호 한 쌍의 모양 (위치는 칸 번호 = 줄 × 10 + 열): (묶음, 줄, 손가락). 묶음 0은 한 손 짝이고 손가락은 왼손 기준 두 열
+// (오른손은 거울 자리로 바꿈), 묶음 1은 좌우 대칭이고 손가락은 왼손 열. 짝 규칙에 맞지 않는 자리는 None
+fn bracket_shape(a: usize, b: usize) -> Option<(usize, usize, usize)> {
+  let half = COLS / 2;
+  let ((ra, ca), (rb, cb)) = ((a / COLS, a % COLS), (b / COLS, b % COLS));
+  if ra != rb { return None; }
+  let (lo, hi) = (ca.min(cb), ca.max(cb));
+  if (lo < half) == (hi < half) {
+    let (f1, f2) = if lo < half { (lo, hi) } else { (COLS - 1 - hi, COLS - 1 - lo) };
+    Some((0, ra, f1 * COLS + f2))
+  } else if lo + hi == COLS - 1 {
+    Some((1, ra, lo))
+  } else {
+    None
+  }
+}
+
+// 괄호 묶음 규칙 (외우기 쉽게): 한 손 짝끼리, 좌우 대칭 짝끼리 각각 모두 같은 손가락이거나 모두 같은 줄이어야 함.
+// 묶음마다 어긴 쌍 수 = 쌍 수 - 같은 손가락을 쓰거나 같은 줄에 있는 가장 많은 쌍 수
+fn bracket_violations(places: &[(usize, usize)]) -> [usize; 2] {
+  let mut keys = [[(0usize, 0usize); NSYM / 2]; 2];
+  let mut n = [0usize; 2];
+  for &(a, b) in places {
+    if let Some((g, row, fingers)) = bracket_shape(a, b) { keys[g][n[g]] = (row, fingers); n[g] += 1; }
+  }
+  std::array::from_fn(|g| {
+    let ks = &keys[g][..n[g]];
+    let most = |f: fn(&(usize, usize)) -> usize| ks.iter().map(|k| ks.iter().filter(|j| f(j) == f(k)).count()).max().unwrap_or(0);
+    ks.len() - most(|k| k.0).max(most(|k| k.1))
+  })
+}
+
 impl<'a> Problem<'a> {
   pub fn new(t: &'a Tables, g: &'a Ngrams, base: &Layout, cfg: &SymbolsConfig) -> anyhow::Result<Self> {
     let mut key_pos = [0; KEYS];
@@ -253,7 +292,7 @@ impl<'a> Problem<'a> {
     let mut pair_of = vec![None; slots.len()];
     for (i, p) in pairs.iter().enumerate() { pair_of[p.a] = Some(i); pair_of[p.b] = Some(i); }
     let singles = (0..slots.len()).filter(|&i| pair_of[i].is_none()).collect();
-    Ok(Problem { t, g, key_pos, slots, pairs, pair_of, singles, tap_cost: t.eff.iter().copied().fold(f64::INFINITY, f64::min), base_extra: f64::from(cfg.base_slot_extra) })
+    Ok(Problem { t, g, key_pos, slots, pairs, n_ordered: cfg.pairs.len(), pair_of, singles, tap_cost: t.eff.iter().copied().fold(f64::INFINITY, f64::min), base_extra: f64::from(cfg.base_slot_extra) })
   }
 
   fn work(&self) -> Work {
@@ -414,8 +453,27 @@ impl<'a> Problem<'a> {
     self.pair_swap(st, p, q)
   }
 
-  // 결정적 근처 탐색: 홀 항목 맞바꾸기, 짝 옮기기, 짝끼리 맞바꾸기를 더 좋아지지 않을 때까지
+  // 짝 두 기호의 물리 위치 (칸 번호)
+  fn pair_pos(&self, st: &State, p: &Pair) -> (usize, usize) {
+    (self.slots[st.slot_of[p.a] as usize].pos as usize, self.slots[st.slot_of[p.b] as usize].pos as usize)
+  }
+
+  // 괄호(순서 있는 짝) 묶음 규칙을 어긴 쌍 수
+  fn violations(&self, st: &State) -> usize {
+    let mut places = [(0usize, 0usize); NSYM / 2];
+    for (place, p) in places.iter_mut().zip(&self.pairs[..self.n_ordered]) { *place = self.pair_pos(st, p); }
+    bracket_violations(&places[..self.n_ordered]).iter().sum()
+  }
+
+  // 이동이 괄호를 옮기는지 (안 옮기면 묶음 규칙을 어긴 정도가 그대로)
+  fn moves_bracket(&self, mv: &Move) -> bool {
+    mv.iter().any(|&(i, _)| self.pair_of[i].is_some_and(|p| p < self.n_ordered))
+  }
+
+  // 결정적 근처 탐색: 홀 항목 맞바꾸기, 짝 옮기기, 짝끼리 맞바꾸기를 더 좋아지지 않을 때까지.
+  // 괄호 묶음 규칙을 더 어기게 되는 이동은 받지 않음 (규칙을 지키던 배치는 끝까지 지킴)
   fn polish(&self, mut st: State, w: &mut Work) -> (f64, State) {
+    let mut viol = self.violations(&st);
     loop {
       let mut improved = false;
       let mut cands: Vec<Move> = Vec::new();
@@ -430,7 +488,8 @@ impl<'a> Problem<'a> {
       }
       for mv in &cands {
         let (d, old) = self.apply(&mut st, mv, w);
-        if d < -1e-9 { improved = true; break; }
+        let v = self.violations(&st);
+        if v <= viol && d + GROUP_PENALTY * (v as f64 - viol as f64) < -1e-9 { viol = v; improved = true; break; }
         self.undo(&mut st, &old);
       }
       if !improved { break; }
@@ -442,25 +501,32 @@ impl<'a> Problem<'a> {
     let mut w = self.work();
     let mut st = self.random_state(rng);
     let mut cur = self.total(&st);
-    let (mut best, mut best_st) = (cur, st.clone());
+    let mut viol = self.violations(&st);
+    // 괄호 묶음 규칙을 지키는 배치 중 가장 좋은 것 (어기는 배치는 벌점을 안고 거쳐 가기만 함)
+    let mut best: Option<(f64, State)> = (viol == 0).then(|| (cur, st.clone()));
     for it in 0..steps {
       let temp = T_START * (T_END / T_START).powf(it as f64 / steps as f64);
       let Some(mv) = self.random_move(&st, rng) else { continue };
       let (d, old) = self.apply(&mut st, &mv, &mut w);
-      if d <= 0.0 || rng.f64() < (-d / temp).exp() {
+      let v = if self.moves_bracket(&mv) { self.violations(&st) } else { viol };
+      let dv = d + GROUP_PENALTY * (v as f64 - viol as f64);
+      if dv <= 0.0 || rng.f64() < (-dv / temp).exp() {
         cur += d;
-        if cur < best - 1e-12 { best = cur; best_st = st.clone(); }
+        viol = v;
+        if viol == 0 && best.as_ref().is_none_or(|(b, _)| cur < b - 1e-12) { best = Some((cur, st.clone())); }
       } else {
         self.undo(&mut st, &old);
       }
     }
-    self.polish(best_st, &mut w)
+    self.polish(best.map_or(st, |(_, s)| s), &mut w)
   }
 
   // 무작위 시작 담금질을 starts_per_batch개씩 돌리고 같은 최고점이 stop_after_hits번 나오면 멈춤 (배열 최적화와 같은 규칙).
   // seed가 있으면(이전 결과) 첫 시작으로 써서 결과가 그보다 나빠지지 않게 함
+  // 괄호 묶음 규칙을 어긴 채 끝난 시작은 최고점으로 치지 않음 (모든 시작이 그러면 그중 가장 좋은 것을 돌려줌)
   pub fn search(&self, sa: &SaParams, steps: usize, seed: Option<State>) -> (f64, State, usize, usize) {
     let mut best: Option<(f64, State)> = None;
+    let mut fallback: Option<(f64, State)> = None;
     let (mut hits, mut starts) = (0usize, 0usize);
     let t0 = std::time::Instant::now();
     loop {
@@ -476,6 +542,10 @@ impl<'a> Problem<'a> {
       }).collect();
       for (c, st) in found {
         starts += 1;
+        if self.violations(&st) > 0 {
+          if fallback.as_ref().is_none_or(|(b, _)| c < *b) { fallback = Some((c, st)); }
+          continue;
+        }
         match &best {
           Some((b, _)) if c > b + 1e-9 => {}
           Some((b, _)) if c >= b - 1e-9 => hits += 1,
@@ -489,7 +559,7 @@ impl<'a> Problem<'a> {
         || (starts >= sa.starts_per_batch && hits >= sa.stop_after_hits) { break; }
     }
     println!();
-    let (c, st) = best.expect("at least one start");
+    let (c, st) = best.or(fallback).expect("at least one start");
     (c, st, hits, starts)
   }
 
@@ -598,10 +668,19 @@ impl<'a> Problem<'a> {
     Ok(self.state_from(slot_of))
   }
 
-  // 짝 규칙을 지키는지 (파일에서 읽은 배치는 지키지 않아도 채점은 함)
+  // 짝 규칙을 지키는지 (파일에서 읽은 배치는 지키지 않아도 채점은 함). 괄호 묶음 규칙을 어기면 그 묶음의 괄호를 함께 알림
   pub fn broken_pairs(&self, st: &State) -> Vec<String> {
-    self.pairs.iter().filter(|p| !p.places.contains(&(st.slot_of[p.a], st.slot_of[p.b])))
-      .map(|p| format!("{}{}", keycorpus::key_char(FIRST_SYM + p.a as u8), keycorpus::key_char(FIRST_SYM + p.b as u8))).collect()
+    let name = |p: &Pair| format!("{}{}", keycorpus::key_char(FIRST_SYM + p.a as u8), keycorpus::key_char(FIRST_SYM + p.b as u8));
+    let mut out: Vec<String> = self.pairs.iter().filter(|p| !p.places.contains(&(st.slot_of[p.a], st.slot_of[p.b]))).map(name).collect();
+    let ordered = &self.pairs[..self.n_ordered];
+    let places: Vec<(usize, usize)> = ordered.iter().map(|p| self.pair_pos(st, p)).collect();
+    for (g, &v) in bracket_violations(&places).iter().enumerate() {
+      if v == 0 { continue; }
+      let names: Vec<String> = ordered.iter().zip(&places)
+        .filter(|&(_, &(a, b))| bracket_shape(a, b).is_some_and(|s| s.0 == g)).map(|(p, _)| name(p)).collect();
+      out.push(format!("{} ({} pairs not all on the same fingers or row)", names.join(" "), ["one-hand", "mirrored"][g]));
+    }
+    out
   }
 }
 
@@ -662,6 +741,8 @@ pub fn optimize(result_path: &Path, config: &Config, base: &Layout, label: &str)
   if seed.is_some() { println!("[Symbols] also starting from {}", out.display()); }
   let (_, st, hits, starts) = problem.search(&config.sa, config.symbols.steps, seed);
   println!("[Symbols] best found {hits} times in {starts} starts");
+  let broken = problem.broken_pairs(&st);
+  if !broken.is_empty() { println!("note: no start ended inside the pair rules; this layer breaks: {}", broken.join(" ")); }
   let text = problem.to_text(base, &st);
   print!("{text}");
   problem.print_report(&st);
@@ -840,6 +921,50 @@ mod tests {
   }
 
   #[test]
+  fn brackets_on_one_hand_or_mirrored_share_fingers_or_a_row() {
+    let at = |r: usize, c: usize| r * COLS + c;
+    // 한 손 짝의 손가락은 왼손 기준 두 열 (오른손 중지·약지 = 왼손 약지·중지), 좌우 대칭은 왼손 열. 위아래는 괄호 자리가 아님
+    assert_eq!(bracket_shape(at(1, 1), at(1, 2)), Some((0, 1, COLS + 2)));
+    assert_eq!(bracket_shape(at(2, 7), at(2, 8)), Some((0, 2, COLS + 2)));
+    assert_eq!(bracket_shape(at(0, 2), at(0, 7)), Some((1, 0, 2)));
+    assert_eq!(bracket_shape(at(0, 1), at(2, 1)), None);
+    // 되는 예: 한 손 짝은 약지·중지, 좌우 대칭은 중지 (줄은 달라도 됨)
+    assert_eq!(bracket_violations(&[(at(1, 1), at(1, 2)), (at(0, 2), at(0, 7)), (at(1, 7), at(1, 8)), (at(2, 2), at(2, 7))]), [0, 0]);
+    // 되는 예: 한 손 짝은 홈줄, 좌우 대칭은 윗줄 (손가락은 달라도 됨)
+    assert_eq!(bracket_violations(&[(at(1, 1), at(1, 2)), (at(0, 1), at(0, 8)), (at(1, 3), at(1, 4)), (at(0, 2), at(0, 7))]), [0, 0]);
+    // 안 되는 예 (54.72 결과): 한 손 짝 셋 중 [ ]만 새끼·약지이고, 줄로 보면 ( )만 홈줄
+    assert_eq!(bracket_violations(&[(at(1, 1), at(1, 2)), (at(2, 0), at(2, 1)), (at(2, 7), at(2, 8)), (at(0, 2), at(0, 7))]), [1, 0]);
+    // 셋 이상이면 손가락과 줄을 섞어 맞출 수 없음: 첫째와 둘째는 같은 손가락, 첫째와 셋째는 같은 줄
+    assert_eq!(bracket_violations(&[(at(1, 1), at(1, 2)), (at(0, 1), at(0, 2)), (at(1, 3), at(1, 4))]), [1, 0]);
+    // 좌우 대칭 둘이 손가락도 줄도 다름
+    assert_eq!(bracket_violations(&[(at(0, 2), at(0, 7)), (at(2, 1), at(2, 8))]), [0, 1]);
+  }
+
+  #[test]
+  fn broken_bracket_groups_are_reported() {
+    let mut c = config();
+    // 괄호만 보려고 순서 없는 짝은 뺌
+    c.symbols.loose_pairs.clear();
+    let (t, g) = (Tables::new(&c), ngrams());
+    let base = Layout::parse(BASE).unwrap();
+    let p = Problem::new(&t, &g, &base, &c.symbols).unwrap();
+    // 54.72 결과의 심볼 레이어 (괄호 하나하나는 규칙대로지만 한 손 짝 ( ) [ ] { }가 손가락도 줄도 하나로 맞지 않음)
+    let text = r#"
+ ? - < ' +   % = > / *
+ ! ( ) " `   \ . , _ |
+ [ ] # ; @   $ : { } &
+ p l o u ^   q b d f k
+ c t h e ~   x ␣ s n r
+ w g j a ·   z i v m y
+"#;
+    let (_, placed) = parse_text(text).unwrap();
+    let st = p.state_of(&placed).unwrap();
+    assert_eq!(p.violations(&st), 1);
+    // 저장된 결과가 이러면 다음 symbols의 출발점으로 쓰지 않음
+    assert_eq!(p.broken_pairs(&st), vec!["() [] {} (one-hand pairs not all on the same fingers or row)".to_string()]);
+  }
+
+  #[test]
   fn search_keeps_pairs_and_rarest_symbols_go_to_the_base() {
     fastrand::seed(11);
     let mut c = config();
@@ -854,7 +979,7 @@ mod tests {
     let (cost, st, _, starts) = p.search(&c.sa, 20_000, None);
     assert_eq!(starts, 4);
     assert!((cost - p.total(&st)).abs() < 1e-9);
-    // 짝은 모두 규칙대로 (괄호는 같은 줄에서 여는 쪽이 왼쪽·왼손)
+    // 짝은 모두 규칙대로 (괄호는 같은 줄에서 여는 쪽이 왼쪽·왼손이고, 묶음끼리 같은 손가락이나 같은 줄)
     assert!(p.broken_pairs(&st).is_empty());
     // 베이스 빈칸에는 코퍼스에서 가장 드문 기호만. 심볼 레이어가 2칸 모자라므로 2개 이상이고, 심볼 레이어에 남는 칸이
     // 어떤 기호에도 나쁜 자리(예: 스페이스와 같은 손가락)면 그 칸을 비우고 3개를 둘 수도 있음
