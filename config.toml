@@ -3,7 +3,7 @@ corpus_file = "corpus.bin"
 # 코드는 [code]의 크레이트를 위키와 같은 규칙으로 센 것 (code.letters.bin: 양옆이 글자인 공백만 세고, 기호·숫자 옆 공백은 연속을 끊음)
 code_share = 0.25
 # 스페이스는 3×10 배열 안의 27번째 키로 함께 배치함 (예전 grid 결과 파일 이름 그대로). 결과는 늘 스페이스가 오른손 쪽
-# (점수가 좌우 대칭이라 왼손이면 좌우를 뒤집어 저장함. 왼손 스페이스는 symbols N --flip).
+# (점수가 좌우 대칭이라 왼손이면 좌우를 뒤집어 저장함).
 # code_share가 0보다 크면 이름에 비율이 붙어 따로 저장됨 (result-grid-code25.bin)
 result_file = "result-grid.bin"
 elites = 5

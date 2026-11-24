@@ -285,11 +285,12 @@ fn cmd_run(result_path: &Path, config: &Config, reset: bool) -> anyhow::Result<(
   run_optimize(result_path, config, &english, reset)
 }
 
-// 심볼 레이어 최적화: 저장된 결과 N번(기본 1, results와 같은 순서) 또는 배열 파일을 베이스로. --flip이면 베이스를 좌우로 뒤집어서
+// 심볼 레이어 최적화: 저장된 결과 N번(기본 1, results와 같은 순서) 또는 배열 파일을 베이스로
 fn cmd_symbols(result_path: &Path, config: &Config, args: &[String]) -> anyhow::Result<()> {
-  let flip = args.iter().any(|a| a == "--flip");
+  // 모르는 옵션은 그냥 넘기지 않음 (없앤 --flip을 주면 뒤집히지 않은 베이스로 돌게 되므로). --reset은 모든 명령이 받음
+  if let Some(o) = args.iter().find(|a| a.starts_with("--") && *a != "--reset") { anyhow::bail!("unknown option {o} for symbols"); }
   let target = args.iter().find(|a| !a.starts_with("--")).map_or("1", String::as_str);
-  let (mut base, label, what) = if let Ok(n) = target.parse::<usize>() {
+  let (base, label, what) = if let Ok(n) = target.parse::<usize>() {
     let result_file = config.result_file_in(result_path);
     anyhow::ensure!(result_file.exists(), "{}, or pass a layout file", no_results(result_path, config));
     let results = saved_results(result_path, config, Scoring::load_if_present(result_path, config)?.as_ref())?;
@@ -302,12 +303,11 @@ fn cmd_symbols(result_path: &Path, config: &Config, args: &[String]) -> anyhow::
     (read_layout(target)?, stem, target.to_string())
   };
   anyhow::ensure!(base.key_count() == 27, "the base layout must hold a-z and the space key (_)");
-  if flip { base = base.mirrored(); }
-  println!("[Symbols] base: {what}{}", if flip { ", mirrored" } else { "" });
-  symbols::optimize(result_path, config, &base, &format!("{label}{}", if flip { "-flip" } else { "" }))
+  println!("[Symbols] base: {what}");
+  symbols::optimize(result_path, config, &base, &label)
 }
 
-const USAGE: &str = "[analyze|optimize|run|results|score <layout_file>...|sensitivity [layout_file]...|analyze-code|symbols [N|layout_file] [--flip]|symbols-score <symbols_file>...] [--reset]";
+const USAGE: &str = "[analyze|optimize|run|results|score <layout_file>...|sensitivity [layout_file]...|analyze-code|symbols [N|layout_file]|symbols-score <symbols_file>...] [--reset]";
 
 fn main() -> anyhow::Result<()> {
   ctrlc::set_handler(move || {
@@ -396,6 +396,15 @@ mod tests {
     assert!(sorted.windows(2).all(|w| w[0].total >= w[1].total));
     assert!(sorted.iter().all(|l| right[..5].iter().any(|o| o.slots == l.slots)));
     std::fs::remove_dir_all(&dir).unwrap();
+  }
+
+  #[test]
+  fn symbols_refuses_unknown_options() {
+    let config = crate::config::load_config(std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/config.toml"))).unwrap();
+    let dir = std::env::temp_dir().join(format!("p2anut-symopt-{}", std::process::id()));
+    let err = super::cmd_symbols(&dir, &config, &["1".to_string(), "--flip".to_string()]).unwrap_err().to_string();
+    assert!(err.contains("unknown option --flip"), "{err}");
+    assert!(!dir.exists());
   }
 
   #[test]

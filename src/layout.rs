@@ -200,7 +200,7 @@ impl Layout {
       pct(skip), pct(skip_space));
   }
 
-  // 좌우를 뒤집은 배열 (점수는 같음. 스페이스를 반대 손으로 옮겨 쓸 때 등). 손 비율도 서로 바뀜
+  // 좌우를 뒤집은 배열 (점수는 같음. space_right가 씀). 손 비율도 서로 바뀜
   pub fn mirrored(&self) -> Layout {
     let mut m = *self;
     for r in 0..ROWS { m.slots[r * COLS..(r + 1) * COLS].reverse(); }
