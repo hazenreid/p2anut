@@ -402,6 +402,8 @@ mod tests {
     let dir = std::env::temp_dir().join(format!("p2anut-none-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let mut config = crate::config::load_config(std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/config.toml"))).unwrap();
+    // config.toml의 비율과 상관없이 코드를 절반 섞는 설정으로
+    config.code_share = 0.5;
     let msg = super::no_results(&dir, &config);
     assert!(msg.contains("result-grid-code50.bin: run optimize first") && !msg.contains("without code"), "{msg}");
     // 섞기 전 결과가 있으면 그 파일과 보는 법도 알려 줌

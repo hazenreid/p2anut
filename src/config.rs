@@ -592,12 +592,12 @@ loose_pairs = ["(\""]"#, "steps = 0", "base_slot_extra = -1.0", r#"pairs = ["(1"
     let root = Path::new("/r");
     let c = config(&format!("{url}code_share = 0.0"));
     assert_eq!((c.share_tag(), c.result_file_in(root)), (None, root.join("result-grid.bin")));
-    // config.toml은 코드를 절반 섞음
+    // config.toml은 코드를 25% 섞음
     let c = config(url);
-    assert_eq!((c.code_share, c.share_tag().as_deref()), (0.5, Some("code50")));
-    assert_eq!(c.result_file_in(root), root.join("result-grid-code50.bin"));
-    let c = config(&format!("{url}code_share = 0.25\nresult_file = \"out/res\""));
-    assert_eq!(c.result_file_in(root), root.join("out/res-code25"));
+    assert_eq!((c.code_share, c.share_tag().as_deref()), (0.25, Some("code25")));
+    assert_eq!(c.result_file_in(root), root.join("result-grid-code25.bin"));
+    let c = config(&format!("{url}code_share = 0.5\nresult_file = \"out/res\""));
+    assert_eq!(c.result_file_in(root), root.join("out/res-code50"));
     for bad in ["code_share = -0.1", "code_share = 1.5"] { assert!(config(&format!("{url}{bad}")).validate().is_err(), "{bad}"); }
     assert!(config(&format!("{url}code_share = 1.0")).validate().is_ok());
   }

@@ -1,9 +1,9 @@
 corpus_file = "corpus.bin"
 # 글자 배열 코퍼스에 섞을 러스트 코드의 비율 (글자 수 기준, 0~1). 0이면 위키 영어만.
 # 코드는 [code]의 크레이트를 위키와 같은 규칙으로 센 것 (code.letters.bin: 양옆이 글자인 공백만 세고, 기호·숫자 옆 공백은 연속을 끊음)
-code_share = 0.5
+code_share = 0.25
 # 스페이스는 3×10 배열 안의 27번째 키로 함께 배치함 (예전 grid 결과 파일 이름 그대로).
-# code_share가 0보다 크면 이름에 비율이 붙어 따로 저장됨 (result-grid-code50.bin)
+# code_share가 0보다 크면 이름에 비율이 붙어 따로 저장됨 (result-grid-code25.bin)
 result_file = "result-grid.bin"
 elites = 5
 # 각 손(왼손·오른손)이 최소 이 비율 이상 치면 감점 없음 (0.45 = 45~55%)
