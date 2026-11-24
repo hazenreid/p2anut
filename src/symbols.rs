@@ -830,7 +830,7 @@ pub fn score_files(result_path: &Path, config: &Config, files: &[String]) -> any
 
 // 심볼 레이어에 쓰는 코드 코퍼스의 n-gram (코드 코퍼스가 없거나 만들 때와 설정이 다르면 다시 만듦)
 fn code_ngrams(result_path: &Path, config: &Config) -> anyhow::Result<Ngrams> {
-  Ok(Ngrams::new(&crate::code::load_or_build(result_path, config)?.symbols, config.bigram_coverage, config.trigram_coverage))
+  Ok(Ngrams::new(&crate::code::load_or_build(result_path, config)?, config.bigram_coverage, config.trigram_coverage))
 }
 
 #[cfg(test)]
