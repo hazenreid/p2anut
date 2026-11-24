@@ -281,7 +281,7 @@ impl Default for SymbolsConfig {
     Self {
       base_slot_extra: 3.0,
       pairs: ["()", "[]", "{}", "<>"].iter().map(|s| (*s).to_string()).collect(),
-      loose_pairs: vec!["'\"".into()],
+      loose_pairs: ["'\"", "+-", "*/", "&|", "!?", ":;"].iter().map(|s| (*s).to_string()).collect(),
       steps: 100_000,
       old_corpus_file: None,
       old_crates: None,
