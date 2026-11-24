@@ -1,10 +1,10 @@
-// 러스트 코드 코퍼스 (analyze-code): code_crates에 적은 크레이트만 crates.io에서 최신 안정 버전으로 받아(의존성은 받지 않음)
+// 러스트 코드 코퍼스 (analyze-code): [code]의 crates에 적은 크레이트만 crates.io에서 최신 안정 버전으로 받아(의존성은 받지 않음)
 // 주석 내용을 빼고 키 연속을 셈.
 // - 받은 크레이트는 <result_path>/crates/<이름>-<버전>/에 풀어 두고, 같은 버전이 있으면 다시 받지 않음.
 //   새 버전을 받으면 같은 크레이트의 옛 버전 폴더는 지움. 받지 못하면 받아 둔 가장 새 버전을 쓰고, 그것도 없으면
 //   경고하고 건너뜀 (crates.io 요청은 제한 시간을 두고 몇 번 다시 시도함)
-// - 만들 때의 크레이트 목록을 <code.bin>.crates.json에 적어 둠. symbols는 설정의 code_crates나 규칙 버전이
-//   달라졌으면 코드 코퍼스를 다시 만듦
+// - 만들 때의 크레이트 목록을 <code.bin>.crates.json에 적어 둠. 코드 코퍼스를 쓰는 명령(symbols, 그리고 code_share가
+//   0보다 크면 글자 배열 명령)은 설정의 crates나 규칙 버전이 달라졌으면 코드 코퍼스를 다시 만듦
 // - 패키지 본체 코드를 모두 읽음: tests·benches·examples·fuzz 폴더와 build.rs, 200KB가 넘는 파일(생성된 표 등),
 //   숨김·target 폴더는 뺌 (src 안의 단위 테스트는 들어감)
 // - 크레이트마다 같은 무게: 크레이트별로 센 뒤 글자 수가 같아지게 늘리거나 줄여서 더함. 큰 크레이트 몇 개가
@@ -272,7 +272,7 @@ fn fetch_with(names: &[String], dir: &Path, get: impl Fn(&str) -> anyhow::Result
 pub struct BuildInfo {
   // 세는 규칙의 버전 (keycorpus::CODE_VERSION)
   pub version: u32,
-  // 설정의 code_crates
+  // 설정의 [code] crates
   pub requested: Vec<String>,
   // 실제로 센 크레이트 (이름-버전)
   pub used: Vec<String>,
@@ -297,7 +297,7 @@ impl BuildInfo {
     match info {
       None => Some("its crate list is unknown"),
       Some(i) if i.version != keycorpus::CODE_VERSION => Some("it was built with older rules"),
-      Some(i) if sorted(&i.requested) != sorted(crates) => Some("code_crates changed"),
+      Some(i) if sorted(&i.requested) != sorted(crates) => Some("the [code] crates changed"),
       Some(_) => None,
     }
   }
@@ -366,22 +366,22 @@ pub fn analyze_crates(crates: &[(String, PathBuf)]) -> anyhow::Result<(KeyCorpus
   Ok((total, scan))
 }
 
-// 코드 코퍼스 만들기 (analyze-code 명령): code_crates를 crates.io에서 받아(<result_path>/crates, 의존성은 받지 않음)
-// 세고 <result_path>/<code_corpus_file>에 저장. 만들 때의 크레이트 목록도 옆에 적어 둠
+// 코드 코퍼스 만들기 (analyze-code 명령): [code]의 crates를 crates.io에서 받아(<result_path>/crates, 의존성은 받지 않음)
+// 세고 <result_path>/<corpus_file>에 저장. 만들 때의 크레이트 목록도 옆에 적어 둠
 pub fn build_corpus(result_path: &Path, config: &Config) -> anyhow::Result<CorpusStats> {
-  let s = &config.symbols;
+  let s = &config.code;
   let dir = result_path.join("crates");
-  println!("[Code Corpus] {} crates from crates.io (latest stable versions, without dependencies) -> {}", s.code_crates.len(), dir.display());
-  let fetched = fetch_crates(&s.code_crates, &dir)?;
-  anyhow::ensure!(!fetched.crates.is_empty(), "none of the code_crates could be downloaded");
+  println!("[Code Corpus] {} crates from crates.io (latest stable versions, without dependencies) -> {}", s.crates.len(), dir.display());
+  let fetched = fetch_crates(&s.crates, &dir)?;
+  anyhow::ensure!(!fetched.crates.is_empty(), "none of the [code] crates could be downloaded");
   let (k, scan) = analyze_crates(&fetched.crates)?;
-  anyhow::ensure!(scan.files > 0, "no .rs files found in the code_crates");
-  let path = result_path.join(&s.code_corpus_file);
+  anyhow::ensure!(scan.files > 0, "no .rs files found in the [code] crates");
+  let path = result_path.join(&s.corpus_file);
   let stats = k.into_stats();
   stats.save_with(path.to_str().context("Invalid corpus path")?, keycorpus::CODE_MAGIC, keycorpus::CODE_VERSION)?;
   let skipped: Vec<String> = fetched.skipped.iter().map(|(n, _)| n.clone()).collect();
   BuildInfo {
-    version: keycorpus::CODE_VERSION, requested: s.code_crates.clone(),
+    version: keycorpus::CODE_VERSION, requested: s.crates.clone(),
     used: fetched.crates.iter().map(|(l, _)| l.clone()).collect(), skipped: skipped.clone(),
   }.save(&path)?;
   let total: u64 = scan.crates.iter().map(|c| c.1).sum();
@@ -391,16 +391,16 @@ pub fn build_corpus(result_path: &Path, config: &Config) -> anyhow::Result<Corpu
   println!("  {}", scan.crates.iter().map(|(c, b)| format!("{c} {:.0}KB", kb(*b))).collect::<Vec<_>>().join("  "));
   keycorpus::print_summary(&stats);
   if !skipped.is_empty() {
-    println!("[Code Corpus] warning: {} of {} crates were skipped ({}); run analyze-code again to retry", skipped.len(), s.code_crates.len(), skipped.join(", "));
+    println!("[Code Corpus] warning: {} of {} crates were skipped ({}); run analyze-code again to retry", skipped.len(), s.crates.len(), skipped.join(", "));
   }
   Ok(stats)
 }
 
-// 코드 코퍼스 불러오기. 없거나, code_crates·세는 규칙이 만들 때와 다르면 다시 만듦
+// 코드 코퍼스 불러오기. 없거나, [code]의 crates나 세는 규칙이 만들 때와 다르면 다시 만듦
 pub fn load_or_build(result_path: &Path, config: &Config) -> anyhow::Result<CorpusStats> {
-  let path = result_path.join(&config.symbols.code_corpus_file);
+  let path = result_path.join(&config.code.corpus_file);
   let info = BuildInfo::load(&path);
-  let stale = if path.exists() { BuildInfo::stale_reason(info.as_ref(), &config.symbols.code_crates) } else { Some("it does not exist") };
+  let stale = if path.exists() { BuildInfo::stale_reason(info.as_ref(), &config.code.crates) } else { Some("it does not exist") };
   match stale {
     None => {
       let (stats, v) = CorpusStats::load_with(path.to_str().context("Invalid corpus path")?, keycorpus::CODE_MAGIC)?;
@@ -514,7 +514,7 @@ mod tests {
     assert_eq!(loaded, info);
     // 순서만 다르면 그대로 씀 (건너뛴 크레이트가 있어도 목록이 같으면 다시 만들지 않음)
     assert_eq!(BuildInfo::stale_reason(Some(&loaded), &list(&["a", "b"])), None);
-    assert_eq!(BuildInfo::stale_reason(Some(&loaded), &list(&["a"])), Some("code_crates changed"));
+    assert_eq!(BuildInfo::stale_reason(Some(&loaded), &list(&["a"])), Some("the [code] crates changed"));
     assert_eq!(BuildInfo::stale_reason(None, &list(&["a", "b"])), Some("its crate list is unknown"));
     let old = BuildInfo { version: keycorpus::CODE_VERSION - 1, ..loaded };
     assert_eq!(BuildInfo::stale_reason(Some(&old), &list(&["a", "b"])), Some("it was built with older rules"));

@@ -61,23 +61,43 @@ fn for_scoring(mut stats: CorpusStats, config: &Config) -> CorpusStats {
   stats
 }
 
+// 글자 배열에 섞을 러스트 코드: 코드 코퍼스의 글자·공백 n-gram (code_share가 0이면 None). 코드 코퍼스가 없거나 오래됐으면 만듦
+fn code_letters(result_path: &Path, config: &Config) -> anyhow::Result<Option<CorpusStats>> {
+  if config.code_share <= 0.0 { return Ok(None); }
+  Ok(Some(keycorpus::letter_part(&code::load_or_build(result_path, config)?)))
+}
+
 // 채점 기준: 코퍼스 배열과, 지금 설정으로 만든 표와 총점 기준
 struct Scoring {
   arrays: CorpusArrays,
   precomp: Precomp,
   norm: ScoreNorm,
+  // 코드를 섞었으면 영어만·코드만의 기준과 코드 비율 (비교 출력용)
+  parts: Vec<(&'static str, Scoring)>,
+  share: f64,
 }
 
 impl Scoring {
-  fn new(stats: &CorpusStats, config: &Config) -> Self {
-    let arrays = stats.to_arrays();
+  // 코퍼스 하나 (빈도가 낮은 n-gram은 잘라 냄)
+  fn of(stats: &CorpusStats, config: &Config) -> Self {
+    let arrays = for_scoring(stats.clone(), config).to_arrays();
     let (precomp, norm) = layout::scoring(&arrays, config);
-    Scoring { arrays, precomp, norm }
+    Scoring { arrays, precomp, norm, parts: Vec::new(), share: 0.0 }
   }
 
-  // 저장된 코퍼스로 (빈도가 낮은 n-gram은 잘라 냄)
+  // 글자 배열의 기준: 위키 영어(전체 통계)에 코드를 code_share만큼(글자 수 기준) 섞음
+  fn new(english: &CorpusStats, code: Option<&CorpusStats>, config: &Config) -> Self {
+    let Some(code) = code else { return Self::of(english, config) };
+    let mut s = Self::of(&english.mixed(code, config.code_share), config);
+    s.parts = vec![("english", Self::of(english, config)), ("code", Self::of(code, config))];
+    s.share = config.code_share;
+    s
+  }
+
+  // 저장된 코퍼스로 (code_share가 0보다 크면 코드 코퍼스도)
   fn load(result_path: &Path, config: &Config) -> anyhow::Result<Self> {
-    Ok(Self::new(&for_scoring(load_corpus(&result_path.join(&config.corpus_file), MIN_SCORING_PARSER)?, config), config))
+    let english = load_corpus(&result_path.join(&config.corpus_file), MIN_SCORING_PARSER)?;
+    Ok(Self::new(&english, code_letters(result_path, config)?.as_ref(), config))
   }
 
   // 코퍼스 파일이 있을 때만
@@ -89,12 +109,25 @@ impl Scoring {
     l.calc_scores(&self.arrays, &self.precomp);
     l.calc_total_score(&self.norm);
   }
+
+  // 글자 100개당 항목별 비용. 코드를 섞었으면 영어만·코드만의 총비용도 다음 줄에
+  fn print_goodness(&self, l: &Layout) {
+    l.print_goodness(&self.norm, &self.arrays, &self.precomp);
+    if self.parts.is_empty() { return; }
+    let total = |s: &Scoring| {
+      let mut x = *l;
+      s.score(&mut x);
+      if x.total <= layout::PENALTY_SCORE { "disqualified".to_string() } else { format!("{:.1}", score::cost_per_100(x.total)) }
+    };
+    println!("  {}  (the total mixes them {:.0}:{:.0} by letters)", self.parts.iter().map(|(name, s)| format!("{name}={}", total(s))).collect::<Vec<_>>().join("  "),
+      (1.0 - self.share) * 100.0, self.share * 100.0);
+  }
 }
 
 // 저장된 결과 (결과 파일이 없으면 빈 목록). 채점 기준이 있으면 그 코퍼스와 키 구성이 같은 것만 지금 설정으로 다시 채점해서
 // 정렬 (results 명령의 순서)
 fn saved_results(result_path: &Path, config: &Config, scoring: Option<&Scoring>) -> anyhow::Result<Vec<Layout>> {
-  let file = result_path.join(&config.result_file);
+  let file = config.result_file_in(result_path);
   if !file.exists() { return Ok(Vec::new()); }
   let mut results = load_results(file.to_str().context("Invalid result file path")?)?;
   if let Some(s) = scoring {
@@ -125,7 +158,7 @@ fn print_results(results: &[Layout], scoring: Option<&Scoring>) {
   for (i, l) in results.iter().enumerate() {
     println!("[{}]", i + 1);
     l.print();
-    if let Some(s) = scoring { l.print_goodness(&s.norm, &s.arrays, &s.precomp); }
+    if let Some(s) = scoring { s.print_goodness(l); }
     println!();
   }
 }
@@ -148,11 +181,12 @@ fn cmd_analyze(result_path: &Path, config: &Config, reset: bool) -> anyhow::Resu
 }
 
 fn cmd_results(result_path: &Path, config: &Config) -> anyhow::Result<()> {
-  let result_file = result_path.join(&config.result_file);
+  let result_file = config.result_file_in(result_path);
   if !result_file.exists() {
     eprintln!("No results found at {}", result_file.display());
     std::process::exit(1);
   }
+  println!("[Results] {}", result_file.display());
   let scoring = Scoring::load_if_present(result_path, config)?;
   print_results(&saved_results(result_path, config, scoring.as_ref())?, scoring.as_ref());
   Ok(())
@@ -161,9 +195,12 @@ fn cmd_results(result_path: &Path, config: &Config) -> anyhow::Result<()> {
 // 배열 파일(행마다 10칸, 빈칸 '.')을 저장된 결과 1등과 같은 기준(같은 정규화 표본)으로 채점해 나란히 출력
 fn cmd_score(result_path: &Path, config: &Config, files: &[String]) -> anyhow::Result<()> {
   anyhow::ensure!(!files.is_empty(), "usage: <result_path> score <layout_file>...");
-  let full = load_corpus(&result_path.join(&config.corpus_file), MIN_SCORING_PARSER)?;
+  let english = load_corpus(&result_path.join(&config.corpus_file), MIN_SCORING_PARSER)?;
+  let code = code_letters(result_path, config)?;
+  // 행·손가락 통계는 채점과 같은 코퍼스(코드를 섞었으면 섞은 것)의 전체 통계로
+  let full = code.as_ref().map_or_else(|| english.clone(), |c| english.mixed(c, config.code_share));
   let (full_arrays, windows) = (full.to_arrays(), full.windows());
-  let s = Scoring::new(&for_scoring(full, config), config);
+  let s = Scoring::new(&english, code.as_ref(), config);
   let mut entries: Vec<(String, Layout)> = saved_results(result_path, config, Some(&s))?.into_iter().take(1)
     .map(|l| ("best saved result".to_string(), l)).collect();
   for (f, mut l) in layout_files(files, &s, config, "Score")? {
@@ -173,7 +210,7 @@ fn cmd_score(result_path: &Path, config: &Config, files: &[String]) -> anyhow::R
   for (name, l) in &entries {
     println!("[{name}]");
     l.print();
-    l.print_goodness(&s.norm, &s.arrays, &s.precomp);
+    s.print_goodness(l);
     l.print_stats(&full_arrays, &s.precomp, &windows);
     println!();
   }
@@ -191,14 +228,18 @@ fn cmd_sensitivity(result_path: &Path, config: &Config, files: &[String]) -> any
   Ok(())
 }
 
-fn run_optimize(result_path: &Path, config: &Config, stats: &corpus::CorpusStats, reset: bool) -> anyhow::Result<()> {
-  let s = Scoring::new(stats, config);
+// english: 위키 영어 코퍼스의 전체 통계 (code_share가 0보다 크면 코드를 섞어서 최적화)
+fn run_optimize(result_path: &Path, config: &Config, english: &CorpusStats, reset: bool) -> anyhow::Result<()> {
+  let s = Scoring::new(english, code_letters(result_path, config)?.as_ref(), config);
+  let result_file = config.result_file_in(result_path);
+  if config.code_share > 0.0 {
+    println!("[Corpus] Wikipedia English with {:.0}% Rust code (by letters) -> {}", config.code_share * 100.0, result_file.display());
+  }
   let center_mask = s.arrays.rare_mask(config.center_rare);
   if center_mask != 0 {
     let letters: String = (0..s.arrays.keys.len()).filter(|&i| center_mask >> i & 1 == 1).map(|i| s.arrays.keys[i]).collect();
     println!("[Center] least frequent {} letters forced into the center columns: {letters}", config.center_rare);
   }
-  let result_file = result_path.join(&config.result_file);
   let result_file_str = result_file.to_str().context("Invalid result file path")?;
   let base_layouts = if !reset && result_file.exists() {
     let mut layouts = load_results(result_file_str)?;
@@ -230,8 +271,8 @@ fn run_optimize(result_path: &Path, config: &Config, stats: &corpus::CorpusStats
 }
 
 fn cmd_run(result_path: &Path, config: &Config, reset: bool) -> anyhow::Result<()> {
-  let stats = for_scoring(load_or_analyze(result_path, config, reset, MIN_SCORING_PARSER)?, config);
-  run_optimize(result_path, config, &stats, reset)
+  let english = load_or_analyze(result_path, config, reset, MIN_SCORING_PARSER)?;
+  run_optimize(result_path, config, &english, reset)
 }
 
 // 심볼 레이어 최적화: 저장된 결과 N번(기본 1, results와 같은 순서) 또는 배열 파일을 베이스로. --flip이면 베이스를 좌우로 뒤집어서
@@ -239,11 +280,13 @@ fn cmd_symbols(result_path: &Path, config: &Config, args: &[String]) -> anyhow::
   let flip = args.iter().any(|a| a == "--flip");
   let target = args.iter().find(|a| !a.starts_with("--")).map_or("1", String::as_str);
   let (mut base, label, what) = if let Ok(n) = target.parse::<usize>() {
-    let result_file = result_path.join(&config.result_file);
+    let result_file = config.result_file_in(result_path);
     anyhow::ensure!(result_file.exists(), "no results at {}: run optimize first, or pass a layout file", result_file.display());
     let results = saved_results(result_path, config, Scoring::load_if_present(result_path, config)?.as_ref())?;
     anyhow::ensure!((1..=results.len()).contains(&n), "there are {} saved results; pick 1..={}", results.len(), results.len());
-    (results[n - 1], n.to_string(), format!("saved result #{n}"))
+    // 코드를 섞은 결과면 그 표시를 붙임 (symbols-code50-1.txt): 비율마다 N번 배열이 다름
+    let label = config.share_tag().map_or_else(|| n.to_string(), |t| format!("{t}-{n}"));
+    (results[n - 1], label, format!("saved result #{n} of {}", result_file.display()))
   } else {
     let stem = Path::new(target).file_stem().map_or_else(|| "layout".to_string(), |s| s.to_string_lossy().into_owned());
     (read_layout(target)?, stem, target.to_string())
@@ -282,10 +325,7 @@ fn main() -> anyhow::Result<()> {
   if reset { fs::create_dir_all(result_path)?; }
   match cmd {
     Some("analyze")  => cmd_analyze(result_path, &config, reset),
-    Some("optimize") => {
-      let stats = for_scoring(load_corpus(&result_path.join(&config.corpus_file), MIN_SCORING_PARSER)?, &config);
-      run_optimize(result_path, &config, &stats, reset)
-    },
+    Some("optimize") => run_optimize(result_path, &config, &load_corpus(&result_path.join(&config.corpus_file), MIN_SCORING_PARSER)?, reset),
     Some("run")      => cmd_run(result_path, &config, reset),
     Some("results")  => cmd_results(result_path, &config),
     Some("score")    => cmd_score(result_path, &config, &args[3..].iter().filter(|a| *a != "--reset").cloned().collect::<Vec<_>>()),
@@ -325,7 +365,7 @@ mod tests {
     let dir = std::env::temp_dir().join(format!("p2anut-saved-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let config = crate::config::load_config(std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/config.toml"))).unwrap();
-    let s = super::Scoring::new(&crate::test_util::stats(), &config);
+    let s = super::Scoring::new(&crate::test_util::stats(), None, &config);
     // 결과 파일이 없으면 빈 목록
     assert!(super::saved_results(&dir, &config, Some(&s)).unwrap().is_empty());
     // 무작위 배열 5개와, 키 구성이 다른 배열 하나 (스페이스 키를 뺀 것)
@@ -334,7 +374,7 @@ mod tests {
     odd.slots[odd.pos[crate::SPACE_ID as usize] as usize] = layout::EMPTY;
     odd.pos[crate::SPACE_ID as usize] = layout::EMPTY;
     ls.push(odd);
-    layout::save_results(&ls, dir.join(&config.result_file).to_str().unwrap()).unwrap();
+    layout::save_results(&ls, config.result_file_in(&dir).to_str().unwrap()).unwrap();
     // 채점 기준이 없으면 파일 그대로
     let slots = |v: &[Layout]| v.iter().map(|l| l.slots).collect::<Vec<_>>();
     assert_eq!(slots(&super::saved_results(&dir, &config, None).unwrap()), slots(&ls));
@@ -345,5 +385,30 @@ mod tests {
     assert!(sorted.windows(2).all(|w| w[0].total >= w[1].total));
     assert!(sorted.iter().all(|l| ls[..5].iter().any(|o| o.slots == l.slots)));
     std::fs::remove_dir_all(&dir).unwrap();
+  }
+
+  #[test]
+  fn code_is_mixed_in_by_letters_and_shown_by_part() {
+    let mut config = crate::config::load_config(std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/config.toml"))).unwrap();
+    (config.bigram_coverage, config.trigram_coverage) = (1.0, 1.0);
+    // 손 비율 감점은 섞은 뒤의 비율로 매겨 평균이 되지 않으므로 끔
+    (config.min_hand_usage, config.hand_hard_limit) = (0.0, Some(0.0));
+    let english = crate::test_util::stats();
+    let mut f = crate::corpus::FastCorpus::new();
+    crate::wiki::analyze_bytes(&b"pub fn new self let mut value impl from str usize index expect unwrap\n".repeat(50), &mut f);
+    let code = f.into_stats();
+    // 섞지 않으면 영어만
+    let plain = super::Scoring::new(&english, None, &config);
+    assert!(plain.parts.is_empty());
+    let s = super::Scoring::new(&english, Some(&code), &config);
+    assert_eq!(s.parts.iter().map(|p| p.0).collect::<Vec<_>>(), ["english", "code"]);
+    assert_eq!(s.parts[0].1.arrays.freq, plain.arrays.freq);
+    // 글자 수 기준으로 섞으므로, 섞은 비용은 영어만·코드만의 비용을 code_share로 평균한 것 (반올림 오차 안에서)
+    let l = Layout::parse("kfdbq.uolp\nrns_x.ehtc\nymviz.ajgw\n").unwrap();
+    let cost = |x: &super::Scoring| { let mut m = l; x.score(&mut m); crate::score::cost_per_100(m.total) };
+    let (mix, e, c) = (cost(&s), cost(&s.parts[0].1), cost(&s.parts[1].1));
+    let want = (1.0 - config.code_share) * e + config.code_share * c;
+    assert!((mix - want).abs() < 0.01 * want, "{mix} vs {want} ({e}, {c})");
+    assert!((e - c).abs() > 1.0);
   }
 }

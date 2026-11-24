@@ -203,6 +203,25 @@ impl CorpusStats {
   // 최적화 속도를 위해 불러올 때 적용. 파일에는 전체 통계를 저장해서 기준을 바꿔도 재분석이 필요 없음.
   // 묶음마다 따로 자름: 글자끼리 / 가운데가 공백인 것("a _ c") / 나머지 공백이 낀 것.
   // 빈도가 큰 공백 n-gram이 섞여도 글자끼리의 n-gram은 늘 같은 것이 남음
+  // other를 글자(a-z) 수 기준 share 비율로 섞은 통계 (self는 1 - share). 글자 수는 self와 같게 맞춤
+  pub fn mixed(&self, other: &CorpusStats, share: f64) -> CorpusStats {
+    fn blend<K: Eq + std::hash::Hash + Copy>(a: &HashMap<K, u64>, ka: f64, b: &HashMap<K, u64>, kb: f64) -> HashMap<K, u64> {
+      let mut m: HashMap<K, f64> = HashMap::new();
+      for (k, &n) in a { *m.entry(*k).or_default() += n as f64 * ka; }
+      for (k, &n) in b { *m.entry(*k).or_default() += n as f64 * kb; }
+      #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+      m.into_iter().map(|(k, v)| (k, v.round() as u64)).filter(|&(_, n)| n > 0).collect()
+    }
+    let letters = |s: &CorpusStats| s.letters.iter().filter(|(c, _)| c.is_ascii_lowercase()).map(|(_, &n)| n).sum::<u64>() as f64;
+    let (la, lb) = (letters(self), letters(other));
+    let (ka, kb) = (1.0 - share, if lb > 0.0 { share * la / lb } else { 0.0 });
+    CorpusStats {
+      letters: blend(&self.letters, ka, &other.letters, kb),
+      bigrams: blend(&self.bigrams, ka, &other.bigrams, kb),
+      trigrams: blend(&self.trigrams, ka, &other.trigrams, kb),
+    }
+  }
+
   pub fn trim_by_coverage(&mut self, bigram: f64, trigram: f64) {
     fn trim<K: Eq + std::hash::Hash + Clone + Ord>(map: &mut HashMap<K, u64>, threshold: f64) {
       if map.is_empty() || threshold >= 1.0 { return; }
@@ -391,6 +410,26 @@ mod tests {
     let (l, bi, tri, sp) = a.to_vecs();
     assert_eq!(FastCorpus::from_vecs(&l, &bi, &tri, &sp).unwrap(), a);
     assert!(FastCorpus::from_vecs(&l[..3], &bi, &tri, &sp).is_err());
+  }
+
+  #[test]
+  fn mixing_weighs_by_letters() {
+    let mut a = FastCorpus::new();
+    crate::wiki::analyze_bytes(&b"the cat sat on the mat\n".repeat(10), &mut a);
+    let mut b = FastCorpus::new();
+    crate::wiki::analyze_bytes(&b"fn zz qq\n".repeat(100), &mut b);
+    let (a, b) = (a.into_stats(), b.into_stats());
+    let letters = |s: &CorpusStats| s.letters.iter().filter(|(c, _)| c.is_ascii_lowercase()).map(|(_, &n)| n).sum::<u64>();
+    // 0이면 그대로, 글자 수는 앞쪽에 맞춤 (반올림 오차만큼 다를 수 있음)
+    assert_eq!(a.mixed(&b, 0.0), a);
+    let m = a.mixed(&b, 0.5);
+    assert!(letters(&m).abs_diff(letters(&a)) <= 3);
+    // 절반은 b의 글자: z는 b 글자의 1/3
+    let z = m.letters[&'z'] as f64 / letters(&m) as f64;
+    assert!((z - 0.5 / 3.0).abs() < 0.02, "{z}");
+    assert_eq!(m.bigrams[&('t', 'h')], a.bigrams[&('t', 'h')] / 2);
+    let whole = a.mixed(&b, 1.0);
+    assert!(!whole.letters.contains_key(&'t') && whole.letters[&'z'] > 0);
   }
 
   #[test]
