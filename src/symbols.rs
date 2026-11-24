@@ -13,8 +13,9 @@
 // 치지 않음. 탭 한 번의 비용은 노력값 표에서 가장 작은 값 (× [costs] effort).
 // 베이스 빈칸의 기호는 탭이 없는 대신 노력값에 base_slot_extra를 더함 (탭 비용보다 크면 심볼 레이어가 모자랄 때만 씀).
 //
-// 짝: pairs(순서 있음)는 첫 글자가 왼쪽인 같은 줄 나란히, 또는 좌우 대칭(같은 손가락·같은 줄, 첫 글자가 왼손).
-// loose_pairs(순서 없음)는 나란히·좌우 대칭·같은 열 위아래 중 하나. 짝은 심볼 레이어 안에서만.
+// 짝: pairs(순서 있음)는 같은 줄에만. 한 손 안이면 떨어져 있어도 되고 첫 글자가 왼쪽, 양손에 나뉘면 좌우 대칭(같은 손가락)에
+// 첫 글자가 왼손. loose_pairs(순서 없음)는 거기에 더해 한 손 같은 열(떨어져 있어도 됨)도 되고 어느 쪽이 먼저든.
+// 짝은 심볼 레이어 안에서만.
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 use std::collections::HashMap;
 use std::path::Path;
@@ -208,15 +209,20 @@ impl Breakdown {
   pub fn total(&self) -> f64 { self.effort + self.taps + self.sfb + self.scissors - self.rolling }
 }
 
-// 순서 있는 짝(나란히·대칭)과 순서 없는 짝(나란히·대칭·위아래)의 칸 (심볼 레이어 칸 번호 = 위치)
+// 짝을 놓을 수 있는 칸 (심볼 레이어 칸 번호 = 위치): 한 손 같은 줄(떨어져 있어도 됨)과 좌우 대칭(양손 같은 손가락·같은 줄).
+// 순서 있는 짝은 첫 글자가 왼쪽·왼손인 방향만. 순서 없는 짝은 한 손 같은 열(떨어져 있어도 됨)도 되고 두 방향 모두
 fn placements(ordered: bool) -> Vec<(u8, u8)> {
+  let at = |r: usize, c: usize| (r * COLS + c) as u8;
+  let left = |c: usize| c < COLS / 2;
   let mut v: Vec<(u8, u8)> = Vec::new();
   for r in 0..ROWS {
-    for c in 0..COLS - 1 { if c != COLS / 2 - 1 { v.push(((r * COLS + c) as u8, (r * COLS + c + 1) as u8)); } }
-    for c in 0..COLS / 2 { v.push(((r * COLS + c) as u8, (r * COLS + COLS - 1 - c) as u8)); }
+    for c in 0..COLS {
+      for c2 in c + 1..COLS { if left(c) == left(c2) { v.push((at(r, c), at(r, c2))); } }
+      if !ordered { for r2 in r + 1..ROWS { v.push((at(r, c), at(r2, c))); } }
+    }
+    for c in 0..COLS / 2 { v.push((at(r, c), at(r, COLS - 1 - c))); }
   }
   if !ordered {
-    for r in 0..ROWS - 1 { for c in 0..COLS { v.push(((r * COLS + c) as u8, ((r + 1) * COLS + c) as u8)); } }
     let rev: Vec<(u8, u8)> = v.iter().map(|&(a, b)| (b, a)).collect();
     v.extend(rev);
   }
@@ -808,6 +814,32 @@ mod tests {
   }
 
   #[test]
+  fn ordered_pairs_stay_in_one_row_and_loose_pairs_may_also_share_a_column() {
+    let at = |r: usize, c: usize| (r * COLS + c) as u8;
+    let rc = |p: u8| (p as usize / COLS, p as usize % COLS);
+    let same_row = |a: u8, b: u8| { let ((ra, ca), (rb, cb)) = (rc(a), rc(b)); ra == rb && ca != cb && (ca < COLS / 2) == (cb < COLS / 2) };
+    let same_col = |a: u8, b: u8| { let ((ra, ca), (rb, cb)) = (rc(a), rc(b)); ca == cb && ra != rb };
+    let mirror = |a: u8, b: u8| { let ((ra, ca), (rb, cb)) = (rc(a), rc(b)); ra == rb && ca + cb == COLS - 1 };
+    let distinct = |v: &[(u8, u8)]| { let mut s = v.to_vec(); s.sort_unstable(); s.dedup(); s.len() == v.len() };
+    // 순서 있는 짝: 한 손 같은 줄 (5칸에서 2칸: 10가지 × 2손 × 3줄) + 좌우 대칭 (5가지 × 3줄). 첫 글자가 왼쪽·왼손
+    let ordered = placements(true);
+    assert!(distinct(&ordered) && ordered.len() == 60 + 15);
+    for &(a, b) in &ordered { assert!((same_row(a, b) || mirror(a, b)) && rc(a).1 < rc(b).1, "{a} {b}"); }
+    // 떨어진 자리도 됨 (같은 줄 새끼-가운데 열). 양손 가운데 열끼리는 좌우 대칭
+    for p in [(at(0, 0), at(0, 4)), (at(2, 5), at(2, 9)), (at(1, 4), at(1, 5))] { assert!(ordered.contains(&p), "{p:?}"); }
+    // 위아래(같은 열)와 거꾸로(오른쪽·오른손이 먼저)는 안 됨
+    for p in [(at(0, 1), at(2, 1)), (at(1, 2), at(2, 2)), (at(0, 4), at(0, 0)), (at(1, 6), at(1, 3))] { assert!(!ordered.contains(&p), "{p:?}"); }
+    // 순서 없는 짝: 위 자리 두 방향 + 한 손 같은 열 (3줄에서 2줄: 3가지 × 10열) 두 방향
+    let loose = placements(false);
+    assert!(distinct(&loose) && loose.len() == 2 * (60 + 30 + 15));
+    for &(a, b) in &loose { assert!(same_row(a, b) || same_col(a, b) || mirror(a, b), "{a} {b}"); }
+    assert!(ordered.iter().all(|&(a, b)| loose.contains(&(a, b)) && loose.contains(&(b, a))));
+    for p in [(at(0, 1), at(2, 1)), (at(2, 1), at(0, 1))] { assert!(loose.contains(&p), "{p:?}"); }
+    // 대각선이나 양손에 나뉜 대칭 아닌 자리는 어느 짝도 안 됨
+    for p in [(at(0, 1), at(1, 2)), (at(1, 3), at(1, 7)), (at(0, 3), at(2, 6))] { assert!(!loose.contains(&p), "{p:?}"); }
+  }
+
+  #[test]
   fn search_keeps_pairs_and_rarest_symbols_go_to_the_base() {
     fastrand::seed(11);
     let mut c = config();
@@ -822,11 +854,8 @@ mod tests {
     let (cost, st, _, starts) = p.search(&c.sa, 20_000, None);
     assert_eq!(starts, 4);
     assert!((cost - p.total(&st)).abs() < 1e-9);
+    // 짝은 모두 규칙대로 (괄호는 같은 줄에서 여는 쪽이 왼쪽·왼손)
     assert!(p.broken_pairs(&st).is_empty());
-    // 괄호는 여는 쪽이 왼쪽(나란히) 또는 왼손(대칭)
-    let sp = |ch: char| st.slot_of[keycorpus::sym_index(ch).unwrap()] as usize;
-    let (o, cl) = (sp('('), sp(')'));
-    assert!(o < N && cl < N && o / COLS == cl / COLS && (cl == o + 1 || (o % COLS < 5 && cl % COLS == COLS - 1 - o % COLS)));
     // 베이스 빈칸에는 코퍼스에서 가장 드문 기호만. 심볼 레이어가 2칸 모자라므로 2개 이상이고, 심볼 레이어에 남는 칸이
     // 어떤 기호에도 나쁜 자리(예: 스페이스와 같은 손가락)면 그 칸을 비우고 3개를 둘 수도 있음
     let on_base: Vec<usize> = (0..NSYM).filter(|&i| !p.slots[st.slot_of[i] as usize].tap).collect();
