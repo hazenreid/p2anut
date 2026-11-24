@@ -14,7 +14,7 @@ and mathematics while the river flows gently under the stone bridge toward the d
 pub fn stats() -> CorpusStats {
   let text = TEXT.repeat(20);
   let mut f = FastCorpus::new();
-  crate::analyze_bytes(text.as_bytes(), &mut f);
+  crate::wiki::analyze_bytes(text.as_bytes(), &mut f);
   f.into_stats()
 }
 

@@ -18,6 +18,8 @@ use std::time::Duration;
 use anyhow::Context;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use crate::config::Config;
+use crate::corpus::CorpusStats;
 use crate::keycorpus::{self, KeyCorpus};
 
 const MAX_FILE_BYTES: u64 = 200_000;
@@ -362,6 +364,57 @@ pub fn analyze_crates(crates: &[(String, PathBuf)]) -> anyhow::Result<(KeyCorpus
     scan.crates.push((label.clone(), bytes));
   }
   Ok((total, scan))
+}
+
+// 코드 코퍼스 만들기 (analyze-code 명령): code_crates를 crates.io에서 받아(<result_path>/crates, 의존성은 받지 않음)
+// 세고 <result_path>/<code_corpus_file>에 저장. 만들 때의 크레이트 목록도 옆에 적어 둠
+pub fn build_corpus(result_path: &Path, config: &Config) -> anyhow::Result<CorpusStats> {
+  let s = &config.symbols;
+  let dir = result_path.join("crates");
+  println!("[Code Corpus] {} crates from crates.io (latest stable versions, without dependencies) -> {}", s.code_crates.len(), dir.display());
+  let fetched = fetch_crates(&s.code_crates, &dir)?;
+  anyhow::ensure!(!fetched.crates.is_empty(), "none of the code_crates could be downloaded");
+  let (k, scan) = analyze_crates(&fetched.crates)?;
+  anyhow::ensure!(scan.files > 0, "no .rs files found in the code_crates");
+  let path = result_path.join(&s.code_corpus_file);
+  let stats = k.into_stats();
+  stats.save_with(path.to_str().context("Invalid corpus path")?, keycorpus::CODE_MAGIC, keycorpus::CODE_VERSION)?;
+  let skipped: Vec<String> = fetched.skipped.iter().map(|(n, _)| n.clone()).collect();
+  BuildInfo {
+    version: keycorpus::CODE_VERSION, requested: s.code_crates.clone(),
+    used: fetched.crates.iter().map(|(l, _)| l.clone()).collect(), skipped: skipped.clone(),
+  }.save(&path)?;
+  let total: u64 = scan.crates.iter().map(|c| c.1).sum();
+  #[allow(clippy::cast_precision_loss)]
+  let kb = |b: u64| b as f64 / 1e3;
+  println!("[Code Corpus] {} files, {:.0} KB without comments, each crate weighted equally -> {}", scan.files, kb(total), path.display());
+  println!("  {}", scan.crates.iter().map(|(c, b)| format!("{c} {:.0}KB", kb(*b))).collect::<Vec<_>>().join("  "));
+  keycorpus::print_summary(&stats);
+  if !skipped.is_empty() {
+    println!("[Code Corpus] warning: {} of {} crates were skipped ({}); run analyze-code again to retry", skipped.len(), s.code_crates.len(), skipped.join(", "));
+  }
+  Ok(stats)
+}
+
+// 코드 코퍼스 불러오기. 없거나, code_crates·세는 규칙이 만들 때와 다르면 다시 만듦
+pub fn load_or_build(result_path: &Path, config: &Config) -> anyhow::Result<CorpusStats> {
+  let path = result_path.join(&config.symbols.code_corpus_file);
+  let info = BuildInfo::load(&path);
+  let stale = if path.exists() { BuildInfo::stale_reason(info.as_ref(), &config.symbols.code_crates) } else { Some("it does not exist") };
+  match stale {
+    None => {
+      let (stats, v) = CorpusStats::load_with(path.to_str().context("Invalid corpus path")?, keycorpus::CODE_MAGIC)?;
+      anyhow::ensure!(v == keycorpus::CODE_VERSION, "{} has rules v{v} but its crate list says v{}; run analyze-code", path.display(), keycorpus::CODE_VERSION);
+      if let Some(i) = info.as_ref().filter(|i| !i.skipped.is_empty()) {
+        println!("[Code Corpus] note: {} was built without {} (could not be downloaded); run analyze-code to retry", path.display(), i.skipped.join(", "));
+      }
+      Ok(stats)
+    }
+    Some(reason) => {
+      println!("[Code Corpus] building {}: {reason}", path.display());
+      build_corpus(result_path, config)
+    }
+  }
 }
 
 #[cfg(test)]

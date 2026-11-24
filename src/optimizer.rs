@@ -104,8 +104,6 @@ impl<'a> Optimizer<'a> {
     Self { corpus_arrays, precomp, norm, elites_len, min_home_diff, sa_params, center_mask }
   }
 
-  pub fn corpus(&self) -> &CorpusArrays { &self.corpus_arrays }
-
   // 이동에 쓰는 칸들이 모두 같은 구역(센터/바깥)인지. 제약이 없으면 항상 true
   fn same_zone(&self, ps: &[usize]) -> bool {
     self.center_mask == 0 || ps.iter().all(|&p| is_center_slot(p) == is_center_slot(ps[0]))

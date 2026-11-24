@@ -5,10 +5,10 @@
 use rayon::prelude::*;
 use crate::config::Config;
 use crate::corpus::CorpusArrays;
-use crate::layout::{abs_weights, Layout, CHARS, COLS, PENALTY_SCORE, ROWS};
+use crate::layout::{scoring, Layout, CHARS, COLS, PENALTY_SCORE, ROWS};
 use crate::optimizer::Optimizer;
 use crate::precomp::Precomp;
-use crate::score::{cost_per_100, HandRule, ScoreNorm};
+use crate::score::{cost_per_100, ScoreNorm};
 
 pub const LEVELS: [f32; 4] = [0.10, 0.20, 0.35, 0.50];
 
@@ -83,13 +83,6 @@ pub fn knobs() -> Vec<Knob> {
     Knob { name: "effort.bottom_row", show: |c| show_row(&c.effort.bottom, &c.effort.home),
       apply: |c, f| { let home = c.effort.home; scale_row(&mut c.effort.bottom, &home, f); } },
   ]
-}
-
-// init_score_norm과 같은 기준 (무작위 배열 중앙값은 표시용이라 기준 설정의 값을 그대로 씀)
-pub fn scoring(arrays: &CorpusArrays, c: &Config) -> (Precomp, ScoreNorm) {
-  let precomp = Precomp::new(&arrays.freq, &c.weights, &c.costs, &c.effort, c.hand_hard_limit());
-  let norm = ScoreNorm { abs: abs_weights(arrays, &precomp, &c.costs), hand: HandRule::from_config(c) };
-  (precomp, norm)
 }
 
 // 총점 → 글자 100개당 비용
@@ -303,6 +296,7 @@ pub fn run(arrays: &CorpusArrays, config: &Config, cands: Vec<(String, Layout)>,
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::score::HandRule;
   use crate::test_util;
 
   fn config() -> Config {

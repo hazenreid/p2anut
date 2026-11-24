@@ -381,11 +381,11 @@ mod tests {
   fn fast_corpus_merge_and_vec_roundtrip() {
     let mut a = FastCorpus::new();
     let mut b = FastCorpus::new();
-    crate::analyze_bytes(b"hello world", &mut a);
-    crate::analyze_bytes(b"other text", &mut b);
+    crate::wiki::analyze_bytes(b"hello world", &mut a);
+    crate::wiki::analyze_bytes(b"other text", &mut b);
     let mut both = FastCorpus::new();
     // 줄바꿈은 연속을 끊으므로 두 덩어리를 따로 센 것과 같음
-    crate::analyze_bytes(b"hello world\nother text", &mut both);
+    crate::wiki::analyze_bytes(b"hello world\nother text", &mut both);
     a.merge(&b);
     assert_eq!(a, both);
     let (l, bi, tri, sp) = a.to_vecs();

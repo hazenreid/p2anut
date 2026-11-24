@@ -17,6 +17,8 @@
 // loose_pairs(순서 없음)는 나란히·좌우 대칭·같은 열 위아래 중 하나. 짝은 심볼 레이어 안에서만.
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 use std::collections::HashMap;
+use std::path::Path;
+use anyhow::Context;
 use rayon::prelude::*;
 use crate::config::{Config, SaParams, SymbolsConfig};
 use crate::corpus::CorpusStats;
@@ -638,6 +640,55 @@ pub fn parse_text(text: &str) -> anyhow::Result<(Layout, [(u8, bool); NSYM])> {
   let base = Layout::parse(&base_text)?;
   anyhow::ensure!(base.key_count() == 27, "the base layer must hold a-z and ␣");
   Ok((base, placed.map(|p| p.expect("checked above"))))
+}
+
+// 심볼 레이어 최적화 (symbols 명령): base는 고른 베이스 배열(뒤집었으면 뒤집은 것), label은 결과 파일 이름에 붙임
+pub fn optimize(result_path: &Path, config: &Config, base: &Layout, label: &str) -> anyhow::Result<()> {
+  let g = code_ngrams(result_path, config)?;
+  let t = Tables::new(config);
+  let problem = Problem::new(&t, &g, base, &config.symbols)?;
+  let out = result_path.join(format!("symbols-{label}.txt"));
+  // 같은 베이스로 저장해 둔 결과가 있으면 첫 시작점으로 (이전보다 나빠지지 않게)
+  let seed = std::fs::read_to_string(&out).ok().and_then(|text| parse_text(&text).ok())
+    .filter(|(b, _)| b.slots == base.slots)
+    .and_then(|(_, placed)| problem.state_of(&placed).ok())
+    .filter(|st| problem.broken_pairs(st).is_empty());
+  if seed.is_some() { println!("[Symbols] also starting from {}", out.display()); }
+  let (_, st, hits, starts) = problem.search(&config.sa, config.symbols.steps, seed);
+  println!("[Symbols] best found {hits} times in {starts} starts");
+  let text = problem.to_text(base, &st);
+  print!("{text}");
+  problem.print_report(&st);
+  let tmp = out.with_extension("txt.tmp");
+  std::fs::write(&tmp, &text)?;
+  std::fs::rename(&tmp, &out)?;
+  println!("[Symbols] saved {} (edit it and check with `symbols-score`)", out.display());
+  Ok(())
+}
+
+// 기호 배치 파일들을 같은 기준으로 채점 (symbols-score 명령)
+pub fn score_files(result_path: &Path, config: &Config, files: &[String]) -> anyhow::Result<()> {
+  anyhow::ensure!(!files.is_empty(), "usage: <result_path> symbols-score <symbols_file>...");
+  let g = code_ngrams(result_path, config)?;
+  let t = Tables::new(config);
+  for f in files {
+    let (base, placed) = parse_text(&std::fs::read_to_string(f).with_context(|| format!("reading {f}"))?)
+      .with_context(|| format!("parsing {f}"))?;
+    let problem = Problem::new(&t, &g, &base, &config.symbols)?;
+    let st = problem.state_of(&placed)?;
+    println!("[{f}]");
+    print!("{}", problem.to_text(&base, &st));
+    let broken = problem.broken_pairs(&st);
+    if !broken.is_empty() { println!("note: pairs not placed by the pair rules: {}", broken.join(" ")); }
+    problem.print_report(&st);
+    println!();
+  }
+  Ok(())
+}
+
+// 심볼 레이어에 쓰는 코드 코퍼스의 n-gram (코드 코퍼스가 없거나 만들 때와 설정이 다르면 다시 만듦)
+fn code_ngrams(result_path: &Path, config: &Config) -> anyhow::Result<Ngrams> {
+  Ok(Ngrams::new(&crate::code::load_or_build(result_path, config)?, config.bigram_coverage, config.trigram_coverage))
 }
 
 #[cfg(test)]

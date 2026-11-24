@@ -15,7 +15,6 @@ mod wiki;
 mod test_util;
 
 use std::path::Path;
-use std::io::Write;
 use std::fs;
 use anyhow::Context;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,126 +22,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 use config::{load_config, Config};
-use corpus::CorpusStats;
+use corpus::{CorpusArrays, CorpusStats};
 use precomp::Precomp;
-use layout::{init_score_norm, save_results, load_results, sort_unique_layouts};
+use score::ScoreNorm;
+use layout::{Layout, save_results, load_results, sort_unique_layouts};
 use optimizer::Optimizer;
 
-// a-z와 단어 사이 공백을 셈.
-// - 공백은 양옆이 글자인 공백 하나(단어 사이)만 셈: `the end` → he_, e_e, _en.
-//   문장부호·숫자 옆(`. The`, `end.` 뒤), 연속 공백, 줄 처음·끝, 마크업 옆 공백은 세지 않고 연속을 끊음
-// - 문장부호·숫자 자체는 n-gram에 넣지 않고 끊음
-// - 세지 않는 공백도 경우별 개수는 따로 셈 (분석 뒤 확인용 출력)
-// - 같은 글자 연속(ll)은 빅그램으로 세지 않고, 그 쌍이 낀 트라이그램도 세지 않음
+// 스페이스 키 번호 (a-z 다음). 글자 코퍼스를 세는 규칙은 wiki.rs의 analyze_bytes
 pub const SPACE_ID: u8 = 26;
-
-// 실제 글의 문장부호와 숫자 (공백 경우별 개수 출력에서 마크업 찌꺼기와 나눠 보이려고 씀)
-fn is_text_punct(b: u8) -> bool {
-  b.is_ascii_digit() || matches!(b, b'.' | b',' | b';' | b':' | b'!' | b'?' | b')' | b']' | b'(' | b'[' | b'"' | b'\'')
-}
-
-// 공백 옆에 오는 것의 종류. Other = 줄 처음·끝, 마크업이나 그 밖의 기호
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Side { Letter, Punct, Other }
-
-// 키 연속(사슬)을 이어 가며 n-gram을 셈
-struct Counter<'a> {
-  stats: &'a mut corpus::FastCorpus,
-  hist: [u8; 3],
-  len: usize,
-}
-
-impl Counter<'_> {
-  fn commit(&mut self, id: u8) {
-    self.stats.add_letter(id);
-    self.hist = [self.hist[1], self.hist[2], id];
-    self.len += 1;
-    let h = self.hist;
-    if self.len >= 2 && h[1] != 255 && h[1] != h[2] {
-      self.stats.add_bigram(h[1], h[2]);
-      if self.len >= 3 && h[0] != 255 && h[0] != h[1] { self.stats.add_trigram(h[0], h[1], h[2]); }
-    }
-  }
-
-  fn reset(&mut self) { self.len = 0; self.hist = [255; 3]; }
-
-  // 공백 run개가 left와 right 사이에서 끝남
-  fn spaces(&mut self, left: Side, right: Side, run: usize) {
-    let counted = left != Side::Other && right != Side::Other;
-    let case = if !counted { 4 } else if run > 1 { 3 } else {
-      match (left, right) { (Side::Letter, Side::Letter) => 0, (Side::Letter, _) | (_, Side::Letter) => 1, _ => 2 }
-    };
-    self.stats.space_cases[case] += 1;
-    // 단어 사이(글자 _ 글자)만 셈. 왼쪽 글자의 사슬에 이어 붙이고, 오른쪽 글자가 이어서 붙음
-    if case == 0 { self.commit(SPACE_ID); } else { self.reset(); }
-  }
-}
-
-fn analyze_bytes(bytes: &[u8], stats: &mut corpus::FastCorpus) {
-  let mut c = Counter { stats, hist: [255; 3], len: 0 };
-  let mut prev = Side::Other; // 마지막으로 본 공백이 아닌 문자 (글 처음은 Other)
-  let mut left = Side::Other;
-  let mut run = 0usize;
-  for &b in bytes {
-    if b == b' ' {
-      if run == 0 { left = prev; }
-      run += 1;
-      continue;
-    }
-    let lch = b.to_ascii_lowercase();
-    let cur = if lch.is_ascii_lowercase() { Side::Letter } else if is_text_punct(b) { Side::Punct } else { Side::Other };
-    if run > 0 { c.spaces(left, cur, run); run = 0; }
-    if cur == Side::Letter { c.commit(lch - b'a'); } else { c.reset(); }
-    prev = cur;
-  }
-  // 글 끝의 공백은 세지 않음
-  if run > 0 { c.spaces(left, Side::Other, run); }
-}
-
-// 덤프 분석: 받아 둔 파일이 있으면 병렬(멀티스트림)·이어서 분석, 아니면 스트리밍 순차 분석.
-// wikipedia_limit > 0이면 앞쪽 N개만 순차로 (빠른 확인용)
-fn analyze_dump(result_path: &Path, config: &Config, corpus_path: &Path) -> anyhow::Result<CorpusStats> {
-  // 저장할 폴더를 먼저 만듦: 몇 시간짜리 분석이 끝난 뒤 저장 단계에서 실패하지 않도록
-  if let Some(dir) = corpus_path.parent() { fs::create_dir_all(dir)?; }
-  let urls = config.dump_urls();
-  let sample = config.wikipedia_sample;
-  let checkpoint = std::path::PathBuf::from(format!("{}.partial", corpus_path.display()));
-  // 중간 저장은 병렬 분석을 끝까지 마쳤을 때만 지움 (앞쪽 N개만 보는 빠른 확인이 전체 분석의 진행을 지우지 않도록)
-  let mut parallel = false;
-  let (fast, counts) = if let Some(dump_path) = config.dump_path(result_path) {
-    if !dump_path.exists() {
-      if urls.is_empty() { anyhow::bail!("dump file {} not found and wikipedia_dump_url is empty", dump_path.display()); }
-      if let Some(dir) = dump_path.parent() { fs::create_dir_all(dir)?; }
-      println!("[Download] -> {}", dump_path.display());
-      let opts = download::DownloadOpts { verify: config.wikipedia_verify, parallel: config.wikipedia_parallel_download, ..Default::default() };
-      download::download_dump(&download::http_client()?, &urls, &dump_path, &opts)?;
-    }
-    println!("[Wikipedia Dump] Reading {}", dump_path.display());
-    if config.wikipedia_limit > 0 {
-      wiki::analyze_sequential(fs::File::open(&dump_path)?, sample, config.wikipedia_limit)?
-    } else {
-      parallel = true;
-      wiki::analyze_file_parallel(&dump_path, sample, &checkpoint)?
-    }
-  } else {
-    println!("[Wikipedia Dump] streaming: single thread, no resume (set wikipedia_download = true for both)");
-    let client = download::http_client()?;
-    let url = if urls.len() > 1 {
-      let opts = download::DownloadOpts::default();
-      download::rank_mirrors(&client, &urls, &opts)?.remove(0).url
-    } else { urls[0].clone() };
-    println!("[Wikipedia Dump] Connecting to {url}");
-    let response = client.get(&url).send()?.error_for_status()?;
-    wiki::analyze_sequential(response, sample, config.wikipedia_limit)?
-  };
-  println!("[Wikipedia Dump] used {} articles; skipped {} redirects, {} list/disambiguation pages, {} outside sample",
-    counts.articles, counts.redirects, counts.lists, counts.sampled_out);
-  fast.print_space_cases();
-  let stats = fast.into_stats();
-  stats.save(corpus_path.to_str().context("Invalid corpus path")?, dump::PARSER_VERSION)?;
-  if parallel && checkpoint.exists() { fs::remove_file(&checkpoint)?; }
-  Ok(stats)
-}
 
 // 채점·최적화에 쓸 수 있는 가장 오래된 파서 버전: 단어 사이 공백만 세는 6부터 (스페이스 키도 배열에 두므로.
 // 5는 문장부호 옆 공백까지 세서 누름 횟수가 다르고, 그 전에는 공백을 세지 않음)
@@ -165,7 +52,7 @@ fn load_corpus(corpus_path: &Path, min_parser: u32) -> anyhow::Result<CorpusStat
 // 전체 통계. 코퍼스 파일이 없거나 --reset이면 덤프를 분석해서 저장
 fn load_or_analyze(result_path: &Path, config: &Config, reset: bool, min_parser: u32) -> anyhow::Result<CorpusStats> {
   let corpus_path = result_path.join(&config.corpus_file);
-  if !reset && corpus_path.exists() { load_corpus(&corpus_path, min_parser) } else { analyze_dump(result_path, config, &corpus_path) }
+  if !reset && corpus_path.exists() { load_corpus(&corpus_path, min_parser) } else { wiki::analyze_dump(result_path, config, &corpus_path) }
 }
 
 // 최적화·채점용: 빈도가 낮은 빅/트라이그램을 config 기준으로 잘라 냄
@@ -174,11 +61,71 @@ fn for_scoring(mut stats: CorpusStats, config: &Config) -> CorpusStats {
   stats
 }
 
-fn print_results(results: &[layout::Layout], scoring: Option<(&corpus::CorpusArrays, &Precomp, &score::ScoreNorm)>) {
+// 채점 기준: 코퍼스 배열과, 지금 설정으로 만든 표와 총점 기준
+struct Scoring {
+  arrays: CorpusArrays,
+  precomp: Precomp,
+  norm: ScoreNorm,
+}
+
+impl Scoring {
+  fn new(stats: &CorpusStats, config: &Config) -> Self {
+    let arrays = stats.to_arrays();
+    let (precomp, norm) = layout::scoring(&arrays, config);
+    Scoring { arrays, precomp, norm }
+  }
+
+  // 저장된 코퍼스로 (빈도가 낮은 n-gram은 잘라 냄)
+  fn load(result_path: &Path, config: &Config) -> anyhow::Result<Self> {
+    Ok(Self::new(&for_scoring(load_corpus(&result_path.join(&config.corpus_file), MIN_SCORING_PARSER)?, config), config))
+  }
+
+  // 코퍼스 파일이 있을 때만
+  fn load_if_present(result_path: &Path, config: &Config) -> anyhow::Result<Option<Self>> {
+    if result_path.join(&config.corpus_file).exists() { Self::load(result_path, config).map(Some) } else { Ok(None) }
+  }
+
+  fn score(&self, l: &mut Layout) {
+    l.calc_scores(&self.arrays, &self.precomp);
+    l.calc_total_score(&self.norm);
+  }
+}
+
+// 저장된 결과 (결과 파일이 없으면 빈 목록). 채점 기준이 있으면 그 코퍼스와 키 구성이 같은 것만 지금 설정으로 다시 채점해서
+// 정렬 (results 명령의 순서)
+fn saved_results(result_path: &Path, config: &Config, scoring: Option<&Scoring>) -> anyhow::Result<Vec<Layout>> {
+  let file = result_path.join(&config.result_file);
+  if !file.exists() { return Ok(Vec::new()); }
+  let mut results = load_results(file.to_str().context("Invalid result file path")?)?;
+  if let Some(s) = scoring {
+    results.retain(|l| l.key_count() == s.arrays.keys.len());
+    for l in &mut results { s.score(l); }
+    layout::sort_layouts(&mut results);
+  }
+  Ok(results)
+}
+
+// 배열 파일 읽기: 행마다 10칸씩 3행 (스페이스 키는 '_', 빈칸은 '.')
+fn read_layout(file: &str) -> anyhow::Result<Layout> {
+  Layout::parse(&fs::read_to_string(file).with_context(|| format!("reading {file}"))?).with_context(|| format!("parsing {file}"))
+}
+
+// 채점할 배열 파일들: 키 구성이 코퍼스와 같아야 함. center_rare를 어기면 알리기만 함
+fn layout_files(files: &[String], s: &Scoring, config: &Config, tag: &str) -> anyhow::Result<Vec<(String, Layout)>> {
+  let center_mask = s.arrays.rare_mask(config.center_rare);
+  files.iter().map(|f| {
+    let l = read_layout(f)?;
+    anyhow::ensure!(l.key_count() == s.arrays.keys.len(), "{f} has {} letters, the corpus has {}", l.key_count(), s.arrays.keys.len());
+    if !l.center_ok(center_mask) { println!("[{tag}] note: {f} does not follow center_rare ({} letters)", config.center_rare); }
+    Ok((f.clone(), l))
+  }).collect()
+}
+
+fn print_results(results: &[Layout], scoring: Option<&Scoring>) {
   for (i, l) in results.iter().enumerate() {
     println!("[{}]", i + 1);
     l.print();
-    if let Some((arrays, precomp, norm)) = scoring { l.print_goodness(norm, arrays, precomp); }
+    if let Some(s) = scoring { l.print_goodness(&s.norm, &s.arrays, &s.precomp); }
     println!();
   }
 }
@@ -200,195 +147,34 @@ fn cmd_analyze(result_path: &Path, config: &Config, reset: bool) -> anyhow::Resu
   Ok(())
 }
 
-// 러스트 코드 코퍼스: code_crates를 crates.io에서 받아(<result_path>/crates, 의존성은 받지 않음) 세고 저장
-fn cmd_analyze_code(result_path: &Path, config: &Config) -> anyhow::Result<CorpusStats> {
-  let s = &config.symbols;
-  let dir = result_path.join("crates");
-  println!("[Code Corpus] {} crates from crates.io (latest stable versions, without dependencies) -> {}", s.code_crates.len(), dir.display());
-  let fetched = code::fetch_crates(&s.code_crates, &dir)?;
-  anyhow::ensure!(!fetched.crates.is_empty(), "none of the code_crates could be downloaded");
-  let (k, scan) = code::analyze_crates(&fetched.crates)?;
-  anyhow::ensure!(scan.files > 0, "no .rs files found in the code_crates");
-  let path = result_path.join(&s.code_corpus_file);
-  let stats = k.into_stats();
-  stats.save_with(path.to_str().context("Invalid corpus path")?, keycorpus::CODE_MAGIC, keycorpus::CODE_VERSION)?;
-  let skipped: Vec<String> = fetched.skipped.iter().map(|(n, _)| n.clone()).collect();
-  code::BuildInfo {
-    version: keycorpus::CODE_VERSION, requested: s.code_crates.clone(),
-    used: fetched.crates.iter().map(|(l, _)| l.clone()).collect(), skipped: skipped.clone(),
-  }.save(&path)?;
-  let total: u64 = scan.crates.iter().map(|c| c.1).sum();
-  #[allow(clippy::cast_precision_loss)]
-  let kb = |b: u64| b as f64 / 1e3;
-  println!("[Code Corpus] {} files, {:.0} KB without comments, each crate weighted equally -> {}", scan.files, kb(total), path.display());
-  println!("  {}", scan.crates.iter().map(|(c, b)| format!("{c} {:.0}KB", kb(*b))).collect::<Vec<_>>().join("  "));
-  keycorpus::print_summary(&stats);
-  if !skipped.is_empty() {
-    println!("[Code Corpus] warning: {} of {} crates were skipped ({}); run analyze-code again to retry", skipped.len(), s.code_crates.len(), skipped.join(", "));
-  }
-  Ok(stats)
-}
-
-// 심볼 레이어에 쓰는 코드 코퍼스의 n-gram. 코드 코퍼스가 없거나, code_crates·세는 규칙이 만들 때와 다르면 다시 만듦
-fn symbol_ngrams(result_path: &Path, config: &Config) -> anyhow::Result<symbols::Ngrams> {
-  let path = result_path.join(&config.symbols.code_corpus_file);
-  let info = code::BuildInfo::load(&path);
-  let stale = if path.exists() { code::BuildInfo::stale_reason(info.as_ref(), &config.symbols.code_crates) } else { Some("it does not exist") };
-  let code = match stale {
-    None => {
-      let (stats, v) = CorpusStats::load_with(path.to_str().context("Invalid corpus path")?, keycorpus::CODE_MAGIC)?;
-      anyhow::ensure!(v == keycorpus::CODE_VERSION, "{} has rules v{v} but its crate list says v{}; run analyze-code", path.display(), keycorpus::CODE_VERSION);
-      if let Some(i) = info.as_ref().filter(|i| !i.skipped.is_empty()) {
-        println!("[Code Corpus] note: {} was built without {} (could not be downloaded); run analyze-code to retry", path.display(), i.skipped.join(", "));
-      }
-      stats
-    }
-    Some(reason) => {
-      println!("[Code Corpus] building {}: {reason}", path.display());
-      cmd_analyze_code(result_path, config)?
-    }
-  };
-  Ok(symbols::Ngrams::new(&code, config.bigram_coverage, config.trigram_coverage))
-}
-
-// 저장된 결과를 results 명령과 같은 순서로 (코퍼스가 있으면 지금 설정으로 다시 채점해서 정렬)
-fn sorted_results(result_path: &Path, config: &Config) -> anyhow::Result<Vec<layout::Layout>> {
-  let result_file = result_path.join(&config.result_file);
-  anyhow::ensure!(result_file.exists(), "no results at {}: run optimize first, or pass a layout file", result_file.display());
-  let mut results = load_results(result_file.to_str().context("Invalid result file path")?)?;
-  let corpus_path = result_path.join(&config.corpus_file);
-  if corpus_path.exists() {
-    let arrays = for_scoring(load_corpus(&corpus_path, MIN_SCORING_PARSER)?, config).to_arrays();
-    results.retain(|l| l.key_count() == arrays.keys.len());
-    let precomp = Precomp::new(&arrays.freq, &config.weights, &config.costs, &config.effort, config.hand_hard_limit());
-    let n = init_score_norm(&arrays, &precomp, &config.costs, score::HandRule::from_config(config));
-    for l in &mut results { l.calc_scores(&arrays, &precomp); l.calc_total_score(&n); }
-    layout::sort_layouts(&mut results);
-  }
-  Ok(results)
-}
-
-// 심볼 레이어 최적화: 저장된 결과 N번(기본 1) 또는 배열 파일을 베이스로. --flip이면 베이스를 좌우로 뒤집어서
-fn cmd_symbols(result_path: &Path, config: &Config, args: &[String]) -> anyhow::Result<()> {
-  let flip = args.iter().any(|a| a == "--flip");
-  let target = args.iter().find(|a| !a.starts_with("--")).map_or("1", String::as_str);
-  let (mut base, label, what) = if let Ok(n) = target.parse::<usize>() {
-    let results = sorted_results(result_path, config)?;
-    anyhow::ensure!((1..=results.len()).contains(&n), "there are {} saved results; pick 1..={}", results.len(), results.len());
-    (results[n - 1], n.to_string(), format!("saved result #{n}"))
-  } else {
-    let l = layout::Layout::parse(&fs::read_to_string(target).with_context(|| format!("reading {target}"))?)
-      .with_context(|| format!("parsing {target}"))?;
-    let stem = Path::new(target).file_stem().map_or_else(|| "layout".to_string(), |s| s.to_string_lossy().into_owned());
-    (l, stem, target.to_string())
-  };
-  anyhow::ensure!(base.key_count() == 27, "the base layout must hold a-z and the space key (_)");
-  if flip { base = base.mirrored(); }
-  println!("[Symbols] base: {what}{}", if flip { ", mirrored" } else { "" });
-  let g = symbol_ngrams(result_path, config)?;
-  let t = symbols::Tables::new(config);
-  let problem = symbols::Problem::new(&t, &g, &base, &config.symbols)?;
-  let out = result_path.join(format!("symbols-{label}{}.txt", if flip { "-flip" } else { "" }));
-  // 같은 베이스로 저장해 둔 결과가 있으면 첫 시작점으로 (이전보다 나빠지지 않게)
-  let seed = fs::read_to_string(&out).ok().and_then(|text| symbols::parse_text(&text).ok())
-    .filter(|(b, _)| b.slots == base.slots)
-    .and_then(|(_, placed)| problem.state_of(&placed).ok())
-    .filter(|st| problem.broken_pairs(st).is_empty());
-  if seed.is_some() { println!("[Symbols] also starting from {}", out.display()); }
-  let (_, st, hits, starts) = problem.search(&config.sa, config.symbols.steps, seed);
-  println!("[Symbols] best found {hits} times in {starts} starts");
-  let text = problem.to_text(&base, &st);
-  print!("{text}");
-  problem.print_report(&st);
-  let tmp = out.with_extension("txt.tmp");
-  fs::write(&tmp, &text)?;
-  fs::rename(&tmp, &out)?;
-  println!("[Symbols] saved {} (edit it and check with `symbols-score`)", out.display());
-  Ok(())
-}
-
-// 기호 배치 파일을 같은 기준으로 채점
-fn cmd_symbols_score(result_path: &Path, config: &Config, files: &[String]) -> anyhow::Result<()> {
-  anyhow::ensure!(!files.is_empty(), "usage: <result_path> symbols-score <symbols_file>...");
-  let g = symbol_ngrams(result_path, config)?;
-  let t = symbols::Tables::new(config);
-  for f in files {
-    let (base, placed) = symbols::parse_text(&fs::read_to_string(f).with_context(|| format!("reading {f}"))?)
-      .with_context(|| format!("parsing {f}"))?;
-    let problem = symbols::Problem::new(&t, &g, &base, &config.symbols)?;
-    let st = problem.state_of(&placed)?;
-    println!("[{f}]");
-    print!("{}", problem.to_text(&base, &st));
-    let broken = problem.broken_pairs(&st);
-    if !broken.is_empty() { println!("note: pairs not placed by the pair rules: {}", broken.join(" ")); }
-    problem.print_report(&st);
-    println!();
-  }
-  Ok(())
-}
-
 fn cmd_results(result_path: &Path, config: &Config) -> anyhow::Result<()> {
   let result_file = result_path.join(&config.result_file);
-  let result_file_str = result_file.to_str().context("Invalid result file path")?;
   if !result_file.exists() {
     eprintln!("No results found at {}", result_file.display());
     std::process::exit(1);
   }
-  let mut results = load_results(result_file_str)?;
-  let corpus_path = result_path.join(&config.corpus_file);
-  let mut scoring = None;
-  if corpus_path.exists() {
-    let stats = for_scoring(load_corpus(&corpus_path, MIN_SCORING_PARSER)?, config);
-    let arrays = stats.to_arrays();
-    results.retain(|l| l.key_count() == arrays.keys.len());
-    let precomp = Precomp::new(&arrays.freq, &config.weights, &config.costs, &config.effort, config.hand_hard_limit());
-    let n = init_score_norm(&arrays, &precomp, &config.costs, score::HandRule::from_config(config));
-    for l in &mut results {
-      l.calc_scores(&arrays, &precomp);
-      l.calc_total_score(&n);
-    }
-    layout::sort_layouts(&mut results);
-    scoring = Some((arrays, precomp, n));
-  }
-  print_results(&results, scoring.as_ref().map(|(a, p, n)| (a, p, n)));
+  let scoring = Scoring::load_if_present(result_path, config)?;
+  print_results(&saved_results(result_path, config, scoring.as_ref())?, scoring.as_ref());
   Ok(())
 }
 
 // 배열 파일(행마다 10칸, 빈칸 '.')을 저장된 결과 1등과 같은 기준(같은 정규화 표본)으로 채점해 나란히 출력
 fn cmd_score(result_path: &Path, config: &Config, files: &[String]) -> anyhow::Result<()> {
   anyhow::ensure!(!files.is_empty(), "usage: <result_path> score <layout_file>...");
-  let corpus_path = result_path.join(&config.corpus_file);
-  let full = load_corpus(&corpus_path, MIN_SCORING_PARSER)?;
-  let full_arrays = full.to_arrays();
-  let windows = full.windows();
-  let arrays = for_scoring(full, config).to_arrays();
-  let precomp = Precomp::new(&arrays.freq, &config.weights, &config.costs, &config.effort, config.hand_hard_limit());
-  let center_mask = arrays.rare_mask(config.center_rare);
-  let norm = init_score_norm(&arrays, &precomp, &config.costs, score::HandRule::from_config(config));
-
-  let mut entries: Vec<(String, layout::Layout)> = Vec::new();
-  let result_file = result_path.join(&config.result_file);
-  if result_file.exists() {
-    let mut results = load_results(result_file.to_str().context("Invalid result file path")?)?;
-    results.retain(|l| l.key_count() == arrays.keys.len());
-    for l in &mut results { l.calc_scores(&arrays, &precomp); l.calc_total_score(&norm); }
-    layout::sort_layouts(&mut results);
-    if let Some(best) = results.first() { entries.push(("best saved result".to_string(), *best)); }
-  }
-  for f in files {
-    let mut l = layout::Layout::parse(&fs::read_to_string(f).with_context(|| format!("reading {f}"))?)
-      .with_context(|| format!("parsing {f}"))?;
-    anyhow::ensure!(l.key_count() == arrays.keys.len(), "{f} has {} letters, the corpus has {}", l.key_count(), arrays.keys.len());
-    if !l.center_ok(center_mask) { println!("[Score] note: {f} does not follow center_rare ({} letters)", config.center_rare); }
-    l.calc_scores(&arrays, &precomp);
-    l.calc_total_score(&norm);
-    entries.push((f.clone(), l));
+  let full = load_corpus(&result_path.join(&config.corpus_file), MIN_SCORING_PARSER)?;
+  let (full_arrays, windows) = (full.to_arrays(), full.windows());
+  let s = Scoring::new(&for_scoring(full, config), config);
+  let mut entries: Vec<(String, Layout)> = saved_results(result_path, config, Some(&s))?.into_iter().take(1)
+    .map(|l| ("best saved result".to_string(), l)).collect();
+  for (f, mut l) in layout_files(files, &s, config, "Score")? {
+    s.score(&mut l);
+    entries.push((f, l));
   }
   for (name, l) in &entries {
     println!("[{name}]");
     l.print();
-    l.print_goodness(&norm, &arrays, &precomp);
-    l.print_stats(&full_arrays, &precomp, &windows);
+    l.print_goodness(&s.norm, &s.arrays, &s.precomp);
+    l.print_stats(&full_arrays, &s.precomp, &windows);
     println!();
   }
   Ok(())
@@ -396,42 +182,20 @@ fn cmd_score(result_path: &Path, config: &Config, files: &[String]) -> anyhow::R
 
 // 점수 설정값을 하나씩 흔들어 저장된 결과와 배열 파일들의 1등이 바뀌는지 점검 (설정·결과 파일은 바꾸지 않음)
 fn cmd_sensitivity(result_path: &Path, config: &Config, files: &[String]) -> anyhow::Result<()> {
-  let arrays = for_scoring(load_corpus(&result_path.join(&config.corpus_file), MIN_SCORING_PARSER)?, config).to_arrays();
-  let precomp = Precomp::new(&arrays.freq, &config.weights, &config.costs, &config.effort, config.hand_hard_limit());
-  let center_mask = arrays.rare_mask(config.center_rare);
-  let norm = init_score_norm(&arrays, &precomp, &config.costs, score::HandRule::from_config(config));
-  let mut cands: Vec<(String, layout::Layout)> = Vec::new();
-  let result_file = result_path.join(&config.result_file);
-  if result_file.exists() {
-    let mut results = load_results(result_file.to_str().context("Invalid result file path")?)?;
-    results.retain(|l| l.key_count() == arrays.keys.len());
-    for l in &mut results { l.calc_scores(&arrays, &precomp); l.calc_total_score(&norm); }
-    layout::sort_layouts(&mut results);
-    cands.extend(results.into_iter().enumerate().map(|(i, l)| (format!("saved #{}", i + 1), l)));
-  }
-  for f in files {
-    let l = layout::Layout::parse(&fs::read_to_string(f).with_context(|| format!("reading {f}"))?)
-      .with_context(|| format!("parsing {f}"))?;
-    anyhow::ensure!(l.key_count() == arrays.keys.len(), "{f} has {} letters, the corpus has {}", l.key_count(), arrays.keys.len());
-    if !l.center_ok(center_mask) { println!("[Sensitivity] note: {f} does not follow center_rare ({} letters)", config.center_rare); }
-    cands.push((f.clone(), l));
-  }
+  let s = Scoring::load(result_path, config)?;
+  let mut cands: Vec<(String, Layout)> = saved_results(result_path, config, Some(&s))?.into_iter().enumerate()
+    .map(|(i, l)| (format!("saved #{}", i + 1), l)).collect();
+  cands.extend(layout_files(files, &s, config, "Sensitivity")?);
   anyhow::ensure!(!cands.is_empty(), "no layouts to check: run optimize first or pass layout files");
-  sensitivity::run(&arrays, config, cands, center_mask);
+  sensitivity::run(&s.arrays, config, cands, s.arrays.rare_mask(config.center_rare));
   Ok(())
 }
 
 fn run_optimize(result_path: &Path, config: &Config, stats: &corpus::CorpusStats, reset: bool) -> anyhow::Result<()> {
-  let arrays = stats.to_arrays();
-  print!("[Precomp] ..."); let _ = std::io::stdout().flush();
-  let precomp = Precomp::new(&arrays.freq, &config.weights, &config.costs, &config.effort, config.hand_hard_limit());
-  println!(" done");
-  let center_mask = arrays.rare_mask(config.center_rare);
-  print!("[Score Norm] ..."); let _ = std::io::stdout().flush();
-  let norm = init_score_norm(&arrays, &precomp, &config.costs, score::HandRule::from_config(config));
-  println!(" done");
+  let s = Scoring::new(stats, config);
+  let center_mask = s.arrays.rare_mask(config.center_rare);
   if center_mask != 0 {
-    let letters: String = (0..arrays.keys.len()).filter(|&i| center_mask >> i & 1 == 1).map(|i| arrays.keys[i]).collect();
+    let letters: String = (0..s.arrays.keys.len()).filter(|&i| center_mask >> i & 1 == 1).map(|i| s.arrays.keys[i]).collect();
     println!("[Center] least frequent {} letters forced into the center columns: {letters}", config.center_rare);
   }
   let result_file = result_path.join(&config.result_file);
@@ -440,7 +204,7 @@ fn run_optimize(result_path: &Path, config: &Config, stats: &corpus::CorpusStats
     let mut layouts = load_results(result_file_str)?;
     // 키 구성이 다른 결과(스페이스 방식이 다를 때)는 시드로 쓰지 않음
     let before = layouts.len();
-    layouts.retain(|l| l.key_count() == arrays.keys.len());
+    layouts.retain(|l| l.key_count() == s.arrays.keys.len());
     if layouts.len() < before {
       println!("[Results] skipped {} saved layouts with a different key set (made with the old thumb space key)", before - layouts.len());
     }
@@ -450,10 +214,10 @@ fn run_optimize(result_path: &Path, config: &Config, stats: &corpus::CorpusStats
     if layouts.len() < before {
       println!("[Results] skipped {} saved layouts that break center_rare", before - layouts.len());
     }
-    for l in &mut layouts { l.calc_scores(&arrays, &precomp); l.calc_total_score(&norm); }
+    for l in &mut layouts { s.score(l); }
     layouts
   } else { vec![] };
-  let optimizer = Optimizer::new(arrays, &precomp, &norm, config.elites, config.min_home_diff, config.sa.clone(), center_mask);
+  let optimizer = Optimizer::new(s.arrays.clone(), &s.precomp, &s.norm, config.elites, config.min_home_diff, config.sa.clone(), center_mask);
   println!("[Optimize]");
   let layouts = optimizer.run(&base_layouts, result_file_str);
   let mut combined = base_layouts;
@@ -461,13 +225,33 @@ fn run_optimize(result_path: &Path, config: &Config, stats: &corpus::CorpusStats
   let best = sort_unique_layouts(combined, config.elites, &[], config.min_home_diff);
   save_results(&best, result_file_str)?;
   println!("\n[Results]");
-  print_results(&best, Some((optimizer.corpus(), &precomp, &norm)));
+  print_results(&best, Some(&s));
   Ok(())
 }
 
 fn cmd_run(result_path: &Path, config: &Config, reset: bool) -> anyhow::Result<()> {
   let stats = for_scoring(load_or_analyze(result_path, config, reset, MIN_SCORING_PARSER)?, config);
   run_optimize(result_path, config, &stats, reset)
+}
+
+// 심볼 레이어 최적화: 저장된 결과 N번(기본 1, results와 같은 순서) 또는 배열 파일을 베이스로. --flip이면 베이스를 좌우로 뒤집어서
+fn cmd_symbols(result_path: &Path, config: &Config, args: &[String]) -> anyhow::Result<()> {
+  let flip = args.iter().any(|a| a == "--flip");
+  let target = args.iter().find(|a| !a.starts_with("--")).map_or("1", String::as_str);
+  let (mut base, label, what) = if let Ok(n) = target.parse::<usize>() {
+    let result_file = result_path.join(&config.result_file);
+    anyhow::ensure!(result_file.exists(), "no results at {}: run optimize first, or pass a layout file", result_file.display());
+    let results = saved_results(result_path, config, Scoring::load_if_present(result_path, config)?.as_ref())?;
+    anyhow::ensure!((1..=results.len()).contains(&n), "there are {} saved results; pick 1..={}", results.len(), results.len());
+    (results[n - 1], n.to_string(), format!("saved result #{n}"))
+  } else {
+    let stem = Path::new(target).file_stem().map_or_else(|| "layout".to_string(), |s| s.to_string_lossy().into_owned());
+    (read_layout(target)?, stem, target.to_string())
+  };
+  anyhow::ensure!(base.key_count() == 27, "the base layout must hold a-z and the space key (_)");
+  if flip { base = base.mirrored(); }
+  println!("[Symbols] base: {what}{}", if flip { ", mirrored" } else { "" });
+  symbols::optimize(result_path, config, &base, &format!("{label}{}", if flip { "-flip" } else { "" }))
 }
 
 const USAGE: &str = "[analyze|optimize|run|results|score <layout_file>...|sensitivity [layout_file]...|analyze-code|symbols [N|layout_file] [--flip]|symbols-score <symbols_file>...] [--reset]";
@@ -506,9 +290,9 @@ fn main() -> anyhow::Result<()> {
     Some("results")  => cmd_results(result_path, &config),
     Some("score")    => cmd_score(result_path, &config, &args[3..].iter().filter(|a| *a != "--reset").cloned().collect::<Vec<_>>()),
     Some("sensitivity") => cmd_sensitivity(result_path, &config, &args[3..].iter().filter(|a| *a != "--reset").cloned().collect::<Vec<_>>()),
-    Some("analyze-code") => cmd_analyze_code(result_path, &config).map(|_| ()),
+    Some("analyze-code") => code::build_corpus(result_path, &config).map(|_| ()),
     Some("symbols") => cmd_symbols(result_path, &config, &args[3..]),
-    Some("symbols-score") => cmd_symbols_score(result_path, &config, &args[3..]),
+    Some("symbols-score") => symbols::score_files(result_path, &config, &args[3..]),
     _ => {
       eprintln!("Usage: {} <result_path> {USAGE}", args[0]);
       std::process::exit(1);
@@ -518,161 +302,7 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-  use super::analyze_bytes;
-  use corpus::FastCorpus;
-  use crate::corpus;
-  use crate::layout::CHARS;
-
-  fn id(c: char) -> usize { (c as u8 - b'a') as usize }
-  fn run(text: &str) -> FastCorpus { let mut f = FastCorpus::new(); analyze_bytes(text.as_bytes(), &mut f); f }
-  fn bi(f: &FastCorpus, s: &str) -> u64 { let c: Vec<char> = s.chars().collect(); f.bigrams[id(c[0]) * CHARS + id(c[1])] }
-  fn tri(f: &FastCorpus, s: &str) -> u64 {
-    let c: Vec<char> = s.chars().collect();
-    f.trigrams[(id(c[0]) * CHARS + id(c[1])) * CHARS + id(c[2])]
-  }
-
-  const SP: char = ' ';
-  fn idc(c: char) -> usize { if c == SP { 26 } else { id(c) } }
-  fn bi_s(f: &FastCorpus, a: char, b: char) -> u64 { f.bigrams[idc(a) * CHARS + idc(b)] }
-  fn tri_s(f: &FastCorpus, a: char, b: char, c: char) -> u64 { f.trigrams[(idc(a) * CHARS + idc(b)) * CHARS + idc(c)] }
-
-  #[test]
-  fn one_space_between_letters_is_counted() {
-    let f = run("ab Cd");
-    assert_eq!(f.letters[26], 1);
-    assert_eq!((bi_s(&f, 'b', SP), bi_s(&f, SP, 'c')), (1, 1));
-    assert_eq!((tri_s(&f, 'a', 'b', SP), tri_s(&f, 'b', SP, 'c'), tri_s(&f, SP, 'c', 'd')), (1, 1, 1));
-    // 공백을 건너뛴 글자끼리는 이어지지 않음, 대문자는 소문자로
-    assert_eq!((bi(&f, "bc"), tri(&f, "abc"), tri(&f, "bcd"), bi(&f, "cd")), (0, 0, 0, 1));
-    assert_eq!(f.letters.iter().take(26).sum::<u64>(), 4);
-    // 한 글자 단어: 공백-글자-공백 트라이그램
-    let f = run("x a y");
-    assert_eq!((tri_s(&f, 'x', SP, 'a'), tri_s(&f, SP, 'a', SP), tri_s(&f, 'a', SP, 'y')), (1, 1, 1));
-    assert_eq!(f.letters[26], 2);
-  }
-
-  // 공백이 낀 n-gram이 하나도 없는지
-  fn no_space_ngrams(f: &FastCorpus) -> bool {
-    f.bigrams.iter().skip(26).step_by(CHARS).all(|&c| c == 0) && f.bigrams[26 * CHARS..27 * CHARS].iter().all(|&c| c == 0)
-      && f.trigrams.iter().enumerate().all(|(k, &c)| c == 0 || (k % CHARS != 26 && k / CHARS % CHARS != 26 && k / (CHARS * CHARS) != 26))
-  }
-
-  #[test]
-  fn spaces_next_to_punctuation_are_not_counted() {
-    // 글자 _ 문장부호, 문장부호 _ 글자, 숫자 옆, 문장부호끼리: 세지 않고 끊음 (경우별 개수만)
-    for (text, cases) in [("ab ,cd", [0, 1, 0, 0, 0]), ("ab, cd", [0, 1, 0, 0, 0]), ("ab 1 cd", [0, 2, 0, 0, 0]), ("ab. (cd", [0, 0, 1, 0, 0])] {
-      let f = run(text);
-      assert_eq!((f.letters[26], f.space_cases), (0, cases), "{text:?}");
-      assert!(no_space_ngrams(&f), "{text:?}");
-      assert_eq!((bi(&f, "ab"), bi(&f, "cd")), (1, 1), "{text:?}");
-    }
-    // ". The"의 공백은 세지 않지만 뒤 단어 안의 n-gram은 그대로
-    let f = run("end. The");
-    assert_eq!((f.letters[26], tri(&f, "the"), bi(&f, "dt")), (0, 1, 0));
-  }
-
-  #[test]
-  fn double_spaces_are_not_counted() {
-    for text in ["abc  De", "ab,   cd"] {
-      let f = run(text);
-      assert_eq!((f.letters[26], f.space_cases), (0, [0, 0, 0, 1, 0]), "{text:?}");
-      assert!(no_space_ngrams(&f), "{text:?}");
-    }
-    let f = run("abc  De");
-    assert_eq!((bi(&f, "ab"), bi(&f, "bc"), tri(&f, "abc"), bi(&f, "cd"), bi(&f, "de")), (1, 1, 1, 0, 1));
-  }
-
-  #[test]
-  fn spaces_at_line_edges_or_next_to_markup_are_not_counted() {
-    for (text, cases) in [(" ab ", 2), ("ab \ncd", 1), ("ab\n cd", 1), ("ab | cd", 2), ("ab =cd", 1), ("ab\tcd", 0)] {
-      let f = run(text);
-      assert_eq!((f.letters[26], f.space_cases), (0, [0, 0, 0, 0, cases]), "{text:?}");
-      assert!(no_space_ngrams(&f), "{text:?}");
-    }
-  }
-
-  #[test]
-  fn letter_space_letter_counts_match_a_direct_scan() {
-    // "a _ c"는 v4와 같은 규칙: 양옆이 글자인 공백 하나
-    let text = crate::test_util::TEXT.repeat(2) + " A few, odd  spaces; and an I here. x y z (q) 3 dogs";
-    let f = run(&text);
-    let b = text.as_bytes();
-    let mut want = vec![0u64; 26 * 26];
-    for i in 1..b.len() - 1 {
-      if b[i] == b' ' && b[i - 1].is_ascii_alphabetic() && b[i + 1].is_ascii_alphabetic() {
-        want[id(b[i - 1].to_ascii_lowercase() as char) * 26 + id(b[i + 1].to_ascii_lowercase() as char)] += 1;
-      }
-    }
-    for a in 0..26 { for c in 0..26 { assert_eq!(f.trigrams[(a * CHARS + 26) * CHARS + c], want[a * 26 + c]); } }
-    // 누름은 단어 사이 공백만
-    assert_eq!(f.letters[26], f.space_cases[0]);
-  }
-
-  #[test]
-  fn repeated_letters_next_to_a_space_follow_the_old_rule() {
-    // ll은 세지 않고 ll이 낀 트라이그램도 세지 않음. l_, l_i는 셈
-    let f = run("all in");
-    assert_eq!((bi(&f, "ll"), tri(&f, "all"), tri_s(&f, 'l', 'l', SP)), (0, 0, 0));
-    assert_eq!((bi_s(&f, 'l', SP), tri_s(&f, 'l', SP, 'i'), tri_s(&f, SP, 'i', 'n')), (1, 1, 1));
-  }
-
-  #[test]
-  fn letter_only_counts_match_the_old_space_breaking_rule() {
-    let text = crate::test_util::TEXT.repeat(3) + " A few, odd  spaces; and an I here. x y z";
-    let new = run(&text);
-    // 예전 규칙: 공백도 연속을 끊음 (줄바꿈으로 바꿔 세면 같음)
-    let old = run(&text.replace(' ', "\n"));
-    for i in 0..26 { assert_eq!(new.letters[i], old.letters[i]); }
-    for a in 0..26 { for b in 0..26 {
-      assert_eq!(new.bigrams[a * CHARS + b], old.bigrams[a * CHARS + b]);
-      for c in 0..26 { let k = (a * CHARS + b) * CHARS + c; assert_eq!(new.trigrams[k], old.trigrams[k]); }
-    }}
-    assert!(new.letters[26] > 0 && old.letters[26] == 0);
-  }
-
-  // 문서 몇 개짜리 bz2 덤프
-  fn tiny_dump(path: &std::path::Path) {
-    use std::io::Write;
-    let mut xml = String::from("<mediawiki>\n");
-    for i in 0..5 { xml.push_str(&format!("<page><title>Article {i}</title><ns>0</ns><revision><text>Some words here {i}.</text></revision></page>\n")); }
-    xml.push_str("</mediawiki>\n");
-    let mut e = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::fast());
-    e.write_all(xml.as_bytes()).unwrap();
-    std::fs::write(path, e.finish().unwrap()).unwrap();
-  }
-
-  fn test_config(dump_file: &std::path::Path, limit: usize) -> crate::config::Config {
-    let mut c = crate::config::load_config(std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/config.toml"))).unwrap();
-    c.wikipedia_dump_file = Some(dump_file.to_str().unwrap().to_string());
-    c.wikipedia_limit = limit;
-    c
-  }
-
-  #[test]
-  fn analyze_creates_missing_result_dir_and_keeps_checkpoint_for_quick_runs() {
-    let root = std::env::temp_dir().join(format!("p2anut-main-{}", std::process::id()));
-    let dumps = root.join("dumps");
-    std::fs::create_dir_all(&dumps).unwrap();
-    let dump = dumps.join("d.xml.bz2");
-    tiny_dump(&dump);
-
-    // 결과 폴더가 없어도 (덤프는 다른 곳) 분석 후 저장까지 됨
-    let result = root.join("new").join("result");
-    let corpus = result.join("corpus.bin");
-    let stats = super::analyze_dump(&result, &test_config(&dump, 2), &corpus).unwrap();
-    assert!(corpus.exists() && stats.letters.values().sum::<u64>() > 0);
-
-    // 앞쪽 N개만 보는 빠른 확인은 전체 분석의 중간 저장을 지우지 않음
-    let checkpoint = std::path::PathBuf::from(format!("{}.partial", corpus.display()));
-    std::fs::write(&checkpoint, b"in-progress").unwrap();
-    super::analyze_dump(&result, &test_config(&dump, 2), &corpus).unwrap();
-    assert_eq!(std::fs::read(&checkpoint).unwrap(), b"in-progress");
-
-    // 병렬 분석을 끝까지 마치면 지움 (내용이 맞지 않는 중간 저장은 무시하고 처음부터 분석)
-    super::analyze_dump(&result, &test_config(&dump, 0), &corpus).unwrap();
-    assert!(!checkpoint.exists());
-    std::fs::remove_dir_all(&root).unwrap();
-  }
+  use crate::layout::{self, Layout};
 
   #[test]
   fn scoring_refuses_corpora_built_before_spaces_were_counted() {
@@ -691,8 +321,29 @@ mod tests {
   }
 
   #[test]
-  fn punctuation_and_newlines_break_sequences() {
-    let f = run("ab,cd\nef");
-    assert_eq!((bi(&f, "bc"), bi(&f, "de"), bi(&f, "cd"), bi(&f, "ef")), (0, 0, 1, 1));
+  fn saved_results_are_rescored_and_sorted_when_a_corpus_is_given() {
+    let dir = std::env::temp_dir().join(format!("p2anut-saved-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = crate::config::load_config(std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/config.toml"))).unwrap();
+    let s = super::Scoring::new(&crate::test_util::stats(), &config);
+    // 결과 파일이 없으면 빈 목록
+    assert!(super::saved_results(&dir, &config, Some(&s)).unwrap().is_empty());
+    // 무작위 배열 5개와, 키 구성이 다른 배열 하나 (스페이스 키를 뺀 것)
+    let mut ls: Vec<Layout> = (0..5).map(|_| Layout::make_random(&s.arrays.keys, &[], 0)).collect();
+    let mut odd = ls[0];
+    odd.slots[odd.pos[crate::SPACE_ID as usize] as usize] = layout::EMPTY;
+    odd.pos[crate::SPACE_ID as usize] = layout::EMPTY;
+    ls.push(odd);
+    layout::save_results(&ls, dir.join(&config.result_file).to_str().unwrap()).unwrap();
+    // 채점 기준이 없으면 파일 그대로
+    let slots = |v: &[Layout]| v.iter().map(|l| l.slots).collect::<Vec<_>>();
+    assert_eq!(slots(&super::saved_results(&dir, &config, None).unwrap()), slots(&ls));
+    // 있으면 키 구성이 같은 것만 지금 설정으로 다시 채점해서 높은 점수부터
+    let sorted = super::saved_results(&dir, &config, Some(&s)).unwrap();
+    assert_eq!(sorted.len(), 5);
+    for l in &sorted { let mut again = *l; s.score(&mut again); assert_eq!(again.total, l.total); }
+    assert!(sorted.windows(2).all(|w| w[0].total >= w[1].total));
+    assert!(sorted.iter().all(|l| ls[..5].iter().any(|o| o.slots == l.slots)));
+    std::fs::remove_dir_all(&dir).unwrap();
   }
 }

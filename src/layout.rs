@@ -289,11 +289,11 @@ impl Layout {
   }
 
   // 스페이스 키 몫의 비용 (글자 100개당, 총점에 이미 들어 있음): 스페이스 누름의 노력과
-  // 스페이스가 낀 빅/트라이그램의 sfb·시저스·롤. 배열에 스페이스 키가 없으면 None
-  pub fn space_cost(&self, corpus: &CorpusArrays, precomp: &Precomp, norm: &ScoreNorm) -> Option<f64> {
+  // 스페이스가 낀 빅/트라이그램의 sfb·시저스·롤. 배열에 스페이스 키가 없으면 0
+  pub fn space_cost(&self, corpus: &CorpusArrays, precomp: &Precomp, norm: &ScoreNorm) -> f64 {
     let sp = crate::SPACE_ID;
     let ps = self.pos[sp as usize];
-    if ps == EMPTY { return None; }
+    if ps == EMPTY { return 0.0; }
     let mut sc = Score { effort: precomp.effort(ps as usize, sp as usize), ..Score::default() };
     for &(a, b, n) in &corpus.nz_bigrams {
       if a != sp && b != sp { continue; }
@@ -314,10 +314,10 @@ impl Layout {
       sc.scissors += n as f64 * f64::from(e.skip_scissors_base);
     }
     let c = norm.cost_breakdown(&sc);
-    Some(c.effort + c.sfb + c.scissors + c.rolling)
+    c.effort + c.sfb + c.scissors + c.rolling
   }
 
-  // 글자 100개당 항목별 비용 (손 비율 감점이 있으면 함께, 스페이스를 배열에 두면 그 몫도 따로)
+  // 글자 100개당 항목별 비용 (손 비율 감점이 있으면 함께, 스페이스 키의 몫도 따로)
   pub fn print_goodness(&self, norm: &ScoreNorm, corpus: &CorpusArrays, precomp: &Precomp) {
     if self.total <= PENALTY_SCORE {
       println!("DISQUALIFIED: one hand types less than hand_hard_limit (costs below are for reference only)");
@@ -326,8 +326,8 @@ impl Layout {
     let hand = norm.hand_cost(self.left_usage, self.right_usage);
     let total = c.effort + c.sfb + c.rolling + c.scissors + hand;
     let hand_part = if hand > 0.0 { format!("  hand-balance={hand:.1}") } else { String::new() };
-    let space_part = self.space_cost(corpus, precomp, norm).map_or(String::new(), |sp| format!("  (space key {sp:.1} of the total)"));
-    println!("total={total:.1}  effort={:.1}  sfb={:.1}  scissors={:.1}  rolling={:.1}{hand_part}{space_part}", c.effort, c.sfb, c.scissors, c.rolling);
+    let space = self.space_cost(corpus, precomp, norm);
+    println!("total={total:.1}  effort={:.1}  sfb={:.1}  scissors={:.1}  rolling={:.1}{hand_part}  (space key {space:.1} of the total)", c.effort, c.sfb, c.scissors, c.rolling);
   }
 
   pub fn calc_total_score(&mut self, norm: &ScoreNorm) {
@@ -381,6 +381,13 @@ pub fn load_results(path: &str) -> anyhow::Result<Vec<Layout>> {
 // 총점 기준: [costs]의 대표 사건 비용을 환산한 배율과 손 비율 감점
 pub fn init_score_norm(arrays: &CorpusArrays, precomp: &Precomp, costs: &crate::config::Costs, hand: crate::score::HandRule) -> ScoreNorm {
   ScoreNorm { abs: abs_weights(arrays, precomp, costs), hand }
+}
+
+// 설정대로 채점할 때의 표와 총점 기준
+pub fn scoring(arrays: &CorpusArrays, c: &crate::config::Config) -> (Precomp, ScoreNorm) {
+  let precomp = Precomp::new(&arrays.freq, &c.weights, &c.costs, &c.effort, c.hand_hard_limit());
+  let norm = init_score_norm(arrays, &precomp, &c.costs, crate::score::HandRule::from_config(c));
+  (precomp, norm)
 }
 
 // 대표 사건 (왼손): 검지 홈(1,3)·검지 윗줄(0,3)·중지 홈(1,2)·중지 아랫줄(2,2). 롤·리다이렉트의 대표 사건은 Precomp에 있음
@@ -527,14 +534,14 @@ mod tests {
     for _ in 0..20 {
       let mut l = Layout::make_random(&g.keys, &[], 0);
       l.calc_scores(&g, &precomp);
-      let space = l.space_cost(&g, &precomp, &norm).unwrap();
+      let space = l.space_cost(&g, &precomp, &norm);
       // 스페이스를 빼면 그 몫만큼 줄어듦
       let mut without = l;
       without.slots[l.pos[crate::SPACE_ID as usize] as usize] = EMPTY;
       without.pos[crate::SPACE_ID as usize] = EMPTY;
       without.calc_scores(&g, &precomp);
       assert!((cost(&l) - cost(&without) - space).abs() < 1e-9 * cost(&l).abs().max(1.0), "{} {} {space}", cost(&l), cost(&without));
-      assert!(without.space_cost(&g, &precomp, &norm).is_none());
+      assert_eq!(without.space_cost(&g, &precomp, &norm), 0.0);
       // 손 비율에 스페이스 누름도 들어감
       assert_eq!(l.left_usage + l.right_usage, g.freq.iter().sum::<u64>());
     }
