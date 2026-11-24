@@ -138,6 +138,16 @@ fn saved_results(result_path: &Path, config: &Config, scoring: Option<&Scoring>)
   Ok(results)
 }
 
+// 결과 파일이 없을 때의 안내. 코드를 섞으면 결과 파일이 따로라서, 섞기 전의 결과가 있어도 optimize를 먼저 돌려야 함
+fn no_results(result_path: &Path, config: &Config) -> String {
+  let mut msg = format!("no results at {}: run optimize first", config.result_file_in(result_path).display());
+  let plain = result_path.join(&config.result_file);
+  if config.code_share > 0.0 && plain.exists() {
+    msg += &format!(" (code_share {} keeps its own results; the results without code are in {} and show with code_share = 0)", config.code_share, plain.display());
+  }
+  msg
+}
+
 // 배열 파일 읽기: 행마다 10칸씩 3행 (스페이스 키는 '_', 빈칸은 '.')
 fn read_layout(file: &str) -> anyhow::Result<Layout> {
   Layout::parse(&fs::read_to_string(file).with_context(|| format!("reading {file}"))?).with_context(|| format!("parsing {file}"))
@@ -183,7 +193,7 @@ fn cmd_analyze(result_path: &Path, config: &Config, reset: bool) -> anyhow::Resu
 fn cmd_results(result_path: &Path, config: &Config) -> anyhow::Result<()> {
   let result_file = config.result_file_in(result_path);
   if !result_file.exists() {
-    eprintln!("No results found at {}", result_file.display());
+    eprintln!("{}", no_results(result_path, config));
     std::process::exit(1);
   }
   println!("[Results] {}", result_file.display());
@@ -281,7 +291,7 @@ fn cmd_symbols(result_path: &Path, config: &Config, args: &[String]) -> anyhow::
   let target = args.iter().find(|a| !a.starts_with("--")).map_or("1", String::as_str);
   let (mut base, label, what) = if let Ok(n) = target.parse::<usize>() {
     let result_file = config.result_file_in(result_path);
-    anyhow::ensure!(result_file.exists(), "no results at {}: run optimize first, or pass a layout file", result_file.display());
+    anyhow::ensure!(result_file.exists(), "{}, or pass a layout file", no_results(result_path, config));
     let results = saved_results(result_path, config, Scoring::load_if_present(result_path, config)?.as_ref())?;
     anyhow::ensure!((1..=results.len()).contains(&n), "there are {} saved results; pick 1..={}", results.len(), results.len());
     // 코드를 섞은 결과면 그 표시를 붙임 (symbols-code50-1.txt): 비율마다 N번 배열이 다름
@@ -384,6 +394,22 @@ mod tests {
     for l in &sorted { let mut again = *l; s.score(&mut again); assert_eq!(again.total, l.total); }
     assert!(sorted.windows(2).all(|w| w[0].total >= w[1].total));
     assert!(sorted.iter().all(|l| ls[..5].iter().any(|o| o.slots == l.slots)));
+    std::fs::remove_dir_all(&dir).unwrap();
+  }
+
+  #[test]
+  fn missing_results_point_to_optimize_and_the_results_without_code() {
+    let dir = std::env::temp_dir().join(format!("p2anut-none-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut config = crate::config::load_config(std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/config.toml"))).unwrap();
+    let msg = super::no_results(&dir, &config);
+    assert!(msg.contains("result-grid-code50.bin: run optimize first") && !msg.contains("without code"), "{msg}");
+    // 섞기 전 결과가 있으면 그 파일과 보는 법도 알려 줌
+    std::fs::write(dir.join(&config.result_file), b"").unwrap();
+    let msg = super::no_results(&dir, &config);
+    assert!(msg.contains("without code are in") && msg.contains("result-grid.bin") && msg.contains("code_share = 0"), "{msg}");
+    config.code_share = 0.0;
+    assert!(!super::no_results(&dir, &config).contains("without code"));
     std::fs::remove_dir_all(&dir).unwrap();
   }
 
