@@ -118,6 +118,8 @@ impl<'a> Optimizer<'a> {
 
     for i in 0..elites_len {
       let (elite, tally) = self.find_one(i + 1, elites_len, &excluded_homes, seeds.get(i).copied(), start);
+      // 점수는 좌우 대칭이라, 스페이스가 오른손 쪽에 오게 뒤집어 둠
+      let elite = elite.space_right();
       excluded_homes.push(home_row_keys(&elite));
       all_elites.push(elite);
       sort_layouts(&mut all_elites);
@@ -860,6 +862,8 @@ mod tests {
     let elites = o.run(&[], path.to_str().unwrap());
     let _ = std::fs::remove_file(&path);
     assert_eq!(elites.len(), 3);
+    // 스페이스는 늘 오른손 쪽
+    assert!(elites.iter().all(|l| l.pos[crate::SPACE_ID as usize] as usize % COLS >= COLS / 2));
     for i in 0..elites.len() { for j in i + 1..elites.len() {
       assert!(crate::layout::home_diff(home_row_keys(&elites[i]), home_row_keys(&elites[j])) >= 2);
     }}

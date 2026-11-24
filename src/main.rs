@@ -385,15 +385,16 @@ mod tests {
     odd.pos[crate::SPACE_ID as usize] = layout::EMPTY;
     ls.push(odd);
     layout::save_results(&ls, config.result_file_in(&dir).to_str().unwrap()).unwrap();
-    // 채점 기준이 없으면 파일 그대로
+    // 채점 기준이 없으면 파일 그대로 (스페이스가 왼손에 있는 배열만 좌우를 뒤집음)
     let slots = |v: &[Layout]| v.iter().map(|l| l.slots).collect::<Vec<_>>();
-    assert_eq!(slots(&super::saved_results(&dir, &config, None).unwrap()), slots(&ls));
+    let right: Vec<Layout> = ls.iter().map(Layout::space_right).collect();
+    assert_eq!(slots(&super::saved_results(&dir, &config, None).unwrap()), slots(&right));
     // 있으면 키 구성이 같은 것만 지금 설정으로 다시 채점해서 높은 점수부터
     let sorted = super::saved_results(&dir, &config, Some(&s)).unwrap();
     assert_eq!(sorted.len(), 5);
     for l in &sorted { let mut again = *l; s.score(&mut again); assert_eq!(again.total, l.total); }
     assert!(sorted.windows(2).all(|w| w[0].total >= w[1].total));
-    assert!(sorted.iter().all(|l| ls[..5].iter().any(|o| o.slots == l.slots)));
+    assert!(sorted.iter().all(|l| right[..5].iter().any(|o| o.slots == l.slots)));
     std::fs::remove_dir_all(&dir).unwrap();
   }
 

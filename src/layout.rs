@@ -200,12 +200,19 @@ impl Layout {
       pct(skip), pct(skip_space));
   }
 
-  // 좌우를 뒤집은 배열 (점수는 같음. 스페이스를 반대 손으로 옮겨 쓸 때 등)
+  // 좌우를 뒤집은 배열 (점수는 같음. 스페이스를 반대 손으로 옮겨 쓸 때 등). 손 비율도 서로 바뀜
   pub fn mirrored(&self) -> Layout {
     let mut m = *self;
     for r in 0..ROWS { m.slots[r * COLS..(r + 1) * COLS].reverse(); }
     for (p, &id) in m.slots.iter().enumerate() { if id < CHARS as u8 { m.pos[id as usize] = p as u8; } }
+    std::mem::swap(&mut m.left_usage, &mut m.right_usage);
     m
+  }
+
+  // 스페이스 키가 오른손 쪽에 오게: 왼손에 있으면 좌우를 뒤집음 (점수는 좌우 대칭이라 그대로). 스페이스가 없으면 그대로
+  pub fn space_right(&self) -> Layout {
+    let p = self.pos[crate::SPACE_ID as usize];
+    if p != EMPTY && (p as usize % COLS) < COLS / 2 { self.mirrored() } else { *self }
   }
 
   pub fn key_count(&self) -> usize {
@@ -373,9 +380,11 @@ pub fn save_results(layouts: &[Layout], path: &str) -> anyhow::Result<()> {
   Ok(())
 }
 
+// 저장된 결과. 스페이스가 왼손에 있는 배열(예전 결과)은 좌우를 뒤집어서 (space_right)
 pub fn load_results(path: &str) -> anyhow::Result<Vec<Layout>> {
   let bytes = std::fs::read(path)?;
-  Ok(bincode::deserialize(&bytes)?)
+  let layouts: Vec<Layout> = bincode::deserialize(&bytes)?;
+  Ok(layouts.iter().map(Layout::space_right).collect())
 }
 
 // 총점 기준: [costs]의 대표 사건 비용을 환산한 배율과 손 비율 감점
@@ -500,6 +509,31 @@ mod tests {
       assert!(home_diff(home_row_keys(&kept[i]), home_row_keys(&kept[j])) >= 3);
     }}
     assert!(kept.windows(2).all(|w| w[0].total >= w[1].total));
+  }
+
+  #[test]
+  fn space_right_mirrors_only_layouts_with_the_space_on_the_left() {
+    let stats = test_util::stats();
+    let g = stats.to_arrays();
+    let (precomp, norm) = test_util::precomp_norm_for(&g);
+    let mut seen = [false; 2];
+    for _ in 0..40 {
+      let mut l = Layout::make_random(&g.keys, &[], 0);
+      l.calc_scores(&g, &precomp);
+      l.calc_total_score(&norm);
+      let left = (l.pos[crate::SPACE_ID as usize] as usize % COLS) < COLS / 2;
+      seen[usize::from(left)] = true;
+      let r = l.space_right();
+      r.assert_invariants();
+      assert!(r.pos[crate::SPACE_ID as usize] as usize % COLS >= COLS / 2);
+      assert_eq!(r.slots, if left { l.mirrored().slots } else { l.slots });
+      // 점수는 좌우 대칭이라 다시 채점해도 같고, 손 비율은 뒤집은 쪽으로 맞음
+      let mut again = r;
+      again.calc_scores(&g, &precomp);
+      again.calc_total_score(&norm);
+      assert_eq!((again.total, again.left_usage, again.right_usage), (r.total, r.left_usage, r.right_usage));
+    }
+    assert!(seen[0] && seen[1]);
   }
 
   #[test]
@@ -649,6 +683,10 @@ mod tests {
     save_results(&ls[..1], path).unwrap();
     assert_eq!(load_results(path).unwrap().len(), 1);
     assert!(!std::path::Path::new(&format!("{path}.tmp")).exists());
+    // 스페이스가 왼손에 있던 결과는 읽을 때 좌우를 뒤집음
+    let left = Layout::parse("_blyx.foup\nmanijzreht\ncgkdq.s.vw\n").unwrap();
+    save_results(&[left], path).unwrap();
+    assert_eq!(load_results(path).unwrap()[0].slots, left.mirrored().slots);
     std::fs::remove_dir_all(&dir).unwrap();
   }
 
