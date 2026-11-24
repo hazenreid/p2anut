@@ -16,8 +16,10 @@
 // 짝: pairs(순서 있음)는 같은 줄에만. 한 손 안이면 떨어져 있어도 되고 첫 글자가 왼쪽, 양손에 나뉘면 좌우 대칭(같은 손가락)에
 // 첫 글자가 왼손. loose_pairs(순서 없음)는 거기에 더해 한 손 같은 열(떨어져 있어도 됨)도 되고 어느 쪽이 먼저든.
 // 짝은 심볼 레이어 안에서만.
-// 괄호 묶음 (외우기 쉽게): pairs끼리는 한 손 짝끼리, 좌우 대칭 짝끼리 각각 모두 같은 손가락(오른손은 거울 자리)이거나 모두
-// 같은 줄이어야 함. 담금질은 어긴 쌍마다 GROUP_PENALTY를 더한 채 거쳐 갈 수 있고, 결과는 지키는 배치에서만 고름.
+// 짝 맞춤 (외우기 쉽게): 순서 있는 짝과 없는 짝을 가리지 않고 모양이 같은 짝끼리 자리를 맞춤 (오른손은 거울 자리로 봄).
+// 한 손 가로 짝은 모두 같은 두 열 (양쪽으로 한 칸씩 넓은 짝은 같은 줄에서 그 짝을 감쌀 때만), 한 손 세로 짝은 모두 같은
+// 두 줄, 양손 대칭 짝은 모두 같은 열이거나 모두 같은 줄 (꺾인 모양은 바로 옆끼리 이어질 때만). 담금질은 어긴 쌍마다
+// GROUP_PENALTY를 더한 채 거쳐 갈 수 있고, 결과는 지키는 배치에서만 고름.
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 use std::collections::HashMap;
 use std::path::Path;
@@ -35,7 +37,7 @@ pub const SPACE_TOKEN: char = '␣';
 // 담금질 온도 (글자 100개당 비용 단위): 처음에는 이 정도 악화를 자주 받아들이고 끝에는 거의 안 받아들임
 const T_START: f64 = 3.0;
 const T_END: f64 = 0.0005;
-// 괄호 묶음 규칙을 어긴 쌍 하나의 벌점 (글자 100개당 비용 단위). 담금질 초반에는 어긴 배치를 거쳐 갈 수 있고 끝에는 거의 못 감.
+// 짝 맞춤 규칙을 어긴 쌍 하나의 벌점 (글자 100개당 비용 단위). 담금질 초반에는 어긴 배치를 거쳐 갈 수 있고 끝에는 거의 못 감.
 // 결과는 규칙을 지키는 배치에서만 고르므로 벌점은 탐색에만 씀
 const GROUP_PENALTY: f64 = 5.0;
 
@@ -187,8 +189,6 @@ pub struct Problem<'a> {
   key_pos: [u8; KEYS],
   slots: Vec<Slot>,
   pairs: Vec<Pair>,
-  // pairs의 앞쪽 n_ordered개가 순서 있는 짝(괄호)
-  n_ordered: usize,
   pair_of: Vec<Option<usize>>,
   singles: Vec<usize>,
   tap_cost: f64,
@@ -236,36 +236,92 @@ fn placements(ordered: bool) -> Vec<(u8, u8)> {
   v
 }
 
-// 괄호 한 쌍의 모양 (위치는 칸 번호 = 줄 × 10 + 열): (묶음, 줄, 손가락). 묶음 0은 한 손 짝이고 손가락은 왼손 기준 두 열
-// (오른손은 거울 자리로 바꿈), 묶음 1은 좌우 대칭이고 손가락은 왼손 열. 짝 규칙에 맞지 않는 자리는 None
-fn bracket_shape(a: usize, b: usize) -> Option<(usize, usize, usize)> {
+// 짝 하나의 모양 (위치는 칸 번호 = 줄 × 10 + 열, 두 기호의 순서는 상관없음). 열은 왼손 기준 (오른손은 거울 자리로 바꿈)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Shape {
+  // 한 손 가로: 손(0 왼손, 1 오른손), 줄, 두 열
+  Row { hand: usize, row: usize, cols: (usize, usize) },
+  // 한 손 세로: 위아래 두 줄, 열
+  Col { rows: (usize, usize), col: usize },
+  // 양손 대칭: 줄, 열
+  Mirror { row: usize, col: usize },
+}
+
+impl Shape {
+  // 맞춤 묶음: 0 한 손 가로, 1 한 손 세로, 2 양손 대칭
+  fn group(self) -> usize { match self { Shape::Row { .. } => 0, Shape::Col { .. } => 1, Shape::Mirror { .. } => 2 } }
+}
+
+// 짝 규칙에 맞지 않는 자리(대각선, 양손인데 대칭이 아님)는 None
+fn pair_shape(a: usize, b: usize) -> Option<Shape> {
   let half = COLS / 2;
+  let left = |c: usize| if c < half { c } else { COLS - 1 - c };
   let ((ra, ca), (rb, cb)) = ((a / COLS, a % COLS), (b / COLS, b % COLS));
-  if ra != rb { return None; }
-  let (lo, hi) = (ca.min(cb), ca.max(cb));
-  if (lo < half) == (hi < half) {
-    let (f1, f2) = if lo < half { (lo, hi) } else { (COLS - 1 - hi, COLS - 1 - lo) };
-    Some((0, ra, f1 * COLS + f2))
-  } else if lo + hi == COLS - 1 {
-    Some((1, ra, lo))
+  if ra == rb && ca != cb && (ca < half) == (cb < half) {
+    let (x, y) = (left(ca), left(cb));
+    Some(Shape::Row { hand: usize::from(ca >= half), row: ra, cols: (x.min(y), x.max(y)) })
+  } else if ra == rb && ca + cb == COLS - 1 {
+    Some(Shape::Mirror { row: ra, col: ca.min(cb) })
+  } else if ca == cb && ra != rb {
+    Some(Shape::Col { rows: (ra.min(rb), ra.max(rb)), col: left(ca) })
   } else {
     None
   }
 }
 
-// 괄호 묶음 규칙 (외우기 쉽게): 한 손 짝끼리, 좌우 대칭 짝끼리 각각 모두 같은 손가락이거나 모두 같은 줄이어야 함.
-// 묶음마다 어긴 쌍 수 = 쌍 수 - 같은 손가락을 쓰거나 같은 줄에 있는 가장 많은 쌍 수
-fn bracket_violations(places: &[(usize, usize)]) -> [usize; 2] {
-  let mut keys = [[(0usize, 0usize); NSYM / 2]; 2];
-  let mut n = [0usize; 2];
-  for &(a, b) in places {
-    if let Some((g, row, fingers)) = bracket_shape(a, b) { keys[g][n[g]] = (row, fingers); n[g] += 1; }
+// f가 같은 가장 많은 항목 수
+fn most<T, K: PartialEq>(ks: &[T], f: impl Fn(&T) -> K) -> usize {
+  ks.iter().map(|k| ks.iter().filter(|j| f(j) == f(k)).count()).max().unwrap_or(0)
+}
+
+// linked로 이어지는 가장 큰 덩어리의 항목 수 (이어진 두 항목의 덩어리 번호를 작은 쪽으로 맞추기를 바뀌지 않을 때까지)
+fn largest_group<T>(ks: &[T], linked: impl Fn(&T, &T) -> bool) -> usize {
+  let mut label: [usize; NSYM / 2] = std::array::from_fn(|i| i);
+  loop {
+    let mut changed = false;
+    for (i, a) in ks.iter().enumerate() {
+      for (j, b) in ks.iter().enumerate().skip(i + 1) {
+        if label[i] != label[j] && linked(a, b) {
+          let m = label[i].min(label[j]);
+          (label[i], label[j]) = (m, m);
+          changed = true;
+        }
+      }
+    }
+    if !changed { break; }
   }
-  std::array::from_fn(|g| {
-    let ks = &keys[g][..n[g]];
-    let most = |f: fn(&(usize, usize)) -> usize| ks.iter().map(|k| ks.iter().filter(|j| f(j) == f(k)).count()).max().unwrap_or(0);
-    ks.len() - most(|k| k.0).max(most(|k| k.1))
-  })
+  most(&label[..ks.len()], |l| *l)
+}
+
+// 한 손 가로 짝 (손, 줄, 두 열): 모두 같은 두 열. 양쪽으로 한 칸씩 넓은 짝은 같은 손·같은 줄에서 그 두 열의 짝을 감쌀 때만 됨
+fn row_violations(ks: &[(usize, usize, (usize, usize))]) -> usize {
+  let fits = |base: (usize, usize)| ks.iter().filter(|p| p.2 == base
+    || (p.2.0 + 1 == base.0 && p.2.1 == base.1 + 1 && ks.iter().any(|q| q.2 == base && (q.0, q.1) == (p.0, p.1)))).count();
+  ks.len() - ks.iter().map(|k| fits(k.2)).max().unwrap_or(0)
+}
+
+// 양손 대칭 짝 (줄, 열): 모두 같은 열이거나 모두 같은 줄 (떨어져 있어도 됨). 꺾인 모양은 바로 옆(같은 줄의 옆 열, 같은 열의
+// 옆 줄)끼리 이어서 한 덩어리일 때만 됨
+fn mirror_violations(ks: &[(usize, usize)]) -> usize {
+  let next = largest_group(ks, |a, b| (a.0 == b.0 && a.1.abs_diff(b.1) == 1) || (a.1 == b.1 && a.0.abs_diff(b.0) == 1));
+  ks.len() - next.max(most(ks, |k| k.0)).max(most(ks, |k| k.1))
+}
+
+// 짝 맞춤 규칙: 모양마다 어긴 쌍 수 [한 손 가로, 한 손 세로 (모두 같은 두 줄), 양손 대칭]
+fn shape_violations(places: &[(usize, usize)]) -> [usize; 3] {
+  let mut row_ks = [(0usize, 0usize, (0usize, 0usize)); NSYM / 2];
+  let mut col_ks = [(0usize, 0usize); NSYM / 2];
+  let mut mir_ks = [(0usize, 0usize); NSYM / 2];
+  let (mut nr, mut nc, mut nm) = (0, 0, 0);
+  for &(a, b) in places {
+    match pair_shape(a, b) {
+      Some(Shape::Row { hand, row, cols }) => { row_ks[nr] = (hand, row, cols); nr += 1; }
+      Some(Shape::Col { rows, .. }) => { col_ks[nc] = rows; nc += 1; }
+      Some(Shape::Mirror { row, col }) => { mir_ks[nm] = (row, col); nm += 1; }
+      None => {}
+    }
+  }
+  [row_violations(&row_ks[..nr]), nc - most(&col_ks[..nc], |k| *k), mirror_violations(&mir_ks[..nm])]
 }
 
 impl<'a> Problem<'a> {
@@ -292,7 +348,7 @@ impl<'a> Problem<'a> {
     let mut pair_of = vec![None; slots.len()];
     for (i, p) in pairs.iter().enumerate() { pair_of[p.a] = Some(i); pair_of[p.b] = Some(i); }
     let singles = (0..slots.len()).filter(|&i| pair_of[i].is_none()).collect();
-    Ok(Problem { t, g, key_pos, slots, pairs, n_ordered: cfg.pairs.len(), pair_of, singles, tap_cost: t.eff.iter().copied().fold(f64::INFINITY, f64::min), base_extra: f64::from(cfg.base_slot_extra) })
+    Ok(Problem { t, g, key_pos, slots, pairs, pair_of, singles, tap_cost: t.eff.iter().copied().fold(f64::INFINITY, f64::min), base_extra: f64::from(cfg.base_slot_extra) })
   }
 
   fn work(&self) -> Work {
@@ -458,20 +514,20 @@ impl<'a> Problem<'a> {
     (self.slots[st.slot_of[p.a] as usize].pos as usize, self.slots[st.slot_of[p.b] as usize].pos as usize)
   }
 
-  // 괄호(순서 있는 짝) 묶음 규칙을 어긴 쌍 수
+  // 짝 맞춤 규칙을 어긴 쌍 수
   fn violations(&self, st: &State) -> usize {
     let mut places = [(0usize, 0usize); NSYM / 2];
-    for (place, p) in places.iter_mut().zip(&self.pairs[..self.n_ordered]) { *place = self.pair_pos(st, p); }
-    bracket_violations(&places[..self.n_ordered]).iter().sum()
+    for (place, p) in places.iter_mut().zip(&self.pairs) { *place = self.pair_pos(st, p); }
+    shape_violations(&places[..self.pairs.len()]).iter().sum()
   }
 
-  // 이동이 괄호를 옮기는지 (안 옮기면 묶음 규칙을 어긴 정도가 그대로)
-  fn moves_bracket(&self, mv: &Move) -> bool {
-    mv.iter().any(|&(i, _)| self.pair_of[i].is_some_and(|p| p < self.n_ordered))
+  // 이동이 짝을 옮기는지 (안 옮기면 맞춤 규칙을 어긴 정도가 그대로)
+  fn moves_pair(&self, mv: &Move) -> bool {
+    mv.iter().any(|&(i, _)| self.pair_of[i].is_some())
   }
 
   // 결정적 근처 탐색: 홀 항목 맞바꾸기, 짝 옮기기, 짝끼리 맞바꾸기를 더 좋아지지 않을 때까지.
-  // 괄호 묶음 규칙을 더 어기게 되는 이동은 받지 않음 (규칙을 지키던 배치는 끝까지 지킴)
+  // 짝 맞춤 규칙을 더 어기게 되는 이동은 받지 않음 (규칙을 지키던 배치는 끝까지 지킴)
   fn polish(&self, mut st: State, w: &mut Work) -> (f64, State) {
     let mut viol = self.violations(&st);
     loop {
@@ -502,13 +558,13 @@ impl<'a> Problem<'a> {
     let mut st = self.random_state(rng);
     let mut cur = self.total(&st);
     let mut viol = self.violations(&st);
-    // 괄호 묶음 규칙을 지키는 배치 중 가장 좋은 것 (어기는 배치는 벌점을 안고 거쳐 가기만 함)
+    // 짝 맞춤 규칙을 지키는 배치 중 가장 좋은 것 (어기는 배치는 벌점을 안고 거쳐 가기만 함)
     let mut best: Option<(f64, State)> = (viol == 0).then(|| (cur, st.clone()));
     for it in 0..steps {
       let temp = T_START * (T_END / T_START).powf(it as f64 / steps as f64);
       let Some(mv) = self.random_move(&st, rng) else { continue };
       let (d, old) = self.apply(&mut st, &mv, &mut w);
-      let v = if self.moves_bracket(&mv) { self.violations(&st) } else { viol };
+      let v = if self.moves_pair(&mv) { self.violations(&st) } else { viol };
       let dv = d + GROUP_PENALTY * (v as f64 - viol as f64);
       if dv <= 0.0 || rng.f64() < (-dv / temp).exp() {
         cur += d;
@@ -523,7 +579,7 @@ impl<'a> Problem<'a> {
 
   // 무작위 시작 담금질을 starts_per_batch개씩 돌리고 같은 최고점이 stop_after_hits번 나오면 멈춤 (배열 최적화와 같은 규칙).
   // seed가 있으면(이전 결과) 첫 시작으로 써서 결과가 그보다 나빠지지 않게 함
-  // 괄호 묶음 규칙을 어긴 채 끝난 시작은 최고점으로 치지 않음 (모든 시작이 그러면 그중 가장 좋은 것을 돌려줌)
+  // 짝 맞춤 규칙을 어긴 채 끝난 시작은 최고점으로 치지 않음 (모든 시작이 그러면 그중 가장 좋은 것을 돌려줌)
   pub fn search(&self, sa: &SaParams, steps: usize, seed: Option<State>) -> (f64, State, usize, usize) {
     let mut best: Option<(f64, State)> = None;
     let mut fallback: Option<(f64, State)> = None;
@@ -668,17 +724,16 @@ impl<'a> Problem<'a> {
     Ok(self.state_from(slot_of))
   }
 
-  // 짝 규칙을 지키는지 (파일에서 읽은 배치는 지키지 않아도 채점은 함). 괄호 묶음 규칙을 어기면 그 묶음의 괄호를 함께 알림
+  // 짝 규칙을 지키는지 (파일에서 읽은 배치는 지키지 않아도 채점은 함). 짝 맞춤 규칙을 어기면 그 모양의 짝을 함께 알림
   pub fn broken_pairs(&self, st: &State) -> Vec<String> {
     let name = |p: &Pair| format!("{}{}", keycorpus::key_char(FIRST_SYM + p.a as u8), keycorpus::key_char(FIRST_SYM + p.b as u8));
     let mut out: Vec<String> = self.pairs.iter().filter(|p| !p.places.contains(&(st.slot_of[p.a], st.slot_of[p.b]))).map(name).collect();
-    let ordered = &self.pairs[..self.n_ordered];
-    let places: Vec<(usize, usize)> = ordered.iter().map(|p| self.pair_pos(st, p)).collect();
-    for (g, &v) in bracket_violations(&places).iter().enumerate() {
+    let places: Vec<(usize, usize)> = self.pairs.iter().map(|p| self.pair_pos(st, p)).collect();
+    for (g, &v) in shape_violations(&places).iter().enumerate() {
       if v == 0 { continue; }
-      let names: Vec<String> = ordered.iter().zip(&places)
-        .filter(|&(_, &(a, b))| bracket_shape(a, b).is_some_and(|s| s.0 == g)).map(|(p, _)| name(p)).collect();
-      out.push(format!("{} ({} pairs not all on the same fingers or row)", names.join(" "), ["one-hand", "mirrored"][g]));
+      let names: Vec<String> = self.pairs.iter().zip(&places)
+        .filter(|&(_, &(a, b))| pair_shape(a, b).is_some_and(|s| s.group() == g)).map(|(p, _)| name(p)).collect();
+      out.push(format!("{} ({} pairs not lined up)", names.join(" "), ["one-hand row", "one-hand column", "mirrored"][g]));
     }
     out
   }
@@ -920,48 +975,114 @@ mod tests {
     for p in [(at(0, 1), at(1, 2)), (at(1, 3), at(1, 7)), (at(0, 3), at(2, 6))] { assert!(!loose.contains(&p), "{p:?}"); }
   }
 
+  // 예시 격자 (열 칸짜리 줄만, · = 다른 칸)에서 짝 두 기호의 칸 번호
+  fn grid_places(grid: &str, pairs: &[&str]) -> Vec<(usize, usize)> {
+    let rows: Vec<Vec<char>> = grid.lines().map(|l| l.split_whitespace().filter_map(|t| t.chars().next()).collect::<Vec<char>>())
+      .filter(|r| r.len() == COLS).collect();
+    let find = |ch: char| rows.iter().enumerate().find_map(|(r, row)| row.iter().position(|&c| c == ch).map(|c| r * COLS + c))
+      .unwrap_or_else(|| panic!("{ch:?} is not in the grid"));
+    pairs.iter().map(|p| { let cs: Vec<char> = p.chars().collect(); (find(cs[0]), find(cs[1])) }).collect()
+  }
+
+  // 예시 격자의 짝들이 모양마다 어긴 쌍 수 [가로, 세로, 대칭]
+  fn broken(grid: &str, pairs: &[&str]) -> [usize; 3] { shape_violations(&grid_places(grid, pairs)) }
+
   #[test]
-  fn brackets_on_one_hand_or_mirrored_share_fingers_or_a_row() {
+  fn pairs_line_up_by_shape() {
     let at = |r: usize, c: usize| r * COLS + c;
-    // 한 손 짝의 손가락은 왼손 기준 두 열 (오른손 중지·약지 = 왼손 약지·중지), 좌우 대칭은 왼손 열. 위아래는 괄호 자리가 아님
-    assert_eq!(bracket_shape(at(1, 1), at(1, 2)), Some((0, 1, COLS + 2)));
-    assert_eq!(bracket_shape(at(2, 7), at(2, 8)), Some((0, 2, COLS + 2)));
-    assert_eq!(bracket_shape(at(0, 2), at(0, 7)), Some((1, 0, 2)));
-    assert_eq!(bracket_shape(at(0, 1), at(2, 1)), None);
-    // 되는 예: 한 손 짝은 약지·중지, 좌우 대칭은 중지 (줄은 달라도 됨)
-    assert_eq!(bracket_violations(&[(at(1, 1), at(1, 2)), (at(0, 2), at(0, 7)), (at(1, 7), at(1, 8)), (at(2, 2), at(2, 7))]), [0, 0]);
-    // 되는 예: 한 손 짝은 홈줄, 좌우 대칭은 윗줄 (손가락은 달라도 됨)
-    assert_eq!(bracket_violations(&[(at(1, 1), at(1, 2)), (at(0, 1), at(0, 8)), (at(1, 3), at(1, 4)), (at(0, 2), at(0, 7))]), [0, 0]);
-    // 안 되는 예 (54.72 결과): 한 손 짝 셋 중 [ ]만 새끼·약지이고, 줄로 보면 ( )만 홈줄
-    assert_eq!(bracket_violations(&[(at(1, 1), at(1, 2)), (at(2, 0), at(2, 1)), (at(2, 7), at(2, 8)), (at(0, 2), at(0, 7))]), [1, 0]);
-    // 셋 이상이면 손가락과 줄을 섞어 맞출 수 없음: 첫째와 둘째는 같은 손가락, 첫째와 셋째는 같은 줄
-    assert_eq!(bracket_violations(&[(at(1, 1), at(1, 2)), (at(0, 1), at(0, 2)), (at(1, 3), at(1, 4))]), [1, 0]);
-    // 좌우 대칭 둘이 손가락도 줄도 다름
-    assert_eq!(bracket_violations(&[(at(0, 2), at(0, 7)), (at(2, 1), at(2, 8))]), [0, 1]);
+    // 모양: 한 손 가로 (오른손은 거울 열), 양손 대칭, 한 손 세로. 대각선은 짝 자리가 아님
+    assert_eq!(pair_shape(at(1, 1), at(1, 2)), Some(Shape::Row { hand: 0, row: 1, cols: (1, 2) }));
+    assert_eq!(pair_shape(at(2, 8), at(2, 7)), Some(Shape::Row { hand: 1, row: 2, cols: (1, 2) }));
+    assert_eq!(pair_shape(at(0, 2), at(0, 7)), Some(Shape::Mirror { row: 0, col: 2 }));
+    assert_eq!(pair_shape(at(2, 9), at(0, 9)), Some(Shape::Col { rows: (0, 2), col: 0 }));
+    assert_eq!(pair_shape(at(0, 1), at(1, 2)), None);
+    let none = [0, 0, 0];
+    let row = |n: usize| [n, 0, 0];
+    let mir = |n: usize| [0, 0, n];
+    // 1. 한 손 가로 짝: 모두 같은 두 열 (줄과 손은 달라도 됨). 55.02 결과는 , . 와 \ / 가 괄호(약지·중지)와 열이 다름
+    let rows = ["()", "{}", "[]", "\\/", ",."];
+    assert_eq!(broken(r"
+      · · · · ·   \ · · / ·
+      · ( ) · ·   · . , · ·
+      · { } · ·   · · [ ] ·", &rows), row(2));
+    // 양쪽으로 한 칸씩 넓은 짝은 같은 줄에서 감쌀 때 됨 (\ / 가 , . 를, [ ] 가 ( ) 를)
+    assert_eq!(broken(r"
+      · · · · ·   · · · · ·
+      · ( ) · ·   · \ , . /
+      · { } · ·   · · [ ] ·", &rows), none);
+    assert_eq!(broken("[ ( ) ] ·   · · · · ·", &["()", "[]"]), none);
+    // 감쌀 짝 없이 다른 줄에 따로 있으면 안 됨
+    assert_eq!(broken(r"
+      · · · · ·   · \ · · /
+      · ( ) · ·   · · , . ·
+      · { } · ·   · · [ ] ·", &rows), row(1));
+    // 열이 한 칸 어긋남. 같은 줄이어도 열이 다르면 안 됨
+    assert_eq!(broken("
+      · ( ) · ·   · . , · ·
+      · { } · ·   · · [ ] ·", &["()", "{}", "[]", ",."]), row(1));
+    assert_eq!(broken("· ( ) , .   · · · · ·", &["()", ",."]), row(1));
+    // 2. 한 손 세로 짝: 모두 같은 두 줄 (열은 달라도 됨). 55.02 결과는 & * 만 1·3줄
+    let cols = ["!?", "'\"", "&*"];
+    assert_eq!(broken("
+      ? · · ' ·   · · · · *
+      ! · · \" ·   · · · · ·
+      · · · · ·   · · · · &", &cols), [0, 1, 0]);
+    assert_eq!(broken("
+      ? · · ' ·   · · · · *
+      ! · · \" ·   · · · · &
+      · · · · ·   · · · · ·", &cols), none);
+    // 3. 양손 대칭 짝: 모두 같은 열이거나 모두 같은 줄 (떨어져도 됨). 55.02 결과는 < > (중지·1줄)와 ; : (검지·3줄)가 다 다름
+    assert_eq!(broken("
+      · · < · ·   · · > · ·
+      · · · · ·   · · · · ·
+      · · · ; ·   · : · · ·", &["<>", ":;"]), mir(1));
+    assert_eq!(broken("
+      · · < · ·   · · > · ·
+      · · · · ·   · · · · ·
+      · · ; · ·   · · : · ·", &["<>", ":;"]), none);
+    assert_eq!(broken("· · < ; ·   · : > · ·", &["<>", ":;"]), none);
+    // 꺾인 모양은 바로 옆끼리 이어질 때만 (ㄱ자는 됨. 떨어져서 이어지거나 끊어지면 안 됨)
+    let three = ["<>", ":;", "'\""];
+    assert_eq!(broken("
+      · · < ; ·   · : > · ·
+      · · ' · ·   · · \" · ·", &three), none);
+    assert_eq!(broken("
+      < · · ; ·   · : · · >
+      · · · ' ·   · \" · · ·", &three), mir(1));
+    assert_eq!(broken("
+      · · < ; ·   · : > · ·
+      · ' · · ·   · · · \" ·", &three), mir(1));
+    // 1·3줄로 떨어진 두 덩어리를 같은 열로 잇는 것도 꺾인 모양이라 안 됨 (덤 있음 56.04 결과의 대칭 짝)
+    assert_eq!(broken(r"
+      · [ < · ·   · · > ] ·
+      · · · · ·   · · · · ·
+      · { / ; ·   · : \ } ·", &["[]", "<>", "{}", "/\\", ":;"]), mir(2));
   }
 
   #[test]
-  fn broken_bracket_groups_are_reported() {
-    let mut c = config();
-    // 괄호만 보려고 순서 없는 짝은 뺌
-    c.symbols.loose_pairs.clear();
+  fn pairs_not_lined_up_are_reported() {
+    let c = config();
     let (t, g) = (Tables::new(&c), ngrams());
     let base = Layout::parse(BASE).unwrap();
     let p = Problem::new(&t, &g, &base, &c.symbols).unwrap();
-    // 54.72 결과의 심볼 레이어 (괄호 하나하나는 규칙대로지만 한 손 짝 ( ) [ ] { }가 손가락도 줄도 하나로 맞지 않음)
+    // 55.02 결과의 심볼 레이어 (짝 하나하나는 규칙대로지만 모양끼리 맞지 않는 곳이 넷)
     let text = r#"
- ? - < ' +   % = > / *
- ! ( ) " `   \ . , _ |
- [ ] # ; @   $ : { } &
+ ? - < ' @   \ = > / *
+ ! ( ) " +   ` . , _ |
+ # { } ; %   $ : [ ] &
  p l o u ^   q b d f k
  c t h e ~   x ␣ s n r
  w g j a ·   z i v m y
 "#;
     let (_, placed) = parse_text(text).unwrap();
     let st = p.state_of(&placed).unwrap();
-    assert_eq!(p.violations(&st), 1);
+    assert_eq!(p.violations(&st), 4);
     // 저장된 결과가 이러면 다음 symbols의 출발점으로 쓰지 않음
-    assert_eq!(p.broken_pairs(&st), vec!["() [] {} (one-hand pairs not all on the same fingers or row)".to_string()]);
+    assert_eq!(p.broken_pairs(&st), vec![
+      "() [] {} /\\ ,. (one-hand row pairs not lined up)".to_string(),
+      "'\" !? &* (one-hand column pairs not lined up)".to_string(),
+      "<> :; (mirrored pairs not lined up)".to_string(),
+    ]);
   }
 
   #[test]
@@ -976,10 +1097,12 @@ mod tests {
     assert!((0..NSYM).all(|i| g.uni[FIRST_SYM as usize + i] > 0.0));
     let base = Layout::parse(BASE).unwrap();
     let p = Problem::new(&t, &g, &base, &c.symbols).unwrap();
-    let (cost, st, _, starts) = p.search(&c.sa, 20_000, None);
+    // 짝 맞춤 규칙이 짝 열 개 모두에 걸려서 짧은 탐색도 이동이 꽤 필요함 (2만 번이면 시작 넷이 모두 규칙을 못 지키는 일이
+    // 시드 20개 중 9개, 20만 번이면 시드 100개 중 0개)
+    let (cost, st, _, starts) = p.search(&c.sa, 200_000, None);
     assert_eq!(starts, 4);
     assert!((cost - p.total(&st)).abs() < 1e-9);
-    // 짝은 모두 규칙대로 (괄호는 같은 줄에서 여는 쪽이 왼쪽·왼손이고, 묶음끼리 같은 손가락이나 같은 줄)
+    // 짝은 모두 규칙대로 (짝마다 놓을 수 있는 자리에, 모양이 같은 짝끼리 맞춰서)
     assert!(p.broken_pairs(&st).is_empty());
     // 베이스 빈칸에는 코퍼스에서 가장 드문 기호만. 심볼 레이어가 2칸 모자라므로 2개 이상이고, 심볼 레이어에 남는 칸이
     // 어떤 기호에도 나쁜 자리(예: 스페이스와 같은 손가락)면 그 칸을 비우고 3개를 둘 수도 있음
