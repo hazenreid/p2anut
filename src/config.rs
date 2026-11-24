@@ -150,7 +150,10 @@ fn default_min_home_diff() -> u32 { 1 }
 #[derive(Deserialize, Clone)]
 pub struct Config {
   pub corpus_file: String,
-  // 글자 배열은 위키 영어만으로 채점함. 예전 설정의 code_share(러스트 코드 섞기)는 없앴으며 남아 있어도 무시됨
+  // 글자 배열 코퍼스에 섞을 러스트 코드의 비율 (글자 수 기준, 0~1). 0(기본) = 위키 영어만. 코드는 [code]의 크레이트를
+  // 위키와 같은 규칙으로 센 것 (code.letters.bin). 결과 파일은 비율과 상관없이 하나 (result_file)
+  #[serde(default)]
+  pub code_share: f64,
   pub result_file: String,
   pub elites: usize,
   // 각 손이 맡아야 할 최소 입력 비율. 이 위면 감점 없음, 아래면 hand_penalty로 감점 (hand_hard_limit 아래는 실격).
@@ -210,7 +213,7 @@ pub struct Config {
   pub effort: EffortGrid,
   pub sa: SaParams,
   // 예전 설정의 [ga](유전 알고리즘)는 더 이상 쓰지 않으며 남아 있어도 무시됨
-  // 러스트 코드 코퍼스 (analyze-code): 심볼 레이어만 씀. 없으면 기본값
+  // 러스트 코드 코퍼스 (analyze-code): 글자 배열(code_share)과 심볼 레이어가 같이 씀. 없으면 기본값
   #[serde(default)]
   pub code: CodeConfig,
   // 심볼 레이어 최적화 (symbols 명령). 없으면 기본값
@@ -401,6 +404,7 @@ impl Config {
     if !(sa.cooling > 0.0 && sa.cooling <= 1.0) { anyhow::bail!("sa.cooling must be in (0.0, 1.0]"); }
     if sa.starts_per_batch == 0 || sa.stop_after_hits == 0 { anyhow::bail!("sa.starts_per_batch and sa.stop_after_hits must be > 0"); }
     if sa.max_starts < sa.starts_per_batch { anyhow::bail!("sa.max_starts must be >= sa.starts_per_batch"); }
+    if !(0.0..=1.0).contains(&self.code_share) { anyhow::bail!("code_share must be in 0.0..=1.0"); }
     self.code.validate()?;
     self.symbols.validate()
   }
@@ -568,12 +572,13 @@ loose_pairs = ["(\""]"#, "steps = 0", "base_slot_extra = -1.0", r#"pairs = ["(1"
   }
 
   #[test]
-  fn old_code_share_is_ignored() {
+  fn code_share_is_a_share_and_keeps_one_result_file() {
     let url = "wikipedia_dump_url = \"https://m.org/a.xml.bz2\"\n";
-    // 예전 설정의 code_share(글자 배열에 러스트 코드 섞기)는 남아 있어도 무시하고, 결과 파일은 하나
-    let c = config(&format!("{url}code_share = 0.25"));
-    assert!(c.validate().is_ok());
-    assert_eq!(c.result_file, "result.bin");
+    // config.toml은 코드를 25% 섞고, 결과 파일 이름에는 비율을 붙이지 않음
+    let c = config(url);
+    assert_eq!((c.code_share, c.result_file.as_str()), (0.25, "result.bin"));
+    for bad in ["code_share = -0.1", "code_share = 1.5"] { assert!(config(&format!("{url}{bad}")).validate().is_err(), "{bad}"); }
+    assert!(config(&format!("{url}code_share = 1.0")).validate().is_ok());
   }
 
   #[test]

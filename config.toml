@@ -1,7 +1,10 @@
-# 글자 배열은 위키 영어 코퍼스만으로 채점함 (러스트 코드 코퍼스는 심볼 레이어에만 씀)
 corpus_file = "corpus.bin"
+# 글자 배열 코퍼스에 섞을 러스트 코드의 비율 (글자 수 기준, 0~1). 0이면 위키 영어만.
+# 코드는 [code]의 크레이트를 위키와 같은 규칙으로 센 것 (code.letters.bin: 양옆이 글자인 공백만 세고, 기호·숫자 옆 공백은 연속을 끊음)
+code_share = 0.25
 # 스페이스는 3×10 배열 안의 27번째 키로 함께 배치함. 결과는 늘 스페이스가 오른손 쪽
 # (점수가 좌우 대칭이라 왼손이면 좌우를 뒤집어 저장함).
+# 결과 파일은 code_share와 상관없이 하나. 비율을 바꾸면 저장된 결과를 새 비율로 다시 채점하고, optimize는 그 결과에서 이어서 찾음
 result_file = "result.bin"
 elites = 5
 # 각 손(왼손·오른손)이 최소 이 비율 이상 치면 감점 없음 (0.45 = 45~55%)
@@ -121,7 +124,8 @@ stop_after_hits = 3
 max_starts = 2000
 
 [code]
-# 러스트 코드 코퍼스 (analyze-code가 만듦): 심볼 레이어(symbols)만 씀 (글자 배열은 위키 영어만).
+# 러스트 코드 코퍼스 (analyze-code가 만듦): 같은 크레이트를 두 규칙으로 셈. corpus_file은 심볼 레이어(symbols)용,
+# 이름에 .letters가 붙은 파일(code.letters.bin)은 글자 배열(code_share)용 (위키와 같은 공백 규칙).
 # 코드 코퍼스를 쓰는 명령은 파일이 없거나 crates가 바뀌었으면 먼저 만듦
 corpus_file = "code.bin"
 # 코드 코퍼스로 쓸 크레이트: crates.io에서 각각 최신 안정 버전만 받아 <result_path>/crates/에 풂 (의존성은 받지 않음).
