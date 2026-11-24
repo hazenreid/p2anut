@@ -53,7 +53,7 @@
 ```bash
 cargo run --release -- <result_path> analyze     # 코퍼스 분석 → <result_path>/corpus.bin
 cargo run --release -- <result_path> optimize    # 최적화 → <result_path>/<result_file> (기본 설정은 코드 25%를 섞어 result-grid-code25.bin)
-cargo run --release -- <result_path> run         # analyze + optimize
+cargo run --release -- <result_path> run         # analyze + optimize + symbols 1 (코퍼스가 없으면 분석하고, 글자 배열 1등으로 심볼 레이어까지 만들어 둘 다 출력)
 cargo run --release -- <result_path> results     # 저장된 결과 출력
 cargo run --release -- <result_path> score mine.txt   # 내 배열을 저장된 결과 1등과 같은 기준으로 채점
 cargo run --release -- <result_path> sensitivity mine.txt   # 점수 설정값에 결과가 얼마나 민감한지 점검

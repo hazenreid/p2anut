@@ -280,9 +280,17 @@ fn run_optimize(result_path: &Path, config: &Config, english: &CorpusStats, rese
   Ok(())
 }
 
+// analyze + optimize + symbols 1: 코퍼스가 없거나 --reset이면 분석하고, 글자 배열을 최적화한 뒤 1등을 베이스로 심볼 레이어까지.
+// Ctrl-C로 최적화를 멈췄으면 심볼 레이어는 건너뜀
 fn cmd_run(result_path: &Path, config: &Config, reset: bool) -> anyhow::Result<()> {
   let english = load_or_analyze(result_path, config, reset, MIN_SCORING_PARSER)?;
-  run_optimize(result_path, config, &english, reset)
+  run_optimize(result_path, config, &english, reset)?;
+  if SHUTDOWN.load(Ordering::SeqCst) {
+    println!("[Run] stopped before the symbol layer; run `symbols 1` to make it");
+    return Ok(());
+  }
+  println!();
+  cmd_symbols(result_path, config, &[])
 }
 
 // 심볼 레이어 최적화: 저장된 결과 N번(기본 1, results와 같은 순서) 또는 배열 파일을 베이스로
