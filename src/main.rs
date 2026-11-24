@@ -127,7 +127,7 @@ impl Scoring {
 // 저장된 결과 (결과 파일이 없으면 빈 목록). 채점 기준이 있으면 그 코퍼스와 키 구성이 같은 것만 지금 설정으로 다시 채점해서
 // 정렬 (results 명령의 순서)
 fn saved_results(result_path: &Path, config: &Config, scoring: Option<&Scoring>) -> anyhow::Result<Vec<Layout>> {
-  let file = config.result_file_in(result_path);
+  let file = result_path.join(&config.result_file);
   if !file.exists() { return Ok(Vec::new()); }
   let mut results = load_results(file.to_str().context("Invalid result file path")?)?;
   if let Some(s) = scoring {
@@ -138,14 +138,9 @@ fn saved_results(result_path: &Path, config: &Config, scoring: Option<&Scoring>)
   Ok(results)
 }
 
-// 결과 파일이 없을 때의 안내. 코드를 섞으면 결과 파일이 따로라서, 섞기 전의 결과가 있어도 optimize를 먼저 돌려야 함
+// 결과 파일이 없을 때의 안내
 fn no_results(result_path: &Path, config: &Config) -> String {
-  let mut msg = format!("no results at {}: run optimize first", config.result_file_in(result_path).display());
-  let plain = result_path.join(&config.result_file);
-  if config.code_share > 0.0 && plain.exists() {
-    msg += &format!(" (code_share {} keeps its own results; the results without code are in {} and show with code_share = 0)", config.code_share, plain.display());
-  }
-  msg
+  format!("no results at {}: run optimize first", result_path.join(&config.result_file).display())
 }
 
 // 배열 파일 읽기: 행마다 10칸씩 3행 (스페이스 키는 '_', 빈칸은 '.')
@@ -191,7 +186,7 @@ fn cmd_analyze(result_path: &Path, config: &Config, reset: bool) -> anyhow::Resu
 }
 
 fn cmd_results(result_path: &Path, config: &Config) -> anyhow::Result<()> {
-  let result_file = config.result_file_in(result_path);
+  let result_file = result_path.join(&config.result_file);
   if !result_file.exists() {
     eprintln!("{}", no_results(result_path, config));
     std::process::exit(1);
@@ -241,7 +236,7 @@ fn cmd_sensitivity(result_path: &Path, config: &Config, files: &[String]) -> any
 // english: 위키 영어 코퍼스의 전체 통계 (code_share가 0보다 크면 코드를 섞어서 최적화)
 fn run_optimize(result_path: &Path, config: &Config, english: &CorpusStats, reset: bool) -> anyhow::Result<()> {
   let s = Scoring::new(english, code_letters(result_path, config)?.as_ref(), config);
-  let result_file = config.result_file_in(result_path);
+  let result_file = result_path.join(&config.result_file);
   if config.code_share > 0.0 {
     println!("[Corpus] Wikipedia English with {:.0}% Rust code (by letters) -> {}", config.code_share * 100.0, result_file.display());
   }
@@ -299,13 +294,11 @@ fn cmd_symbols(result_path: &Path, config: &Config, args: &[String]) -> anyhow::
   if let Some(o) = args.iter().find(|a| a.starts_with("--") && *a != "--reset") { anyhow::bail!("unknown option {o} for symbols"); }
   let target = args.iter().find(|a| !a.starts_with("--")).map_or("1", String::as_str);
   let (base, label, what) = if let Ok(n) = target.parse::<usize>() {
-    let result_file = config.result_file_in(result_path);
+    let result_file = result_path.join(&config.result_file);
     anyhow::ensure!(result_file.exists(), "{}, or pass a layout file", no_results(result_path, config));
     let results = saved_results(result_path, config, Scoring::load_if_present(result_path, config)?.as_ref())?;
     anyhow::ensure!((1..=results.len()).contains(&n), "there are {} saved results; pick 1..={}", results.len(), results.len());
-    // 코드를 섞은 결과면 그 표시를 붙임 (symbols-code50-1.txt): 비율마다 N번 배열이 다름
-    let label = config.share_tag().map_or_else(|| n.to_string(), |t| format!("{t}-{n}"));
-    (results[n - 1], label, format!("saved result #{n} of {}", result_file.display()))
+    (results[n - 1], n.to_string(), format!("saved result #{n} of {}", result_file.display()))
   } else {
     let stem = Path::new(target).file_stem().map_or_else(|| "layout".to_string(), |s| s.to_string_lossy().into_owned());
     (read_layout(target)?, stem, target.to_string())
@@ -392,7 +385,7 @@ mod tests {
     odd.slots[odd.pos[crate::SPACE_ID as usize] as usize] = layout::EMPTY;
     odd.pos[crate::SPACE_ID as usize] = layout::EMPTY;
     ls.push(odd);
-    layout::save_results(&ls, config.result_file_in(&dir).to_str().unwrap()).unwrap();
+    layout::save_results(&ls, dir.join(&config.result_file).to_str().unwrap()).unwrap();
     // 채점 기준이 없으면 파일 그대로 (스페이스가 왼손에 있는 배열만 좌우를 뒤집음)
     let slots = |v: &[Layout]| v.iter().map(|l| l.slots).collect::<Vec<_>>();
     let right: Vec<Layout> = ls.iter().map(Layout::space_right).collect();
@@ -413,24 +406,6 @@ mod tests {
     let err = super::cmd_symbols(&dir, &config, &["1".to_string(), "--flip".to_string()]).unwrap_err().to_string();
     assert!(err.contains("unknown option --flip"), "{err}");
     assert!(!dir.exists());
-  }
-
-  #[test]
-  fn missing_results_point_to_optimize_and_the_results_without_code() {
-    let dir = std::env::temp_dir().join(format!("p2anut-none-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let mut config = crate::config::load_config(std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/config.toml"))).unwrap();
-    // config.toml의 비율과 상관없이 코드를 절반 섞는 설정으로
-    config.code_share = 0.5;
-    let msg = super::no_results(&dir, &config);
-    assert!(msg.contains("result-grid-code50.bin: run optimize first") && !msg.contains("without code"), "{msg}");
-    // 섞기 전 결과가 있으면 그 파일과 보는 법도 알려 줌
-    std::fs::write(dir.join(&config.result_file), b"").unwrap();
-    let msg = super::no_results(&dir, &config);
-    assert!(msg.contains("without code are in") && msg.contains("result-grid.bin") && msg.contains("code_share = 0"), "{msg}");
-    config.code_share = 0.0;
-    assert!(!super::no_results(&dir, &config).contains("without code"));
-    std::fs::remove_dir_all(&dir).unwrap();
   }
 
   #[test]

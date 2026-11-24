@@ -150,8 +150,8 @@ fn default_min_home_diff() -> u32 { 1 }
 #[derive(Deserialize, Clone)]
 pub struct Config {
   pub corpus_file: String,
-  // 글자 배열 코퍼스에 섞을 러스트 코드의 비율 (글자 수 기준, 0~1). 0(기본) = 위키 영어만. 코드는 [code]의 코드 코퍼스에서
-  // 글자와 공백만으로 된 n-gram. 섞으면 결과 파일도 비율마다 따로 (result_file_in)
+  // 글자 배열 코퍼스에 섞을 러스트 코드의 비율 (글자 수 기준, 0~1). 0(기본) = 위키 영어만. 코드는 [code]의 크레이트를
+  // 위키와 같은 규칙으로 센 것 (code.letters.bin). 결과 파일은 비율과 상관없이 하나 (result_file)
   #[serde(default)]
   pub code_share: f64,
   pub result_file: String,
@@ -325,23 +325,6 @@ fn url_file_name(url: &str) -> Option<&str> {
 
 impl Config {
   pub fn hand_hard_limit(&self) -> f32 { self.hand_hard_limit.unwrap_or(self.min_hand_usage) }
-
-  // 코드를 섞을 때 파일 이름에 붙이는 표시 (code_share 0.5 → "code50"). 섞지 않으면 None
-  pub fn share_tag(&self) -> Option<String> {
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let pct = (self.code_share * 100.0).round() as u32;
-    (self.code_share > 0.0).then(|| format!("code{pct}"))
-  }
-
-  // 결과 파일 경로. 코드를 섞으면 이름에 비율을 붙여 따로 둠 (result-grid.bin → result-grid-code50.bin): 비율마다 최적인
-  // 배열이 달라서, 한 파일에 섞이면 다른 비율로 찾은 결과를 덮어씀
-  pub fn result_file_in(&self, result_path: &Path) -> std::path::PathBuf {
-    let file = Path::new(&self.result_file);
-    let Some(tag) = self.share_tag() else { return result_path.join(file) };
-    let stem = file.file_stem().map_or_else(String::new, |s| s.to_string_lossy().into_owned());
-    let name = match file.extension() { Some(e) => format!("{stem}-{tag}.{}", e.to_string_lossy()), None => format!("{stem}-{tag}") };
-    result_path.join(file.with_file_name(name))
-  }
 
   // 비어 있지 않은 덤프 주소들 (적은 순서대로)
   pub fn dump_urls(&self) -> Vec<String> {
@@ -587,17 +570,11 @@ loose_pairs = ["(\""]"#, "steps = 0", "base_slot_extra = -1.0", r#"pairs = ["(1"
   }
 
   #[test]
-  fn code_share_gets_its_own_result_file() {
+  fn code_share_is_a_share_and_keeps_one_result_file() {
     let url = "wikipedia_dump_url = \"https://m.org/a.xml.bz2\"\n";
-    let root = Path::new("/r");
-    let c = config(&format!("{url}code_share = 0.0"));
-    assert_eq!((c.share_tag(), c.result_file_in(root)), (None, root.join("result-grid.bin")));
-    // config.toml은 코드를 25% 섞음
+    // config.toml은 코드를 25% 섞고, 결과 파일 이름에는 비율을 붙이지 않음
     let c = config(url);
-    assert_eq!((c.code_share, c.share_tag().as_deref()), (0.25, Some("code25")));
-    assert_eq!(c.result_file_in(root), root.join("result-grid-code25.bin"));
-    let c = config(&format!("{url}code_share = 0.5\nresult_file = \"out/res\""));
-    assert_eq!(c.result_file_in(root), root.join("out/res-code50"));
+    assert_eq!((c.code_share, c.result_file.as_str()), (0.25, "result.bin"));
     for bad in ["code_share = -0.1", "code_share = 1.5"] { assert!(config(&format!("{url}{bad}")).validate().is_err(), "{bad}"); }
     assert!(config(&format!("{url}code_share = 1.0")).validate().is_ok());
   }
