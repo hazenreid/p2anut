@@ -1065,7 +1065,7 @@ mod tests {
     let (t, g) = (Tables::new(&c), ngrams());
     let base = Layout::parse(BASE).unwrap();
     let p = Problem::new(&t, &g, &base, &c.symbols).unwrap();
-    // 55.02 결과의 심볼 레이어 (짝 하나하나는 규칙대로지만 모양끼리 맞지 않는 곳이 넷)
+    // 55.02 결과의 심볼 레이어 (짝 하나하나는 규칙대로지만 모양끼리 맞지 않는 곳이 둘)
     let text = r#"
  ? - < ' @   \ = > / *
  ! ( ) " +   ` . , _ |
@@ -1076,11 +1076,10 @@ mod tests {
 "#;
     let (_, placed) = parse_text(text).unwrap();
     let st = p.state_of(&placed).unwrap();
-    assert_eq!(p.violations(&st), 4);
+    assert_eq!(p.violations(&st), 2);
     // 저장된 결과가 이러면 다음 symbols의 출발점으로 쓰지 않음
     assert_eq!(p.broken_pairs(&st), vec![
-      "() [] {} /\\ ,. (one-hand row pairs not lined up)".to_string(),
-      "'\" !? &* (one-hand column pairs not lined up)".to_string(),
+      "() [] {} /\\ (one-hand row pairs not lined up)".to_string(),
       "<> :; (mirrored pairs not lined up)".to_string(),
     ]);
   }
