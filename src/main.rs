@@ -61,10 +61,10 @@ fn for_scoring(mut stats: CorpusStats, config: &Config) -> CorpusStats {
   stats
 }
 
-// 글자 배열에 섞을 러스트 코드: 코드 코퍼스의 글자·공백 n-gram (code_share가 0이면 None). 코드 코퍼스가 없거나 오래됐으면 만듦
+// 글자 배열에 섞을 러스트 코드: 위키와 같은 공백 규칙으로 센 코드 코퍼스 (code_share가 0이면 None). 코드 코퍼스가 없거나 오래됐으면 만듦
 fn code_letters(result_path: &Path, config: &Config) -> anyhow::Result<Option<CorpusStats>> {
   if config.code_share <= 0.0 { return Ok(None); }
-  Ok(Some(keycorpus::letter_part(&code::load_or_build(result_path, config)?)))
+  Ok(Some(code::load_or_build(result_path, config)?.letters))
 }
 
 // 채점 기준: 코퍼스 배열과, 지금 설정으로 만든 표와 총점 기준

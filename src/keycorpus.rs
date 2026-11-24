@@ -4,7 +4,7 @@
 // - 숫자, 탭, 줄바꿈, 그 밖의 문자는 연속을 끊음
 // - 같은 키 연속은 그 쌍이 낀 트라이그램을 세지 않음 (글자 코퍼스와 같음). 빅그램도 글자는 세지 않지만, 기호는 셈
 //   (::, //, )) 등: 원샷 레이어 키를 누른 채로 이어 치는지 알려면 필요)
-// 심볼 레이어는 기호가 낀 n-gram을, 글자 배열(code_share)은 글자와 공백만으로 된 n-gram(letter_part)을 씀
+// 심볼 레이어가 씀 (기호가 낀 n-gram). 글자 배열(code_share)용 코드 코퍼스는 위키 규칙으로 따로 셈 (code.rs)
 #![allow(clippy::cast_possible_truncation)]
 use crate::corpus::CorpusStats;
 
@@ -18,7 +18,7 @@ pub const KEYS: usize = FIRST_SYM as usize + NSYM;
 pub const CODE_MAGIC: &[u8] = b"P2ANUT-CODE\0";
 // 2: 크레이트마다 본체 코드를 모두 읽고 같은 무게로 더함
 // 3: 기호의 같은 키 연속(::)도 빅그램으로 셈
-pub const CODE_VERSION: u32 = 3;
+pub const CODE_VERSION: u32 = 4;
 
 // 기호의 번호 (0..32)
 pub fn sym_index(ch: char) -> Option<usize> { SYMBOLS.find(ch).filter(|_| ch.is_ascii()) }
@@ -117,17 +117,6 @@ pub fn count_text(bytes: &[u8], corpus: &mut KeyCorpus) {
   }
 }
 
-// 글자 배열에 섞는 부분: 글자와 공백만으로 된 n-gram. 기호가 끼면 연속이 끊긴 것으로 봄 (기호 쪽은 심볼 레이어가 다룸).
-// 공백은 이 코퍼스의 규칙대로 두 키 사이의 공백 하나를 모두 셈 (`let x = y`의 공백 셋)
-pub fn letter_part(code: &CorpusStats) -> CorpusStats {
-  let base = |c: char| c.is_ascii_lowercase() || c == ' ';
-  CorpusStats {
-    letters: code.letters.iter().filter(|(c, _)| base(**c)).map(|(&c, &n)| (c, n)).collect(),
-    bigrams: code.bigrams.iter().filter(|((a, b), _)| base(*a) && base(*b)).map(|(&k, &n)| (k, n)).collect(),
-    trigrams: code.trigrams.iter().filter(|((a, b, c), _)| base(*a) && base(*b) && base(*c)).map(|(&k, &n)| (k, n)).collect(),
-  }
-}
-
 // 기호 빈도 요약 (글자 100개당): 기호별 누름과 기호가 낀 상위 바이그램
 pub fn print_summary(stats: &CorpusStats) {
   let letters: u64 = stats.letters.iter().filter(|(c, _)| c.is_ascii_lowercase()).map(|(_, n)| n).sum();
@@ -194,17 +183,6 @@ mod tests {
     // 같은 글자 연속(ll)은 글자 코퍼스처럼 세지 않음
     let c = run("all in");
     assert_eq!((bi(&c, "ll"), tri(&c, "all"), bi(&c, "l "), tri(&c, "l i")), (0, 0, 1, 1));
-  }
-
-  #[test]
-  fn letter_part_keeps_letters_and_every_space_between_keys() {
-    let l = letter_part(&run("let x = y.len();").into_stats());
-    // 공백 셋(기호 옆 공백도)은 모두 누름, 기호가 낀 n-gram은 뺌
-    assert_eq!((l.letters[&' '], l.letters.get(&'='), l.letters[&'l']), (3, None, 2));
-    assert_eq!((l.bigrams[&('t', ' ')], l.bigrams[&(' ', 'x')], l.bigrams[&('x', ' ')], l.bigrams[&(' ', 'y')], l.bigrams[&('l', 'e')]), (1, 1, 1, 1, 2));
-    assert!(l.bigrams.keys().all(|&(a, b)| [a, b].iter().all(|c| c.is_ascii_lowercase() || *c == ' ')));
-    // 트라이그램은 let, et_, t_x, _x_, len 다섯 (x_=, y.l처럼 기호가 낀 것은 없음)
-    assert_eq!((l.trigrams[&('t', ' ', 'x')], l.trigrams[&(' ', 'x', ' ')], l.trigrams.get(&('x', ' ', 'y')), l.trigrams.len()), (1, 1, None, 5));
   }
 
   #[test]

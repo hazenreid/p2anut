@@ -15,9 +15,9 @@
    - 본문 문서만 씁니다. 넘겨주기, 목록 문서(`List of ...`), 동음이의·집합 색인 문서는 뺍니다.
    - 위키 마크업, 수식, 코드, 각주, 문서 끝의 참고문헌·외부 링크 섹션을 지우고 본문 문장만 셉니다.
    - 멀티스트림 덤프를 받아 두면 여러 스레드로 나눠 분석합니다. 덩어리마다 중간 결과를 `<corpus_file>.partial`에 저장하므로, 중단해도 다시 실행하면 이어서 분석합니다.
-   - **러스트 코드 섞기**: `code_share`(기본 설정 0.5)가 0보다 크면, 채점·최적화할 때 위키 영어에 러스트 코드를 그 비율(글자 수 기준)만큼 섞습니다. 코드는 심볼 레이어와 같은 코드 코퍼스(`analyze-code`, 아래 4번)에서 글자와 공백만으로 된 n-gram을 씁니다.
-     - 기호가 끼면 연속이 끊긴 것으로 봅니다(기호 쪽은 심볼 레이어가 다룸).
-     - 공백은 위키와 달리 두 키 사이의 공백 하나를 모두 셉니다(`let x = y`의 공백 셋). 코드의 공백은 대부분 기호 옆이라, 위키 규칙으로 세면 공백 누름이 글자 100개당 9.1번에서 2.7번으로 줄어 실제보다 너무 적습니다.
+   - **러스트 코드 섞기**: `code_share`(기본 설정 0.5)가 0보다 크면, 채점·최적화할 때 위키 영어에 러스트 코드를 그 비율(글자 수 기준)만큼 섞습니다. 코드는 심볼 레이어와 같은 크레이트(`analyze-code`, 아래 4번)를 쓰지만, 글자 배열용은 위키와 같은 규칙으로 따로 셉니다(`<result_path>/code.letters.bin`).
+     - 공백은 위키처럼 양옆이 글자인 공백만 셉니다(`let x = y`에서는 `let x`의 공백 하나). 기호·숫자와 그 옆 공백은 연속을 끊습니다. 섞는 두 코퍼스의 공백 규칙이 같아야 섞은 뒤 공백이 낀 n-gram의 비중이 글자 비율과 맞습니다.
+     - 그래서 코드의 공백 누름은 글자 100개당 2.7번으로 셉니다(심볼 레이어용 규칙으로는 9.1번). 기호 옆 공백은 글자 배열에서 빠지는 대신 심볼 레이어 쪽에서 셉니다.
      - 코드의 글자 분포는 영어와 꽤 다릅니다. `self`, `let`, `fn` 같은 단어 때문에 h는 0.4배로 줄고 x·q·p·f는 1.5~3배로 늘어납니다.
      - 코드를 섞으면 결과 파일 이름에 비율이 붙어 따로 저장되고(`result-grid-code50.bin`), 결과·채점 출력에 영어만·코드만의 총비용을 `english=111.2  code=124.2`처럼 함께 보여 줍니다. `code_share = 0`이면 예전과 같습니다.
      - 결과 파일이 따로라서, 새 비율을 처음 쓸 때는 `optimize`를 먼저 돌려야 `results`와 `symbols N`에 결과가 나옵니다. 그동안에도 `score mine.txt`로 지금 배열의 섞은 비용과 영어만·코드만의 비용을 볼 수 있습니다.
@@ -56,7 +56,7 @@ cargo run --release -- <result_path> run         # analyze + optimize
 cargo run --release -- <result_path> results     # 저장된 결과 출력
 cargo run --release -- <result_path> score mine.txt   # 내 배열을 저장된 결과 1등과 같은 기준으로 채점
 cargo run --release -- <result_path> sensitivity mine.txt   # 점수 설정값에 결과가 얼마나 민감한지 점검
-cargo run --release -- <result_path> analyze-code   # [code]의 crates를 crates.io에서 받아 러스트 코드 코퍼스 → <result_path>/code.bin
+cargo run --release -- <result_path> analyze-code   # [code]의 crates를 crates.io에서 받아 러스트 코드 코퍼스 → <result_path>/code.bin (심볼 레이어용), code.letters.bin (글자 배열용)
 cargo run --release -- <result_path> symbols 1 --flip   # 저장된 결과 1등을 좌우로 뒤집은 베이스로 심볼 레이어 최적화
 cargo run --release -- <result_path> symbols-score sym.txt   # 기호 배치 파일 채점
 ```

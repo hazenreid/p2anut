@@ -1,5 +1,8 @@
 // 러스트 코드 코퍼스 (analyze-code): [code]의 crates에 적은 크레이트만 crates.io에서 최신 안정 버전으로 받아(의존성은 받지 않음)
-// 주석 내용을 빼고 키 연속을 셈.
+// 주석 내용을 빼고 키 연속을 셈. 같은 코드를 두 규칙으로 따로 셈:
+// - 심볼 레이어용(code.bin): 글자·공백·기호의 키 연속 (keycorpus 규칙, 두 키 사이 공백 하나는 모두 셈)
+// - 글자 배열용(code.letters.bin, code_share로 위키와 섞음): 위키와 같은 규칙(wiki::analyze_bytes). 양옆이 글자인
+//   공백만 세고 기호·숫자 옆 공백은 연속을 끊음. 섞는 두 코퍼스의 공백 규칙이 같아야 공백 비중이 맞음
 // - 받은 크레이트는 <result_path>/crates/<이름>-<버전>/에 풀어 두고, 같은 버전이 있으면 다시 받지 않음.
 //   새 버전을 받으면 같은 크레이트의 옛 버전 폴더는 지움. 받지 못하면 받아 둔 가장 새 버전을 쓰고, 그것도 없으면
 //   경고하고 건너뜀 (crates.io 요청은 제한 시간을 두고 몇 번 다시 시도함)
@@ -19,7 +22,7 @@ use anyhow::Context;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use crate::config::Config;
-use crate::corpus::CorpusStats;
+use crate::corpus::{CorpusStats, FastCorpus};
 use crate::keycorpus::{self, KeyCorpus};
 
 const MAX_FILE_BYTES: u64 = 200_000;
@@ -334,6 +337,29 @@ fn equal_weight(k: &KeyCorpus) -> KeyCorpus {
   out
 }
 
+// 글자 배열용도 같은 방식으로 (공백 경우별 개수도 같이 맞춤)
+fn equal_weight_letters(f: &FastCorpus) -> FastCorpus {
+  let letters: u64 = f.letters[..26].iter().sum();
+  let mut out = FastCorpus::new();
+  if letters == 0 { return out; }
+  #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+  let scale = |v: &mut [u64], from: &[u64]| for (a, &b) in v.iter_mut().zip(from) { *a = (b as f64 * CRATE_LETTERS / letters as f64).round() as u64; };
+  scale(&mut out.letters[..], &f.letters[..]);
+  scale(&mut out.bigrams[..], &f.bigrams[..]);
+  scale(&mut out.trigrams, &f.trigrams);
+  scale(&mut out.space_cases, &f.space_cases);
+  out
+}
+
+// 코드 코퍼스: 심볼 레이어용(키 연속 전체)과 글자 배열용(위키 규칙)
+pub struct CodeCorpus {
+  pub symbols: CorpusStats,
+  pub letters: CorpusStats,
+}
+
+// 글자 배열용 코퍼스 파일 (code.bin → code.letters.bin)
+pub fn letters_path(corpus: &Path) -> PathBuf { corpus.with_extension("letters.bin") }
+
 pub struct CodeScan {
   // 크레이트마다 (이름-버전, 읽은 바이트)
   pub crates: Vec<(String, u64)>,
@@ -341,44 +367,50 @@ pub struct CodeScan {
 }
 
 // 크레이트 폴더들을 셈: 크레이트마다 본체 코드를 모두 세고, 크레이트끼리 같은 무게로 더함
-pub fn analyze_crates(crates: &[(String, PathBuf)]) -> anyhow::Result<(KeyCorpus, CodeScan)> {
-  let per: Vec<(KeyCorpus, usize, u64)> = crates.par_iter().map(|(_, dir)| -> anyhow::Result<_> {
+// 심볼 레이어용(KeyCorpus)과 글자 배열용(위키 규칙)을 같이 셈
+pub fn analyze_crates(crates: &[(String, PathBuf)]) -> anyhow::Result<(KeyCorpus, FastCorpus, CodeScan)> {
+  let per: Vec<(KeyCorpus, FastCorpus, usize, u64)> = crates.par_iter().map(|(_, dir)| -> anyhow::Result<_> {
     let mut files = Vec::new();
     rs_files(dir, true, &mut files).with_context(|| format!("reading {}", dir.display()))?;
-    let mut k = KeyCorpus::new();
+    let (mut k, mut w) = (KeyCorpus::new(), FastCorpus::new());
     let (mut n, mut bytes) = (0usize, 0u64);
     for f in &files {
       let Ok(code) = std::fs::read(f) else { continue };
       let text = strip_comments(&String::from_utf8_lossy(&code));
       keycorpus::count_text(text.as_bytes(), &mut k);
+      crate::wiki::analyze_bytes(text.as_bytes(), &mut w);
       n += 1;
       bytes += text.len() as u64;
     }
-    Ok((equal_weight(&k), n, bytes))
+    Ok((equal_weight(&k), equal_weight_letters(&w), n, bytes))
   }).collect::<anyhow::Result<_>>()?;
-  let mut total = KeyCorpus::new();
+  let (mut total, mut letters) = (KeyCorpus::new(), FastCorpus::new());
   let mut scan = CodeScan { crates: Vec::new(), files: 0 };
-  for ((label, _), (k, n, bytes)) in crates.iter().zip(per) {
+  for ((label, _), (k, f, n, bytes)) in crates.iter().zip(per) {
     total.merge(&k);
+    letters.merge(&f);
     scan.files += n;
     scan.crates.push((label.clone(), bytes));
   }
-  Ok((total, scan))
+  Ok((total, letters, scan))
 }
 
 // 코드 코퍼스 만들기 (analyze-code 명령): [code]의 crates를 crates.io에서 받아(<result_path>/crates, 의존성은 받지 않음)
-// 세고 <result_path>/<corpus_file>에 저장. 만들 때의 크레이트 목록도 옆에 적어 둠
-pub fn build_corpus(result_path: &Path, config: &Config) -> anyhow::Result<CorpusStats> {
+// 세고 <result_path>/<corpus_file>(심볼 레이어용)과 <이름>.letters.bin(글자 배열용)에 저장. 만들 때의 크레이트 목록도 옆에 적어 둠
+pub fn build_corpus(result_path: &Path, config: &Config) -> anyhow::Result<CodeCorpus> {
   let s = &config.code;
   let dir = result_path.join("crates");
   println!("[Code Corpus] {} crates from crates.io (latest stable versions, without dependencies) -> {}", s.crates.len(), dir.display());
   let fetched = fetch_crates(&s.crates, &dir)?;
   anyhow::ensure!(!fetched.crates.is_empty(), "none of the [code] crates could be downloaded");
-  let (k, scan) = analyze_crates(&fetched.crates)?;
+  let (k, f, scan) = analyze_crates(&fetched.crates)?;
   anyhow::ensure!(scan.files > 0, "no .rs files found in the [code] crates");
   let path = result_path.join(&s.corpus_file);
   let stats = k.into_stats();
   stats.save_with(path.to_str().context("Invalid corpus path")?, keycorpus::CODE_MAGIC, keycorpus::CODE_VERSION)?;
+  f.print_space_cases();
+  let letters = f.into_stats();
+  letters.save_with(letters_path(&path).to_str().context("Invalid corpus path")?, keycorpus::CODE_MAGIC, keycorpus::CODE_VERSION)?;
   let skipped: Vec<String> = fetched.skipped.iter().map(|(n, _)| n.clone()).collect();
   BuildInfo {
     version: keycorpus::CODE_VERSION, requested: s.crates.clone(),
@@ -387,28 +419,33 @@ pub fn build_corpus(result_path: &Path, config: &Config) -> anyhow::Result<Corpu
   let total: u64 = scan.crates.iter().map(|c| c.1).sum();
   #[allow(clippy::cast_precision_loss)]
   let kb = |b: u64| b as f64 / 1e3;
-  println!("[Code Corpus] {} files, {:.0} KB without comments, each crate weighted equally -> {}", scan.files, kb(total), path.display());
+  println!("[Code Corpus] {} files, {:.0} KB without comments, each crate weighted equally -> {} (symbols), {} (letters, Wikipedia space rules)",
+    scan.files, kb(total), path.display(), letters_path(&path).display());
   println!("  {}", scan.crates.iter().map(|(c, b)| format!("{c} {:.0}KB", kb(*b))).collect::<Vec<_>>().join("  "));
   keycorpus::print_summary(&stats);
   if !skipped.is_empty() {
     println!("[Code Corpus] warning: {} of {} crates were skipped ({}); run analyze-code again to retry", skipped.len(), s.crates.len(), skipped.join(", "));
   }
-  Ok(stats)
+  Ok(CodeCorpus { symbols: stats, letters })
 }
 
 // 코드 코퍼스 불러오기. 없거나, [code]의 crates나 세는 규칙이 만들 때와 다르면 다시 만듦
-pub fn load_or_build(result_path: &Path, config: &Config) -> anyhow::Result<CorpusStats> {
+pub fn load_or_build(result_path: &Path, config: &Config) -> anyhow::Result<CodeCorpus> {
   let path = result_path.join(&config.code.corpus_file);
   let info = BuildInfo::load(&path);
-  let stale = if path.exists() { BuildInfo::stale_reason(info.as_ref(), &config.code.crates) } else { Some("it does not exist") };
+  let stale = if path.exists() && letters_path(&path).exists() { BuildInfo::stale_reason(info.as_ref(), &config.code.crates) } else { Some("it does not exist") };
   match stale {
     None => {
-      let (stats, v) = CorpusStats::load_with(path.to_str().context("Invalid corpus path")?, keycorpus::CODE_MAGIC)?;
-      anyhow::ensure!(v == keycorpus::CODE_VERSION, "{} has rules v{v} but its crate list says v{}; run analyze-code", path.display(), keycorpus::CODE_VERSION);
+      let load = |p: &Path| -> anyhow::Result<CorpusStats> {
+        let (stats, v) = CorpusStats::load_with(p.to_str().context("Invalid corpus path")?, keycorpus::CODE_MAGIC)?;
+        anyhow::ensure!(v == keycorpus::CODE_VERSION, "{} has rules v{v} but its crate list says v{}; run analyze-code", p.display(), keycorpus::CODE_VERSION);
+        Ok(stats)
+      };
+      let code = CodeCorpus { symbols: load(&path)?, letters: load(&letters_path(&path))? };
       if let Some(i) = info.as_ref().filter(|i| !i.skipped.is_empty()) {
         println!("[Code Corpus] note: {} was built without {} (could not be downloaded); run analyze-code to retry", path.display(), i.skipped.join(", "));
       }
-      Ok(stats)
+      Ok(code)
     }
     Some(reason) => {
       println!("[Code Corpus] building {}: {reason}", path.display());
@@ -546,7 +583,7 @@ mod tests {
     std::fs::create_dir_all(dir.join("bar-0.10.0")).unwrap();
     assert_eq!(newest_local("bar", &dir).unwrap().0, "0.10.0");
     let crates = vec![("foo-1.0.0".to_string(), foo), ("bar-0.2.0".to_string(), dir.join("bar-0.2.0"))];
-    let (k, scan) = analyze_crates(&crates).unwrap();
+    let (k, f, scan) = analyze_crates(&crates).unwrap();
     // foo는 src/lib.rs만 (벤치·시험·build.rs·큰 파일은 안 읽음), bar는 src/main.rs
     assert_eq!(scan.files, 2);
     let id = |c: char| keycorpus::char_key(c).unwrap() as usize;
@@ -555,6 +592,9 @@ mod tests {
     assert_eq!(k.unigrams[..26].iter().sum::<u64>(), 2 * CRATE_LETTERS as u64);
     assert_eq!(k.unigrams[id('{')], (CRATE_LETTERS / 8.0 + CRATE_LETTERS / 4.0) as u64);
     assert_eq!(k.bigrams[id('"') * keycorpus::KEYS + id('{')], (CRATE_LETTERS / 4.0) as u64);
+    // 글자 배열용도 크레이트마다 같은 무게, 공백은 위키 규칙 (foo의 `fn foo`만 글자 사이 공백, bar의 `let s`만)
+    assert_eq!(f.letters[..26].iter().sum::<u64>(), 2 * CRATE_LETTERS as u64);
+    assert_eq!(f.letters[crate::SPACE_ID as usize], (CRATE_LETTERS / 8.0 + CRATE_LETTERS / 4.0) as u64);
     std::fs::remove_dir_all(&dir).unwrap();
   }
 }

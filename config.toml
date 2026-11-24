@@ -1,6 +1,6 @@
 corpus_file = "corpus.bin"
 # 글자 배열 코퍼스에 섞을 러스트 코드의 비율 (글자 수 기준, 0~1). 0이면 위키 영어만.
-# 코드는 [code]의 코드 코퍼스에서 글자와 공백만으로 된 n-gram (기호가 끼면 끊긴 것으로 보고, 두 키 사이 공백 하나는 모두 셈)
+# 코드는 [code]의 크레이트를 위키와 같은 규칙으로 센 것 (code.letters.bin: 양옆이 글자인 공백만 세고, 기호·숫자 옆 공백은 연속을 끊음)
 code_share = 0.5
 # 스페이스는 3×10 배열 안의 27번째 키로 함께 배치함 (예전 grid 결과 파일 이름 그대로).
 # code_share가 0보다 크면 이름에 비율이 붙어 따로 저장됨 (result-grid-code50.bin)
@@ -123,7 +123,8 @@ stop_after_hits = 3
 max_starts = 2000
 
 [code]
-# 러스트 코드 코퍼스 (analyze-code가 만듦): 글자 배열(code_share)과 심볼 레이어(symbols)가 같이 씀.
+# 러스트 코드 코퍼스 (analyze-code가 만듦): 같은 크레이트를 두 규칙으로 셈. corpus_file은 심볼 레이어(symbols)용,
+# 이름에 .letters가 붙은 파일(code.letters.bin)은 글자 배열(code_share)용 (위키와 같은 공백 규칙).
 # 코드 코퍼스를 쓰는 명령은 파일이 없거나 crates가 바뀌었으면 먼저 만듦
 corpus_file = "code.bin"
 # 코드 코퍼스로 쓸 크레이트: crates.io에서 각각 최신 안정 버전만 받아 <result_path>/crates/에 풂 (의존성은 받지 않음).
