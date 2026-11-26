@@ -16,6 +16,14 @@
 // 짝: pairs(순서 있음)는 같은 줄에만. 한 손 안이면 떨어져 있어도 되고 첫 글자가 왼쪽, 양손에 나뉘면 좌우 대칭(같은 손가락)에
 // 첫 글자가 왼손. loose_pairs(순서 없음)는 거기에 더해 한 손 같은 열(떨어져 있어도 됨)도 되고 어느 쪽이 먼저든.
 // 짝은 심볼 레이어 안에서만.
+//
+// 한손 (one_hand): 왼손 3×5 + 엄지 원샷 키 둘 (글자 엄지층 L, 심볼 S). S를 누르면 심볼층 1(S1), S1의 한 칸에 둔 S2 원샷 키(②)를
+// 누르면 심볼층 2(S2). 기호 32개는 S1 14칸(② 자리 빼고) + S2 15칸 + 글자층 빈칸 3칸에 꼭 맞게 들어감. 원샷 키는 모두 누르고
+// 있으면 홀드: 같은 엄지 키의 층(L끼리, S1·S2끼리)이 이어지면 탭은 처음 한 번만, S2 기호가 이어지면 ②도 처음 한 번만.
+// 다만 ②를 누르고 있는 손가락은 그동안 다른 키를 못 누르므로, ②와 같은 손가락 자리의 S2 기호는 ②를 다시 누른 뒤 그 손가락을
+// 옮겨 침. ②는 손가락 누름이라 노력값과 앞뒤 쌍(SFB·시저스·롤)·세 누름을 보통 키처럼 셈. 엄지층·심볼층 키의 노력값은
+// one_hand_layer_effort배 (비용 표는 배열 최적화의 한손 표: 0~4열 = 기본층 노력값, 5~9열 = 그 배율의 노력값). 짝 규칙은 S1을
+// 왼손, S2를 거울 자리의 오른손처럼 보고 같게 적용하되, 같은 층 가로 짝의 순서는 화면(새끼 → 가운데 열)에서 첫 글자가 왼쪽.
 // 짝 맞춤 (외우기 쉽게): 순서 있는 짝과 없는 짝을 가리지 않고 모양이 같은 짝끼리 자리를 맞춤 (오른손은 거울 자리로 봄).
 // 한 손 가로 짝은 모두 같은 두 열 (양쪽으로 한 칸씩 넓은 짝은 같은 줄에서 그 짝을 감쌀 때만), 한 손 세로 짝은 모두 같은
 // 두 줄, 양손 대칭 짝은 모두 같은 열이거나 모두 같은 줄 (꺾인 모양은 바로 옆끼리 이어질 때만). 담금질은 어긴 쌍마다
@@ -29,11 +37,13 @@ use crate::config::{Config, SaParams, SymbolsConfig};
 use crate::corpus::CorpusStats;
 use crate::keycorpus::{self, FIRST_SYM, KEYS, NSYM, SPACE};
 use crate::layout::{Layout, CHARS, COLS, EMPTY, ROWS};
-use crate::precomp::{finger, Precomp};
+use crate::precomp::Precomp;
 
 const N: usize = ROWS * COLS;
 pub const EMPTY_TOKEN: char = '·';
 pub const SPACE_TOKEN: char = '␣';
+// 한손: S1에 둔 S2 원샷 키
+pub const SHIFT_TOKEN: char = '②';
 // 담금질 온도 (글자 100개당 비용 단위): 처음에는 이 정도 악화를 자주 받아들이고 끝에는 거의 안 받아들임
 const T_START: f64 = 3.0;
 const T_END: f64 = 0.0005;
@@ -41,8 +51,13 @@ const T_END: f64 = 0.0005;
 // 결과는 규칙을 지키는 배치에서만 고르므로 벌점은 탐색에만 씀
 const GROUP_PENALTY: f64 = 5.0;
 
-// 30칸 물리 위치의 비용 표 (비용 단위: 검지 홈 행 키 한 번 = 1). 배열 최적화의 Precomp에서 그대로 가져옴
+// 30칸 물리 위치의 비용 표 (비용 단위: 검지 홈 행 키 한 번 = 1). 배열 최적화의 Precomp에서 그대로 가져옴.
+// 한손이면 한손 표: 0~4열은 기본층 키, 5~9열은 같은 물리 키를 엄지층·심볼층 노력값(one_hand_layer_effort배)으로 누르는 자리
 pub struct Tables {
+  pub one_hand: bool,
+  // 자리마다 누르는 손가락과 왼손 여부 (한손이면 모두 왼손)
+  fingers: [u8; N],
+  lefts: [bool; N],
   eff: [f64; N],
   sfb: Vec<f64>,
   sc: Vec<f64>,
@@ -59,15 +74,22 @@ pub struct Tables {
 
 impl Tables {
   pub fn new(config: &Config) -> Self {
-    let precomp = Precomp::new(&[0; CHARS], &config.weights, &config.costs, &config.effort, 0.0);
+    let one_hand = config.one_hand;
+    let precomp = if one_hand {
+      Precomp::one_hand(&[0; CHARS], &config.weights, &config.costs, &config.effort, config.one_hand_layer_effort)
+    } else {
+      Precomp::new(&[0; CHARS], &config.weights, &config.costs, &config.effort, 0.0)
+    };
     let (a_sfb, a_sc) = crate::layout::event_units(&precomp, &config.costs);
     let grid = config.effort.grid();
+    let layer_f = |p: usize| if one_hand && p % COLS >= COLS / 2 { config.one_hand_layer_effort } else { 1.0 };
     let mut t = Tables {
+      one_hand, fingers: std::array::from_fn(|p| precomp.finger_of(p)), lefts: std::array::from_fn(|p| precomp.same_hand(p, 0)),
       eff: [0.0; N], sfb: vec![0.0; N * N], sc: vec![0.0; N * N], roll: vec![0.0; N * N],
       sfs: vec![0.0; N * N * N], ssc: vec![0.0; N * N * N], roll3: vec![0.0; N * N * N],
       xsfs: vec![0.0; N * N], xssc: vec![0.0; N * N], bg: vec![0.0; N * N], tg: vec![0.0; N * N * N], x: vec![0.0; N * N],
     };
-    for p in 0..N { t.eff[p] = f64::from(grid[p / COLS][p % COLS]) * f64::from(config.costs.effort); }
+    for p in 0..N { t.eff[p] = f64::from(grid[p / COLS][p % COLS] * layer_f(p)) * f64::from(config.costs.effort); }
     for p1 in 0..N {
       for p2 in 0..N {
         let i = p1 * N + p2;
@@ -158,12 +180,25 @@ impl Ngrams {
   pub fn symbol_presses(&self) -> f64 { self.uni[FIRST_SYM as usize..].iter().sum() }
 }
 
+// 키가 속한 층. 두 손: 베이스(글자와 베이스 빈칸)와 심볼 레이어(Sym1). 한손: 기본층·글자 엄지층(Thumb)·심볼층 1·2
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Layer { Base, Thumb, Sym1, Sym2 }
+
+impl Layer {
+  // 이 층의 키를 누를 때 엄지가 누르는 원샷 키 (0 = 없음, 1 = 글자 엄지층 L, 2 = 심볼 S)
+  fn thumb(self) -> u8 { match self { Layer::Base => 0, Layer::Thumb => 1, Layer::Sym1 | Layer::Sym2 => 2 } }
+  fn on_symbol_layer(self) -> bool { matches!(self, Layer::Sym1 | Layer::Sym2) }
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 struct Slot {
+  // 비용 표의 자리
   pos: u8,
-  // 심볼 레이어 칸이면 true (누를 때 탭이 앞에 낌)
-  tap: bool,
+  // 심볼 레이어 칸 번호 (짝 규칙·표시용, 줄 × 10 + 열). 두 손은 pos와 같음. 한손은 S1이 0~4열, S2가 5~9열(거울 자리)
+  grid: u8,
+  layer: Layer,
 }
+
 
 struct Pair {
   a: usize,
@@ -178,7 +213,10 @@ pub struct State {
   slot_of: Vec<u8>,
   item_at: Vec<u8>,
   pos: [u8; KEYS],
-  tap: [bool; KEYS],
+  layer: [Layer; KEYS],
+  // 한손: ② 키의 비용 표 자리와 손가락 (두 손이면 쓰지 않음)
+  shift_pos: u8,
+  shift_finger: u8,
 }
 
 type Move = Vec<(usize, u8)>;
@@ -187,7 +225,10 @@ pub struct Problem<'a> {
   t: &'a Tables,
   g: &'a Ngrams,
   key_pos: [u8; KEYS],
+  key_layer: [Layer; KEYS],
   slots: Vec<Slot>,
+  // 한손: ② 항목 번호 (기호 다음 NSYM). S1 칸에만 둠
+  shift: Option<usize>,
   pairs: Vec<Pair>,
   pair_of: Vec<Option<usize>>,
   singles: Vec<usize>,
@@ -201,6 +242,8 @@ struct Work {
   stamp: u32,
   bl: Vec<u32>,
   tl: Vec<u32>,
+  // 단일 항목 비용(uni)을 다시 셀 항목: 옮긴 항목, ②를 옮기면 S2 기호 전부
+  ul: Vec<usize>,
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -216,15 +259,20 @@ impl Breakdown {
   pub fn total(&self) -> f64 { self.effort + self.taps + self.sfb + self.scissors - self.rolling }
 }
 
-// 짝을 놓을 수 있는 칸 (심볼 레이어 칸 번호 = 위치): 한 손 같은 줄(떨어져 있어도 됨)과 좌우 대칭(양손 같은 손가락·같은 줄).
-// 순서 있는 짝은 첫 글자가 왼쪽·왼손인 방향만. 순서 없는 짝은 한 손 같은 열(떨어져 있어도 됨)도 되고 두 방향 모두
-fn placements(ordered: bool) -> Vec<(u8, u8)> {
+// 짝을 놓을 수 있는 칸 (심볼 레이어 칸 번호): 한 손 같은 줄(떨어져 있어도 됨)과 좌우 대칭(양손 같은 손가락·같은 줄).
+// 순서 있는 짝은 첫 글자가 왼쪽·왼손인 방향만. 순서 없는 짝은 한 손 같은 열(떨어져 있어도 됨)도 되고 두 방향 모두.
+// 한손은 S1이 왼손, S2가 오른손 자리 (같은 층 같은 줄, 같은 층 같은 열, 두 층의 같은 키). S2는 거울 자리라 화면(새끼 → 가운데 열)에서
+// 첫 글자가 왼쪽이려면 큰 열이 먼저
+fn placements(ordered: bool, one_hand: bool) -> Vec<(u8, u8)> {
   let at = |r: usize, c: usize| (r * COLS + c) as u8;
   let left = |c: usize| c < COLS / 2;
   let mut v: Vec<(u8, u8)> = Vec::new();
   for r in 0..ROWS {
     for c in 0..COLS {
-      for c2 in c + 1..COLS { if left(c) == left(c2) { v.push((at(r, c), at(r, c2))); } }
+      for c2 in c + 1..COLS {
+        if left(c) != left(c2) { continue; }
+        v.push(if one_hand && !left(c) { (at(r, c2), at(r, c)) } else { (at(r, c), at(r, c2)) });
+      }
       if !ordered { for r2 in r + 1..ROWS { v.push((at(r, c), at(r2, c))); } }
     }
     for c in 0..COLS / 2 { v.push((at(r, c), at(r, COLS - 1 - c))); }
@@ -326,38 +374,59 @@ fn shape_violations(places: &[(usize, usize)]) -> [usize; 3] {
 
 impl<'a> Problem<'a> {
   pub fn new(t: &'a Tables, g: &'a Ngrams, base: &Layout, cfg: &SymbolsConfig) -> anyhow::Result<Self> {
+    let one_hand = t.one_hand;
+    // 글자의 층: 한손이면 5~9열이 글자 엄지층
+    let letter_layer = |p: u8| if one_hand && p as usize % COLS >= COLS / 2 { Layer::Thumb } else { Layer::Base };
     let mut key_pos = [0; KEYS];
+    let mut key_layer = [Layer::Base; KEYS];
     for (id, kp) in key_pos.iter_mut().enumerate().take(26) {
       anyhow::ensure!(base.pos[id] != EMPTY, "the base layout has no key {}", (b'a' + id as u8) as char);
       *kp = base.pos[id];
+      key_layer[id] = letter_layer(base.pos[id]);
     }
     let p = base.pos[crate::SPACE_ID as usize];
     anyhow::ensure!(p != EMPTY, "the base layout has no space key (_)");
     key_pos[SPACE as usize] = p;
+    key_layer[SPACE as usize] = letter_layer(p);
     let free: Vec<u8> = (0..N as u8).filter(|&p| base.slots[p as usize] == EMPTY).collect();
-    anyhow::ensure!(N + free.len() >= NSYM, "the base layout leaves {} empty slots; 32 symbols need at least {}", free.len(), NSYM - N);
-    let slots: Vec<Slot> = (0..N as u8).map(|p| Slot { pos: p, tap: true }).chain(free.iter().map(|&p| Slot { pos: p, tap: false })).collect();
+    let letter_slots = free.iter().map(|&p| Slot { pos: p, grid: p, layer: letter_layer(p) });
+    let slots: Vec<Slot> = if one_hand {
+      // 심볼층 칸 번호 i: 0~4열은 S1의 그 열, 5~9열은 S2의 거울 열 (9열 = 새끼). 비용 표 자리는 같은 물리 키의 5~9열
+      (0..N as u8).map(|i| {
+        let (r, c) = (i as usize / COLS, i as usize % COLS);
+        let phys = if c < COLS / 2 { c } else { COLS - 1 - c };
+        let layer = if c < COLS / 2 { Layer::Sym1 } else { Layer::Sym2 };
+        Slot { pos: (r * COLS + COLS - 1 - phys) as u8, grid: i, layer }
+      }).chain(letter_slots).collect()
+    } else {
+      (0..N as u8).map(|p| Slot { pos: p, grid: p, layer: Layer::Sym1 }).chain(letter_slots).collect()
+    };
+    // 한손은 ②도 한 칸을 차지함
+    let items = NSYM + usize::from(one_hand);
+    anyhow::ensure!(slots.len() >= items, "the base layout leaves {} empty slots; 32 symbols need at least {}", free.len(), items - N);
     let mut pairs = Vec::new();
     for (list, ordered) in [(&cfg.pairs, true), (&cfg.loose_pairs, false)] {
       for p in list {
         let cs: Vec<char> = p.chars().collect();
         let idx = |c: char| keycorpus::sym_index(c).ok_or_else(|| anyhow::anyhow!("{c:?} is not an ASCII symbol"));
-        pairs.push(Pair { a: idx(cs[0])?, b: idx(cs[1])?, places: placements(ordered) });
+        pairs.push(Pair { a: idx(cs[0])?, b: idx(cs[1])?, places: placements(ordered, one_hand) });
       }
     }
     let mut pair_of = vec![None; slots.len()];
     for (i, p) in pairs.iter().enumerate() { pair_of[p.a] = Some(i); pair_of[p.b] = Some(i); }
     let singles = (0..slots.len()).filter(|&i| pair_of[i].is_none()).collect();
-    Ok(Problem { t, g, key_pos, slots, pairs, pair_of, singles, tap_cost: t.eff.iter().copied().fold(f64::INFINITY, f64::min), base_extra: f64::from(cfg.base_slot_extra) })
+    Ok(Problem { t, g, key_pos, key_layer, slots, shift: one_hand.then_some(NSYM), pairs, pair_of, singles,
+      tap_cost: t.eff.iter().copied().fold(f64::INFINITY, f64::min), base_extra: f64::from(cfg.base_slot_extra) })
   }
 
   fn work(&self) -> Work {
-    Work { bmark: vec![0; self.g.bi.len()], tmark: vec![0; self.g.tri.len()], stamp: 0, bl: Vec::new(), tl: Vec::new() }
+    Work { bmark: vec![0; self.g.bi.len()], tmark: vec![0; self.g.tri.len()], stamp: 0, bl: Vec::new(), tl: Vec::new(), ul: Vec::new() }
   }
 
   // 항목 → 칸 배정에서 상태를 만듦 (slot_of 길이 = 칸 수)
   fn state_from(&self, slot_of: Vec<u8>) -> State {
-    let mut st = State { item_at: vec![0; slot_of.len()], slot_of: vec![0; slot_of.len()], pos: self.key_pos, tap: [false; KEYS] };
+    let mut st = State { item_at: vec![0; slot_of.len()], slot_of: vec![0; slot_of.len()], pos: self.key_pos, layer: self.key_layer,
+      shift_pos: 0, shift_finger: 0 };
     for (item, &s) in slot_of.iter().enumerate() { self.place(&mut st, item, s); }
     st
   }
@@ -365,41 +434,89 @@ impl<'a> Problem<'a> {
   fn place(&self, st: &mut State, item: usize, slot: u8) {
     st.slot_of[item] = slot;
     st.item_at[slot as usize] = item as u8;
+    let s = self.slots[slot as usize];
     if item < NSYM {
       let k = FIRST_SYM as usize + item;
-      let s = self.slots[slot as usize];
       st.pos[k] = s.pos;
-      st.tap[k] = s.tap;
+      st.layer[k] = s.layer;
+    } else if Some(item) == self.shift {
+      st.shift_pos = s.pos;
+      st.shift_finger = self.t.fingers[s.pos as usize];
     }
   }
 
-  // 심볼 레이어 기호는 누를 때마다 탭 비용을 매기고, 이어 치는 기호(bi)에서 되돌려 줌
+  // 항목을 그 칸에 둘 수 있는지: ②는 S1 칸에만
+  fn slot_ok(&self, item: usize, slot: u8) -> bool {
+    Some(item) != self.shift || self.slots[slot as usize].layer == Layer::Sym1
+  }
+
+  fn move_ok(&self, mv: &Move) -> bool { mv.iter().all(|&(i, s)| self.slot_ok(i, s)) }
+
+  // 엄지 원샷 키가 있는 층의 기호는 누를 때마다 탭 비용을 매기고, 이어 치는 쌍(bi)에서 되돌려 줌. 글자층 빈칸은 base_slot_extra.
+  // S2 기호는 앞에 ②를 누르는 비용(② 노력값과 ② → 기호 쌍)도 매기고, ②를 누른 채로 이어 치면 bi에서 되돌려 줌
   fn uni(&self, st: &State, item: usize) -> f64 {
     if item >= NSYM { return 0.0; }
     let k = FIRST_SYM as usize + item;
-    self.g.uni[k] * (self.t.eff[st.pos[k] as usize] + if st.tap[k] { self.tap_cost } else { self.base_extra })
+    let (p, l) = (st.pos[k] as usize, st.layer[k]);
+    let mut c = self.t.eff[p];
+    if l.thumb() != 0 { c += self.tap_cost; }
+    if !l.on_symbol_layer() { c += self.base_extra; }
+    if l == Layer::Sym2 { c += self.t.eff[st.shift_pos as usize] + self.t.bg[st.shift_pos as usize * N + p]; }
+    self.g.uni[k] * c
   }
 
-  // a 다음 b를 칠 때 엄지가 레이어 키를 새로 누르는지: b가 심볼 레이어 기호이고 a는 아닐 때
-  fn tapped(st: &State, a: u8, b: u8) -> bool { st.tap[b as usize] && !st.tap[a as usize] }
+  // a 다음 b를 칠 때 엄지가 원샷 키를 새로 누르는지: b의 층에 엄지 키가 있고 a의 층과 다른 키일 때
+  fn tapped(st: &State, a: u8, b: u8) -> bool {
+    let tb = st.layer[b as usize].thumb();
+    tb != 0 && st.layer[a as usize].thumb() != tb
+  }
 
-  // 둘 다 심볼 레이어 기호면 레이어 키를 누른 채로 이어 침 (탭 하나를 아낌)
-  fn held(st: &State, a: u8, b: u8) -> bool { st.tap[a as usize] && st.tap[b as usize] }
+  // 같은 엄지 키의 층이 이어지면 누른 채로 이어 침 (탭 하나를 아낌)
+  fn held(st: &State, a: u8, b: u8) -> bool {
+    let tb = st.layer[b as usize].thumb();
+    tb != 0 && st.layer[a as usize].thumb() == tb
+  }
+
+  // 한손: b 앞에 ②를 누르는지. S2 기호는 ②를 누른 채로 이어 치지만, ②를 누른 손가락 자리의 기호는 ②를 다시 누른 뒤 침
+  fn shifted(&self, st: &State, a: u8, b: u8) -> bool {
+    if st.layer[b as usize] != Layer::Sym2 { return false; }
+    let f = |k: u8| self.t.fingers[st.pos[k as usize] as usize];
+    !(st.layer[a as usize] == Layer::Sym2 && f(a) != st.shift_finger && f(b) != st.shift_finger)
+  }
+
+  // b를 칠 때 처음 누르는 손가락 키 (②가 끼면 ②)
+  fn first(&self, st: &State, a: u8, b: u8) -> usize {
+    if self.shifted(st, a, b) { st.shift_pos as usize } else { st.pos[b as usize] as usize }
+  }
 
   // a 다음 b를 누르는 손가락 비용 (엄지가 새로 끼면 탭 너머 쌍). 탭 비용은 뺌
   fn pair(&self, st: &State, a: u8, b: u8) -> f64 {
-    let i = st.pos[a as usize] as usize * N + st.pos[b as usize] as usize;
+    let i = st.pos[a as usize] as usize * N + self.first(st, a, b);
     if Self::tapped(st, a, b) { self.t.x[i] } else { self.t.bg[i] }
   }
 
   fn bi(&self, st: &State, a: u8, b: u8) -> f64 {
-    self.pair(st, a, b) - if Self::held(st, a, b) { self.tap_cost } else { 0.0 }
+    let mut c = self.pair(st, a, b);
+    if Self::held(st, a, b) { c -= self.tap_cost; }
+    if st.layer[b as usize] == Layer::Sym2 {
+      let (pa, pb, sp) = (st.pos[a as usize] as usize, st.pos[b as usize] as usize, st.shift_pos as usize);
+      if !self.shifted(st, a, b) {
+        // ②를 누른 채로 이어 침: uni에 넣어 둔 ② 누름을 되돌림
+        c -= self.t.eff[sp] + self.t.bg[sp * N + pb];
+      } else if !Self::tapped(st, a, b) {
+        // 엄지 탭 없이 a → ② → b로 이어지는 세 누름
+        c += self.t.tg[(pa * N + sp) * N + pb];
+      }
+    }
+    c
   }
 
+  // 세 글자 a b c에서 b를 가운데 둔 세 누름 (b 바로 앞 누름, b, c의 첫 누름). 엄지 탭이 사이에 끼면 셈에서 뺌
   fn tri(&self, st: &State, a: u8, b: u8, c: u8) -> f64 {
-    if Self::tapped(st, a, b) || Self::tapped(st, b, c) { return 0.0; }
-    let (pa, pb, pc) = (st.pos[a as usize] as usize, st.pos[b as usize] as usize, st.pos[c as usize] as usize);
-    self.t.tg[(pa * N + pb) * N + pc]
+    let sb = self.shifted(st, a, b);
+    if (!sb && Self::tapped(st, a, b)) || Self::tapped(st, b, c) { return 0.0; }
+    let m = if sb { st.shift_pos as usize } else { st.pos[a as usize] as usize };
+    self.t.tg[(m * N + st.pos[b as usize] as usize) * N + self.first(st, b, c)]
   }
 
   pub fn total(&self, st: &State) -> f64 {
@@ -410,20 +527,25 @@ impl<'a> Problem<'a> {
   }
 
   // 옮기는 항목들이 낀 부분의 비용
-  fn part(&self, st: &State, mv: &Move, w: &mut Work) -> f64 {
-    let mut c: f64 = mv.iter().map(|&(i, _)| self.uni(st, i)).sum();
+  fn part(&self, st: &State, w: &Work) -> f64 {
+    let mut c: f64 = w.ul.iter().map(|&i| self.uni(st, i)).sum();
     for &i in &w.bl { let (x, y, wt) = self.g.bi[i as usize]; c += wt * self.bi(st, x, y); }
     for &i in &w.tl { let (x, y, z, wt) = self.g.tri[i as usize]; c += wt * self.tri(st, x, y, z); }
     c
   }
 
-  fn mark(&self, mv: &Move, w: &mut Work) {
+  // 이동으로 비용이 바뀌는 항목과 n-gram을 표시. ②를 옮기면 S2 기호가 낀 것 모두 (S2 기호의 층은 ②를 옮겨도 그대로)
+  fn mark(&self, st: &State, mv: &Move, w: &mut Work) {
     w.stamp = w.stamp.wrapping_add(1);
     if w.stamp == 0 { w.bmark.fill(0); w.tmark.fill(0); w.stamp = 1; }
     w.bl.clear();
     w.tl.clear();
-    for &(item, _) in mv {
-      if item >= NSYM { continue; }
+    w.ul.clear();
+    let shift_moves = mv.iter().any(|&(i, _)| Some(i) == self.shift);
+    let s2 = (0..NSYM).filter(|&i| shift_moves && st.layer[FIRST_SYM as usize + i] == Layer::Sym2);
+    for item in mv.iter().map(|&(i, _)| i).filter(|&i| i < NSYM).chain(s2) {
+      if w.ul.contains(&item) { continue; }
+      w.ul.push(item);
       for &i in &self.g.bi_of[item] { if w.bmark[i as usize] != w.stamp { w.bmark[i as usize] = w.stamp; w.bl.push(i); } }
       for &i in &self.g.tri_of[item] { if w.tmark[i as usize] != w.stamp { w.tmark[i as usize] = w.stamp; w.tl.push(i); } }
     }
@@ -431,11 +553,11 @@ impl<'a> Problem<'a> {
 
   // 이동을 적용하고 비용 변화를 돌려줌. 되돌릴 때 쓸 이전 칸도 함께
   fn apply(&self, st: &mut State, mv: &Move, w: &mut Work) -> (f64, Move) {
-    self.mark(mv, w);
-    let before = self.part(st, mv, w);
+    self.mark(st, mv, w);
+    let before = self.part(st, w);
     let old: Move = mv.iter().map(|&(i, _)| (i, st.slot_of[i])).collect();
     for &(i, s) in mv { self.place(st, i, s); }
-    (self.part(st, mv, w) - before, old)
+    (self.part(st, w) - before, old)
   }
 
   fn undo(&self, st: &mut State, old: &Move) {
@@ -454,7 +576,8 @@ impl<'a> Problem<'a> {
     if movers.len() != vac.len() { return None; }
     let mut mv: Move = vec![(pr.a, sa), (pr.b, sb)];
     mv.extend(movers.into_iter().zip(vac));
-    Some(mv)
+    // 짝에 밀려난 ②가 S1 밖으로 가면 안 됨
+    self.move_ok(&mv).then_some(mv)
   }
 
   // 두 짝의 칸을 맞바꾸는 이동 (방향은 각 짝이 받을 수 있는 쪽으로)
@@ -483,9 +606,16 @@ impl<'a> Problem<'a> {
         used[b as usize] = true;
       }
       if !ok { continue; }
+      // ②는 남은 S1 칸 중 하나에 먼저 (짝이 모두 S1에 들어가도 기호 14개라 한 칸은 남음)
+      if let Some(sh) = self.shift {
+        let s1: Vec<u8> = (0..n as u8).filter(|&s| !used[s as usize] && self.slot_ok(sh, s)).collect();
+        let s = s1[rng.usize(..s1.len())];
+        slot_of[sh] = s;
+        used[s as usize] = true;
+      }
       let mut rest: Vec<u8> = (0..n as u8).filter(|&s| !used[s as usize]).collect();
       rng.shuffle(&mut rest);
-      for (&i, s) in self.singles.iter().zip(rest) { slot_of[i] = s; }
+      for (&i, s) in self.singles.iter().filter(|&&i| Some(i) != self.shift).zip(rest) { slot_of[i] = s; }
       return self.state_from(slot_of);
     }
   }
@@ -496,7 +626,8 @@ impl<'a> Problem<'a> {
       let x = self.singles[rng.usize(..self.singles.len())];
       let y = self.singles[rng.usize(..self.singles.len())];
       if x == y || (x >= NSYM && y >= NSYM) { return None; }
-      return Some(vec![(x, st.slot_of[y]), (y, st.slot_of[x])]);
+      let mv = vec![(x, st.slot_of[y]), (y, st.slot_of[x])];
+      return self.move_ok(&mv).then_some(mv);
     }
     let p = rng.usize(..self.pairs.len());
     if r < 0.95 {
@@ -509,9 +640,9 @@ impl<'a> Problem<'a> {
     self.pair_swap(st, p, q)
   }
 
-  // 짝 두 기호의 물리 위치 (칸 번호)
+  // 짝 두 기호의 심볼 레이어 칸 번호 (한손은 S1이 왼쪽, S2가 거울 자리의 오른쪽)
   fn pair_pos(&self, st: &State, p: &Pair) -> (usize, usize) {
-    (self.slots[st.slot_of[p.a] as usize].pos as usize, self.slots[st.slot_of[p.b] as usize].pos as usize)
+    (self.slots[st.slot_of[p.a] as usize].grid as usize, self.slots[st.slot_of[p.b] as usize].grid as usize)
   }
 
   // 짝 맞춤 규칙을 어긴 쌍 수
@@ -535,7 +666,8 @@ impl<'a> Problem<'a> {
       let mut cands: Vec<Move> = Vec::new();
       for (i, &x) in self.singles.iter().enumerate() {
         for &y in &self.singles[i + 1..] {
-          if x < NSYM || y < NSYM { cands.push(vec![(x, st.slot_of[y]), (y, st.slot_of[x])]); }
+          let mv = vec![(x, st.slot_of[y]), (y, st.slot_of[x])];
+          if (x < NSYM || y < NSYM) && self.move_ok(&mv) { cands.push(mv); }
         }
       }
       for p in 0..self.pairs.len() {
@@ -619,53 +751,73 @@ impl<'a> Problem<'a> {
     (c, st, hits, starts)
   }
 
-  // 레이어 키 탭 수 (글자 100개당): 심볼 레이어 기호 누름에서 앞 키도 심볼 레이어 기호인 누름(누른 채로 이어 침)을 뺌
+  // 엄지 탭 수 (글자 100개당): 엄지 원샷 키가 있는 층의 기호 누름에서, 같은 엄지 키를 누른 채로 이어 친 누름을 뺌.
+  // 한손은 기호 다음 글자 엄지층 글자를 이어 친 것도 뺌 (그 글자의 탭을 아낌)
   pub fn layer_taps(&self, st: &State) -> f64 {
-    let presses: f64 = (FIRST_SYM as usize..KEYS).filter(|&k| st.tap[k]).map(|k| self.g.uni[k]).sum();
+    let presses: f64 = (FIRST_SYM as usize..KEYS).filter(|&k| st.layer[k].thumb() != 0).map(|k| self.g.uni[k]).sum();
     let held: f64 = self.g.bi.iter().filter(|&&(x, y, _)| Self::held(st, x, y)).map(|e| e.2).sum();
     presses - held
   }
 
+  // 한손: ② 누름 수 (글자 100개당). S2 기호 누름에서 ②를 누른 채로 이어 친 누름을 뺌
+  pub fn shift_presses(&self, st: &State) -> f64 {
+    let presses: f64 = (FIRST_SYM as usize..KEYS).filter(|&k| st.layer[k] == Layer::Sym2).map(|k| self.g.uni[k]).sum();
+    let held: f64 = self.g.bi.iter().filter(|&&(x, y, _)| st.layer[y as usize] == Layer::Sym2 && !self.shifted(st, x, y)).map(|e| e.2).sum();
+    presses - held
+  }
+
   pub fn breakdown(&self, st: &State) -> Breakdown {
+    fn pair_into(b: &mut Breakdown, t: &Tables, w: f64, i: usize) { b.sfb += w * t.sfb[i]; b.scissors += w * t.sc[i]; b.rolling += w * t.roll[i]; }
+    fn triple_into(b: &mut Breakdown, t: &Tables, w: f64, j: usize) { b.sfb += w * t.sfs[j]; b.scissors += w * t.ssc[j]; b.rolling += w * t.roll3[j]; }
     let t = self.t;
+    let sp = st.shift_pos as usize;
     let mut b = Breakdown { taps: self.layer_taps(st) * self.tap_cost, ..Breakdown::default() };
     for k in FIRST_SYM as usize..KEYS {
-      b.effort += self.g.uni[k] * (t.eff[st.pos[k] as usize] + if st.tap[k] { 0.0 } else { self.base_extra });
+      let (p, l, u) = (st.pos[k] as usize, st.layer[k], self.g.uni[k]);
+      b.effort += u * (t.eff[p] + if l.on_symbol_layer() { 0.0 } else { self.base_extra });
+      // S2 기호 앞의 ② (누른 채로 이어 치면 아래 바이그램에서 되돌림)
+      if l == Layer::Sym2 { b.effort += u * t.eff[sp]; pair_into(&mut b, t, u, sp * N + p); }
     }
     for &(x, y, w) in &self.g.bi {
-      let i = st.pos[x as usize] as usize * N + st.pos[y as usize] as usize;
-      if Self::tapped(st, x, y) { b.sfb += w * t.xsfs[i]; b.scissors += w * t.xssc[i]; }
-      else { b.sfb += w * t.sfb[i]; b.scissors += w * t.sc[i]; b.rolling += w * t.roll[i]; }
+      let i = st.pos[x as usize] as usize * N + self.first(st, x, y);
+      if Self::tapped(st, x, y) { b.sfb += w * t.xsfs[i]; b.scissors += w * t.xssc[i]; } else { pair_into(&mut b, t, w, i); }
+      if st.layer[y as usize] == Layer::Sym2 {
+        let (px, py) = (st.pos[x as usize] as usize, st.pos[y as usize] as usize);
+        if !self.shifted(st, x, y) { b.effort -= w * t.eff[sp]; pair_into(&mut b, t, -w, sp * N + py); }
+        else if !Self::tapped(st, x, y) { triple_into(&mut b, t, w, (px * N + sp) * N + py); }
+      }
     }
     for &(x, y, z, w) in &self.g.tri {
-      if Self::tapped(st, x, y) || Self::tapped(st, y, z) { continue; }
-      let j = (st.pos[x as usize] as usize * N + st.pos[y as usize] as usize) * N + st.pos[z as usize] as usize;
-      b.sfb += w * t.sfs[j];
-      b.scissors += w * t.ssc[j];
-      b.rolling += w * t.roll3[j];
+      let sy = self.shifted(st, x, y);
+      if (!sy && Self::tapped(st, x, y)) || Self::tapped(st, y, z) { continue; }
+      let m = if sy { sp } else { st.pos[x as usize] as usize };
+      triple_into(&mut b, t, w, (m * N + st.pos[y as usize] as usize) * N + self.first(st, y, z));
     }
     b
   }
 
-  // 바이그램 하나의 분류 (표시용)
+  // 바이그램 하나의 분류 (표시용). 한손에서 ②가 끼면 a → ② 쌍을 "②:"를 붙여 분류
   fn kind(&self, st: &State, a: u8, b: u8) -> &'static str {
-    let (pa, pb) = (st.pos[a as usize], st.pos[b as usize]);
-    let i = pa as usize * N + pb as usize;
+    let (pa, pb) = (st.pos[a as usize] as usize, self.first(st, a, b));
+    let i = pa * N + pb;
     if Self::tapped(st, a, b) {
       return if pa == pb { "tap:same-key" } else if self.t.xsfs[i] > 0.0 { "tap:sfs" } else if self.t.xssc[i] > 0.0 { "tap:skip-sc" } else { "tap" };
     }
-    let (ca, cb) = (pa as usize % COLS, pb as usize % COLS);
-    if pa == pb { "same-key" }
-    else if (ca < COLS / 2) != (cb < COLS / 2) { "alt" }
-    else if self.t.sfb[i] > 0.0 { "SFB" }
-    else if self.t.sc[i] > 0.0 { if matches!(ca, 4 | 5) || matches!(cb, 4 | 5) { "LSB" } else { "scissor" } }
-    else if self.t.roll[i] > 0.0 { if finger(pa as usize) > finger(pb as usize) { "inroll" } else { "outroll" } }
-    else { "other" }
+    let (ca, cb) = (pa % COLS, pb % COLS);
+    let k = if pa == pb { "same-key" }
+      else if self.t.lefts[pa] != self.t.lefts[pb] { "alt" }
+      else if self.t.sfb[i] > 0.0 { "SFB" }
+      else if self.t.sc[i] > 0.0 { if matches!(ca, 4 | 5) || matches!(cb, 4 | 5) { "LSB" } else { "scissor" } }
+      else if self.t.roll[i] > 0.0 { if self.t.fingers[pa] > self.t.fingers[pb] { "inroll" } else { "outroll" } }
+      else { "other" };
+    if !self.shifted(st, a, b) { return k; }
+    match k { "same-key" => "②:same-key", "SFB" => "②:SFB", "LSB" => "②:LSB", "scissor" => "②:scissor", "inroll" => "②:inroll", "outroll" => "②:outroll", _ => "②:other" }
   }
 
   pub fn print_report(&self, st: &State) {
     let b = self.breakdown(st);
-    println!("cost={:.2}  effort={:.2}  taps={:.2}  sfb={:.2}  scissors={:.2}  rolling={:.2}   (per 100 letters, n-grams with a symbol; {:.1} symbol presses, {:.1} layer taps)",
+    let shift = if self.shift.is_some() { format!(", {:.1} ② presses", self.shift_presses(st)) } else { String::new() };
+    println!("cost={:.2}  effort={:.2}  taps={:.2}  sfb={:.2}  scissors={:.2}  rolling={:.2}   (per 100 letters, n-grams with a symbol; {:.1} symbol presses, {:.1} layer taps{shift})",
       b.total(), b.effort, b.taps, b.sfb, b.scissors, -b.rolling, self.g.symbol_presses(), self.layer_taps(st));
     let mut kinds: Vec<(&str, f64)> = Vec::new();
     let mut total = 0.0;
@@ -684,43 +836,59 @@ impl<'a> Problem<'a> {
     println!("worst: {}", worst.iter().take(12).map(|(c, s, k)| format!("[{s}] {k} {c:.2}")).collect::<Vec<_>>().join("  "));
   }
 
-  // 표시·저장용 두 레이어 (각 3행 × 10칸 토큰)
+  // 표시·저장용 두 레이어 (각 3행 × 10칸 토큰). 한손은 오른쪽 5칸(S2, 글자 엄지층)을 손가락 순서(새끼 → 가운데 열)로
   fn grids(&self, base: &Layout, st: &State) -> [[[char; COLS]; ROWS]; 2] {
+    let col = |c: usize| shown_col(c, self.t.one_hand);
     let mut g = [[[EMPTY_TOKEN; COLS]; ROWS]; 2];
     for p in 0..N {
       let id = base.slots[p];
-      g[1][p / COLS][p % COLS] = if id == crate::SPACE_ID { SPACE_TOKEN } else if id < 26 { (b'a' + id) as char } else { EMPTY_TOKEN };
+      g[1][p / COLS][col(p % COLS)] = if id == crate::SPACE_ID { SPACE_TOKEN } else if id < 26 { (b'a' + id) as char } else { EMPTY_TOKEN };
     }
-    for item in 0..NSYM {
-      let s = self.slots[st.slot_of[item] as usize];
-      g[usize::from(!s.tap)][s.pos as usize / COLS][s.pos as usize % COLS] = keycorpus::key_char(FIRST_SYM + item as u8);
-    }
+    let mut put = |s: Slot, ch: char| {
+      let (layer, q) = if s.layer.on_symbol_layer() { (0, s.grid as usize) } else { (1, s.pos as usize) };
+      g[layer][q / COLS][col(q % COLS)] = ch;
+    };
+    for item in 0..NSYM { put(self.slots[st.slot_of[item] as usize], keycorpus::key_char(FIRST_SYM + item as u8)); }
+    if let Some(sh) = self.shift { put(self.slots[st.slot_of[sh] as usize], SHIFT_TOKEN); }
     g
   }
 
   pub fn to_text(&self, base: &Layout, st: &State) -> String {
     let g = self.grids(base, st);
     let row = |r: &[char; COLS]| format!(" {}   {}", r[..5].iter().map(char::to_string).collect::<Vec<_>>().join(" "), r[5..].iter().map(char::to_string).collect::<Vec<_>>().join(" "));
-    let mut out = String::from("symbol layer (one-shot)\n");
+    let (sym_title, base_title) = if self.t.one_hand {
+      ("symbol layers: S1 (one-shot thumb key) | S2 (one-shot key ② on S1)", "letter layers: base | thumb layer")
+    } else { ("symbol layer (one-shot)", "base layer") };
+    let mut out = format!("{sym_title}\n");
     for r in &g[0] { out.push_str(&row(r)); out.push('\n'); }
-    out.push_str("base layer\n");
+    out.push_str(base_title);
+    out.push('\n');
     for r in &g[1] { out.push_str(&row(r)); out.push('\n'); }
     out
   }
 
   // 파일에서 읽은 기호 배치 → 상태 (base는 parse_text가 돌려준 것과 같아야 함)
-  pub fn state_of(&self, placed: &[(u8, bool); NSYM]) -> anyhow::Result<State> {
+  pub fn state_of(&self, placed: &Placed) -> anyhow::Result<State> {
     let n = self.slots.len();
     let mut slot_of = vec![u8::MAX; n];
     let mut used = vec![false; n];
-    for (item, &(pos, tap)) in placed.iter().enumerate() {
-      let s = self.slots.iter().position(|sl| sl.pos == pos && sl.tap == tap)
+    // 심볼 레이어 칸은 칸 번호로, 글자층 빈칸은 글자 자리로 찾음
+    let find = |pos: u8, sym_layer: bool| self.slots.iter().position(|sl| sl.layer.on_symbol_layer() == sym_layer && if sym_layer { sl.grid == pos } else { sl.pos == pos });
+    for (item, &(pos, sym_layer)) in placed.syms.iter().enumerate() {
+      let s = find(pos, sym_layer)
         .ok_or_else(|| anyhow::anyhow!("symbol {:?} is on a base key that is not empty", keycorpus::key_char(FIRST_SYM + item as u8)))?;
       slot_of[item] = s as u8;
       used[s] = true;
     }
+    if let Some(sh) = self.shift {
+      let pos = placed.shift.ok_or_else(|| anyhow::anyhow!("the symbol layers need one {SHIFT_TOKEN} (the S2 key on S1)"))?;
+      let s = find(pos, true).filter(|&s| self.slot_ok(sh, s as u8) && !used[s])
+        .ok_or_else(|| anyhow::anyhow!("{SHIFT_TOKEN} must be on an empty key of S1"))?;
+      slot_of[sh] = s as u8;
+      used[s] = true;
+    }
     let mut free = (0..n).filter(|&s| !used[s]);
-    for x in slot_of.iter_mut().skip(NSYM) { *x = free.next().expect("one slot per item") as u8; }
+    for x in slot_of.iter_mut().filter(|x| **x == u8::MAX) { *x = free.next().expect("one slot per item") as u8; }
     Ok(self.state_from(slot_of))
   }
 
@@ -729,19 +897,32 @@ impl<'a> Problem<'a> {
     let name = |p: &Pair| format!("{}{}", keycorpus::key_char(FIRST_SYM + p.a as u8), keycorpus::key_char(FIRST_SYM + p.b as u8));
     let mut out: Vec<String> = self.pairs.iter().filter(|p| !p.places.contains(&(st.slot_of[p.a], st.slot_of[p.b]))).map(name).collect();
     let places: Vec<(usize, usize)> = self.pairs.iter().map(|p| self.pair_pos(st, p)).collect();
+    let shapes = if self.t.one_hand { ["same-layer row", "same-layer column", "same-key (S1 and S2)"] } else { ["one-hand row", "one-hand column", "mirrored"] };
     for (g, &v) in shape_violations(&places).iter().enumerate() {
       if v == 0 { continue; }
       let names: Vec<String> = self.pairs.iter().zip(&places)
         .filter(|&(_, &(a, b))| pair_shape(a, b).is_some_and(|s| s.group() == g)).map(|(p, _)| name(p)).collect();
-      out.push(format!("{} ({} pairs not lined up)", names.join(" "), ["one-hand row", "one-hand column", "mirrored"][g]));
+      out.push(format!("{} ({} pairs not lined up)", names.join(" "), shapes[g]));
     }
     out
   }
 }
 
+// 화면 열 → 안쪽 열 (한손은 오른쪽 5칸을 뒤집음: 화면은 손가락 순서, 안은 거울 자리). 두 번 하면 그대로
+fn shown_col(c: usize, one_hand: bool) -> usize { if one_hand && c >= COLS / 2 { 3 * COLS / 2 - 1 - c } else { c } }
+
+// 기호 배치 파일에서 읽은 것: 베이스 배열, 기호마다 (자리, 심볼 레이어인지), 한손이면 ②의 심볼 레이어 칸 번호.
+// 심볼 레이어의 자리는 칸 번호(한손은 S2가 거울 자리), 베이스의 자리는 배열 칸 번호
+pub struct Placed {
+  pub base: Layout,
+  pub syms: [(u8, bool); NSYM],
+  pub shift: Option<u8>,
+}
+
 // 기호 배치 파일 읽기: 칸 10개짜리 줄만 행으로 봄 (나머지 줄은 제목 등으로 무시). 앞 3행은 심볼 레이어, 다음 3행은 베이스
-// (글자, ␣ = 스페이스, · = 빈칸, 기호 = 베이스 빈칸에 둔 기호). 돌려주는 것: 베이스 배열과 기호마다 (위치, 심볼 레이어인지)
-pub fn parse_text(text: &str) -> anyhow::Result<(Layout, [(u8, bool); NSYM])> {
+// (글자, ␣ = 스페이스, · = 빈칸, 기호 = 베이스 빈칸에 둔 기호). 한손은 앞 3행이 S1 | S2, 다음 3행이 기본층 | 글자 엄지층이고
+// 오른쪽 5칸은 손가락 순서(새끼 → 가운데 열). ②(S2 원샷 키)는 S1에 하나
+pub fn parse_text(text: &str, one_hand: bool) -> anyhow::Result<Placed> {
   // 한 글자짜리 토큰만 칸으로 (여러 글자 토큰이 있는 줄은 제목으로 봄)
   let one_char = |t: &str| { let mut c = t.chars(); match (c.next(), c.next()) { (Some(ch), None) => Some(ch), _ => None } };
   let rows: Vec<Vec<char>> = text.lines()
@@ -751,35 +932,43 @@ pub fn parse_text(text: &str) -> anyhow::Result<(Layout, [(u8, bool); NSYM])> {
     .collect();
   anyhow::ensure!(rows.len() == 2 * ROWS, "expected {} rows of {COLS} keys (symbol layer, then base layer), found {}", 2 * ROWS, rows.len());
   let mut placed: [Option<(u8, bool)>; NSYM] = [None; NSYM];
-  let mut base_text = String::new();
+  let mut shift = None;
+  let mut base_rows = [['.'; COLS]; ROWS];
   for (r, row) in rows.iter().enumerate() {
     let sym_layer = r < ROWS;
     for (c, &ch) in row.iter().enumerate() {
-      let pos = ((r % ROWS) * COLS + c) as u8;
+      let inner = shown_col(c, one_hand);
+      let pos = ((r % ROWS) * COLS + inner) as u8;
+      if one_hand && ch == SHIFT_TOKEN {
+        anyhow::ensure!(sym_layer && c < COLS / 2, "{SHIFT_TOKEN} (the S2 key) must be on S1, the left half of the symbol layers");
+        anyhow::ensure!(shift.is_none(), "{SHIFT_TOKEN} appears more than once");
+        shift = Some(pos);
+        continue;
+      }
       if let Some(i) = keycorpus::sym_index(ch) {
         anyhow::ensure!(placed[i].is_none(), "symbol {ch:?} appears more than once");
         placed[i] = Some((pos, sym_layer));
-        if !sym_layer { base_text.push('.'); }
         continue;
       }
       if sym_layer {
         anyhow::ensure!(ch == EMPTY_TOKEN, "unexpected {ch:?} in the symbol layer (use {EMPTY_TOKEN} for an empty key)");
         continue;
       }
-      base_text.push(match ch {
+      base_rows[r % ROWS][inner] = match ch {
         SPACE_TOKEN => '_',
         EMPTY_TOKEN => '.',
         c if c.is_ascii_alphabetic() => c,
         _ => anyhow::bail!("unexpected {ch:?} in the base layer"),
-      });
+      };
     }
-    if !sym_layer { base_text.push('\n'); }
   }
+  anyhow::ensure!(!one_hand || shift.is_some(), "the symbol layers need one {SHIFT_TOKEN} (the S2 key on S1)");
   let missing: String = (0..NSYM).filter(|&i| placed[i].is_none()).map(|i| keycorpus::key_char(FIRST_SYM + i as u8)).collect();
   anyhow::ensure!(missing.is_empty(), "symbols missing from the file: {missing}");
+  let base_text: String = base_rows.iter().map(|r| r.iter().collect::<String>() + "\n").collect();
   let base = Layout::parse(&base_text)?;
   anyhow::ensure!(base.key_count() == 27, "the base layer must hold a-z and ␣");
-  Ok((base, placed.map(|p| p.expect("checked above"))))
+  Ok(Placed { base, syms: placed.map(|p| p.expect("checked above")), shift })
 }
 
 // 심볼 레이어 최적화 (symbols 명령): base는 고른 베이스 배열(뒤집었으면 뒤집은 것), label은 결과 파일 이름에 붙임
@@ -787,11 +976,12 @@ pub fn optimize(result_path: &Path, config: &Config, base: &Layout, label: &str)
   let g = code_ngrams(result_path, config)?;
   let t = Tables::new(config);
   let problem = Problem::new(&t, &g, base, &config.symbols)?;
-  let out = result_path.join(format!("symbols-{label}.txt"));
+  // 한손 결과는 두 손 결과와 섞이지 않게 이름을 따로
+  let out = result_path.join(if config.one_hand { format!("symbols-one-hand-{label}.txt") } else { format!("symbols-{label}.txt") });
   // 같은 베이스로 저장해 둔 결과가 있으면 첫 시작점으로 (이전보다 나빠지지 않게)
-  let seed = std::fs::read_to_string(&out).ok().and_then(|text| parse_text(&text).ok())
-    .filter(|(b, _)| b.slots == base.slots)
-    .and_then(|(_, placed)| problem.state_of(&placed).ok())
+  let seed = std::fs::read_to_string(&out).ok().and_then(|text| parse_text(&text, config.one_hand).ok())
+    .filter(|placed| placed.base.slots == base.slots)
+    .and_then(|placed| problem.state_of(&placed).ok())
     .filter(|st| problem.broken_pairs(st).is_empty());
   if seed.is_some() { println!("[Symbols] also starting from {}", out.display()); }
   let (_, st, hits, starts) = problem.search(&config.sa, config.symbols.steps, seed);
@@ -814,12 +1004,12 @@ pub fn score_files(result_path: &Path, config: &Config, files: &[String]) -> any
   let g = code_ngrams(result_path, config)?;
   let t = Tables::new(config);
   for f in files {
-    let (base, placed) = parse_text(&std::fs::read_to_string(f).with_context(|| format!("reading {f}"))?)
+    let placed = parse_text(&std::fs::read_to_string(f).with_context(|| format!("reading {f}"))?, config.one_hand)
       .with_context(|| format!("parsing {f}"))?;
-    let problem = Problem::new(&t, &g, &base, &config.symbols)?;
+    let problem = Problem::new(&t, &g, &placed.base, &config.symbols)?;
     let st = problem.state_of(&placed)?;
     println!("[{f}]");
-    print!("{}", problem.to_text(&base, &st));
+    print!("{}", problem.to_text(&placed.base, &st));
     let broken = problem.broken_pairs(&st);
     if !broken.is_empty() { println!("note: pairs not placed by the pair rules: {}", broken.join(" ")); }
     problem.print_report(&st);
@@ -898,7 +1088,7 @@ mod tests {
     let t2 = Tables::new(&c2);
     assert!((Problem::new(&t2, &g, &base, &c2.symbols).unwrap().tap_cost - 0.8).abs() < 1e-6);
     // 베이스 빈칸 3칸 + 심볼 레이어 30칸
-    assert_eq!(p.slots.iter().filter(|s| !s.tap).map(|s| s.pos).collect::<Vec<_>>(), vec![4, 14, 24]);
+    assert_eq!(p.slots.iter().filter(|s| !s.layer.on_symbol_layer()).map(|s| s.pos).collect::<Vec<_>>(), vec![4, 14, 24]);
     let mut st = p.random_state(&mut fastrand::Rng::with_seed(1));
     let paren = keycorpus::sym_index('(').unwrap();
     // '('를 심볼 레이어 14번 칸(왼손 가운데 열 홈)에, 그다음 베이스의 같은 자리 빈칸에
@@ -909,7 +1099,7 @@ mod tests {
     move_to(&mut st, 14);
     let on_layer = p.uni(&st, paren);
     move_to(&mut st, (N + 1) as u8);
-    assert_eq!((st.pos[FIRST_SYM as usize + paren], st.tap[FIRST_SYM as usize + paren]), (14, false));
+    assert_eq!((st.pos[FIRST_SYM as usize + paren], st.layer[FIRST_SYM as usize + paren].on_symbol_layer()), (14, false));
     let on_base = p.uni(&st, paren);
     assert!((on_base - on_layer - g.uni[(FIRST_SYM as usize) + paren] * (p.base_extra - p.tap_cost)).abs() < 1e-9);
   }
@@ -933,17 +1123,18 @@ mod tests {
     let mut seen_mixed = false;
     for seed in 0..40 {
       let st = p.random_state(&mut fastrand::Rng::with_seed(seed));
-      let taps = (0..ids.len()).filter(|&i| st.tap[ids[i] as usize] && (i == 0 || !st.tap[ids[i - 1] as usize])).count();
+      let tap = |k: u8| st.layer[k as usize].thumb() != 0;
+      let taps = (0..ids.len()).filter(|&i| tap(ids[i]) && (i == 0 || !tap(ids[i - 1]))).count();
       assert!((p.layer_taps(&st) - taps as f64 * per).abs() < 1e-9, "seed {seed}");
       assert!((p.breakdown(&st).taps - p.layer_taps(&st) * p.tap_cost).abs() < 1e-9);
       // 이어 치면 보통 바이그램에서 탭 하나를 되돌려 받고, 엄지가 새로 끼면 탭 너머 쌍
       for &(x, y, _) in &g.bi {
         let i = st.pos[x as usize] as usize * N + st.pos[y as usize] as usize;
-        let want = match (st.tap[x as usize], st.tap[y as usize]) { (true, true) => t.bg[i] - p.tap_cost, (false, true) => t.x[i], _ => t.bg[i] };
+        let want = match (tap(x), tap(y)) { (true, true) => t.bg[i] - p.tap_cost, (false, true) => t.x[i], _ => t.bg[i] };
         assert!((p.bi(&st, x, y) - want).abs() < 1e-12);
       }
       // 기호 하나는 베이스, 이웃은 심볼 레이어인 경우도 거침
-      seen_mixed |= ids.windows(2).any(|w| is_sym(w[0]) && is_sym(w[1]) && st.tap[w[0] as usize] != st.tap[w[1] as usize]);
+      seen_mixed |= ids.windows(2).any(|w| is_sym(w[0]) && is_sym(w[1]) && tap(w[0]) != tap(w[1]));
       assert!((p.breakdown(&st).total() - p.total(&st)).abs() < 1e-9);
     }
     assert!(seen_mixed);
@@ -958,7 +1149,7 @@ mod tests {
     let mirror = |a: u8, b: u8| { let ((ra, ca), (rb, cb)) = (rc(a), rc(b)); ra == rb && ca + cb == COLS - 1 };
     let distinct = |v: &[(u8, u8)]| { let mut s = v.to_vec(); s.sort_unstable(); s.dedup(); s.len() == v.len() };
     // 순서 있는 짝: 한 손 같은 줄 (5칸에서 2칸: 10가지 × 2손 × 3줄) + 좌우 대칭 (5가지 × 3줄). 첫 글자가 왼쪽·왼손
-    let ordered = placements(true);
+    let ordered = placements(true, false);
     assert!(distinct(&ordered) && ordered.len() == 60 + 15);
     for &(a, b) in &ordered { assert!((same_row(a, b) || mirror(a, b)) && rc(a).1 < rc(b).1, "{a} {b}"); }
     // 떨어진 자리도 됨 (같은 줄 새끼-가운데 열). 양손 가운데 열끼리는 좌우 대칭
@@ -966,7 +1157,7 @@ mod tests {
     // 위아래(같은 열)와 거꾸로(오른쪽·오른손이 먼저)는 안 됨
     for p in [(at(0, 1), at(2, 1)), (at(1, 2), at(2, 2)), (at(0, 4), at(0, 0)), (at(1, 6), at(1, 3))] { assert!(!ordered.contains(&p), "{p:?}"); }
     // 순서 없는 짝: 위 자리 두 방향 + 한 손 같은 열 (3줄에서 2줄: 3가지 × 10열) 두 방향
-    let loose = placements(false);
+    let loose = placements(false, false);
     assert!(distinct(&loose) && loose.len() == 2 * (60 + 30 + 15));
     for &(a, b) in &loose { assert!(same_row(a, b) || same_col(a, b) || mirror(a, b), "{a} {b}"); }
     assert!(ordered.iter().all(|&(a, b)| loose.contains(&(a, b)) && loose.contains(&(b, a))));
@@ -1074,7 +1265,7 @@ mod tests {
  c t h e ~   x ␣ s n r
  w g j a ·   z i v m y
 "#;
-    let (_, placed) = parse_text(text).unwrap();
+    let placed = parse_text(text, false).unwrap();
     let st = p.state_of(&placed).unwrap();
     assert_eq!(p.violations(&st), 2);
     // 저장된 결과가 이러면 다음 symbols의 출발점으로 쓰지 않음
@@ -1105,7 +1296,7 @@ mod tests {
     assert!(p.broken_pairs(&st).is_empty());
     // 베이스 빈칸에는 코퍼스에서 가장 드문 기호만. 심볼 레이어가 2칸 모자라므로 2개 이상이고, 심볼 레이어에 남는 칸이
     // 어떤 기호에도 나쁜 자리(예: 스페이스와 같은 손가락)면 그 칸을 비우고 3개를 둘 수도 있음
-    let on_base: Vec<usize> = (0..NSYM).filter(|&i| !p.slots[st.slot_of[i] as usize].tap).collect();
+    let on_base: Vec<usize> = (0..NSYM).filter(|&i| !p.slots[st.slot_of[i] as usize].layer.on_symbol_layer()).collect();
     assert!((2..=3).contains(&on_base.len()), "{on_base:?}");
     let freq = |i: usize| g.uni[FIRST_SYM as usize + i];
     let mut sorted: Vec<f64> = (0..NSYM).map(freq).collect();
@@ -1124,15 +1315,245 @@ mod tests {
     let p = Problem::new(&t, &g, &base, &c.symbols).unwrap();
     let st = p.random_state(&mut fastrand::Rng::with_seed(3));
     let text = p.to_text(&base, &st);
-    let (b2, placed) = parse_text(&text).unwrap();
-    assert_eq!(b2.slots, base.slots);
+    let placed = parse_text(&text, false).unwrap();
+    assert_eq!(placed.base.slots, base.slots);
     let st2 = p.state_of(&placed).unwrap();
     assert!((p.total(&st2) - p.total(&st)).abs() < 1e-9);
     assert_eq!(p.to_text(&base, &st2), text);
     // 기호가 빠지거나 두 번 나오면 거부
     let dup = text.replacen(EMPTY_TOKEN, "(", 1);
-    assert!(parse_text(&dup).is_err());
+    assert!(parse_text(&dup, false).is_err());
     let lines: Vec<&str> = text.lines().collect();
-    assert!(parse_text(&lines[..4].join("\n")).is_err());
+    assert!(parse_text(&lines[..4].join("\n"), false).is_err());
+  }
+
+  // ---- 한손 ----
+
+  fn one_hand_config() -> Config { Config { one_hand: true, ..config() } }
+
+  // 한손 글자 1등 (엄지층 노력값 ×3). 화면 형식: 왼쪽 5칸 기본층, 오른쪽 5칸 글자 엄지층 (둘 다 새끼 → 가운데 열)
+  const BASE1: &str = " p r i o z   v m u b .\n t s _ n j   g l d a .\n c f h e q   k w x y .\n";
+
+  fn one_hand_base() -> Layout { Layout::parse(BASE1).unwrap().flip_layer() }
+
+  // 한 줄로 이어지는 코드 (숫자·줄바꿈·연속 공백·같은 글자 연속 없음, 글자로 시작): n-gram이 글자 사이의 모든 쌍·세 짝
+  const CHAIN: &str = "fn ok(&self, a: &str) -> Result<(), E> { let v: Vec<_> = it.map(|x| x * y).count(); if a != b && c == d || !e { x += y[i] - z / w; } \
+    use std::io::{self, Read}; let s = 'c'; let t = \"it's\"; x ^= y % z; @ ~ $ ` # ? ;; :: -> => }";
+
+  #[test]
+  fn one_hand_slots_hold_32_symbols_and_the_shift_key() {
+    let c = one_hand_config();
+    let (t, g) = (Tables::new(&c), ngrams());
+    let base = one_hand_base();
+    let p = Problem::new(&t, &g, &base, &c.symbols).unwrap();
+    // S1 15칸(② 포함) + S2 15칸 + 글자층 빈칸 3칸(이 배열은 엄지층 가운데 열) = 기호 32개 + ②
+    let count = |l: Layer| p.slots.iter().filter(|s| s.layer == l).count();
+    assert_eq!((count(Layer::Sym1), count(Layer::Sym2), count(Layer::Thumb), count(Layer::Base)), (15, 15, 3, 0));
+    assert_eq!(p.shift, Some(NSYM));
+    // 엄지층·심볼층 키는 노력값 3배, 탭은 노력값 표의 가장 작은 값
+    assert!((t.eff[COLS + 6] - 3.0 * t.eff[COLS + 3]).abs() < 1e-9 && p.tap_cost == 1.0);
+    // 두 층의 같은 물리 키는 비용 표의 같은 자리 (S1 검지 홈 = 칸 13, S2 검지 홈 = 칸 16)
+    assert_eq!((p.slots[13].pos, p.slots[16].pos), (16, 16));
+    let mut rng = fastrand::Rng::with_seed(5);
+    let mut st = p.random_state(&mut rng);
+    let mut w = p.work();
+    let mut cur = p.total(&st);
+    let mut shift_moved = 0;
+    for _ in 0..4000 {
+      let Some(mv) = p.random_move(&st, &mut rng) else { continue };
+      let (d, old) = p.apply(&mut st, &mv, &mut w);
+      let full = p.total(&st);
+      assert!((cur + d - full).abs() < 1e-7, "{cur} + {d} != {full}");
+      if mv.iter().any(|&(i, _)| i == NSYM) { shift_moved += 1; }
+      if rng.bool() { cur = full; } else { p.undo(&mut st, &old); }
+      // ②는 언제나 S1에
+      assert_eq!(p.slots[st.slot_of[NSYM] as usize].layer, Layer::Sym1);
+      assert!((p.breakdown(&st).total() - p.total(&st)).abs() < 1e-7);
+    }
+    assert!(shift_moved > 50, "{shift_moved}");
+  }
+
+  // 글을 한 키씩 실제로 쳐 보며 비용을 셈: 엄지 탭(같은 엄지 키 층이 이어지면 누른 채로), S2 앞의 ②(누른 채로 이어 치되
+  // ② 손가락 자리는 다시 누름), 손가락 누름끼리의 쌍(엄지 탭이 끼면 탭 너머 쌍)과 세 누름(엄지 탭이 끼면 뺌)
+  // 코퍼스는 같은 키가 이어지는 세 글자(::처럼)를 트라이그램으로 세지 않으므로, 그런 세 글자에 걸친 세 누름은 같이 뺌
+  fn simulate(p: &Problem, st: &State, keys: &[u8]) -> f64 {
+    let t = p.t;
+    let f = |k: u8| t.fingers[st.pos[k as usize] as usize];
+    let mut cost = 0.0;
+    // (자리, 이 누름 앞에 엄지 탭이 있었는지, 어느 키의 누름인지, ②인지)
+    let mut presses: Vec<(usize, bool, usize, bool)> = Vec::new();
+    for (i, &k) in keys.iter().enumerate() {
+      let (l, prev) = (st.layer[k as usize], i.checked_sub(1).map(|j| keys[j]));
+      let tap = l.thumb() != 0 && prev.is_none_or(|a| st.layer[a as usize].thumb() != l.thumb());
+      if tap { cost += p.tap_cost; }
+      let held_shift = prev.is_some_and(|a| st.layer[a as usize] == Layer::Sym2 && f(a) != st.shift_finger && f(k) != st.shift_finger);
+      let mut tap_before = tap;
+      if l == Layer::Sym2 && !held_shift {
+        cost += t.eff[st.shift_pos as usize];
+        presses.push((st.shift_pos as usize, tap_before, i, true));
+        tap_before = false;
+      }
+      cost += t.eff[st.pos[k as usize] as usize];
+      if k >= FIRST_SYM && !l.on_symbol_layer() { cost += p.base_extra; }
+      presses.push((st.pos[k as usize] as usize, tap_before, i, false));
+    }
+    for w in presses.windows(2) {
+      let i = w[0].0 * N + w[1].0;
+      cost += if w[1].1 { t.x[i] } else { t.bg[i] };
+    }
+    for w in presses.windows(3) {
+      if w[1].1 || w[2].1 { continue; }
+      // 가운데가 ②면 a ② b (바이그램 a b의 몫), 아니면 가운데 키 b를 둘러싼 세 글자의 몫
+      if !w[1].3 {
+        let i = w[1].2;
+        if i == 0 || keys[i - 1] == keys[i] || keys.get(i + 1) == Some(&keys[i]) { continue; }
+      }
+      cost += t.tg[(w[0].0 * N + w[1].0) * N + w[2].0];
+    }
+    cost
+  }
+
+  #[test]
+  fn one_hand_costs_match_typing_the_text_key_by_key() {
+    let mut code = keycorpus::KeyCorpus::new();
+    keycorpus::count_text(CHAIN.as_bytes(), &mut code);
+    let g = Ngrams::new(&code.into_stats(), 1.0, 1.0);
+    let keys: Vec<u8> = CHAIN.chars().map(|ch| keycorpus::char_key(ch).unwrap()).collect();
+    assert!(keys.windows(2).all(|w| w[0] != w[1] || is_sym(w[0])), "no doubled letters");
+    // 코퍼스는 대문자도 글자로 셈
+    let per = 100.0 / CHAIN.chars().filter(char::is_ascii_alphabetic).count() as f64;
+    for (c, base) in [(one_hand_config(), one_hand_base()), (config(), Layout::parse(BASE).unwrap())] {
+      let t = Tables::new(&c);
+      let p = Problem::new(&t, &g, &base, &c.symbols).unwrap();
+      let mut rng = fastrand::Rng::with_seed(9);
+      let (mut held_s2, mut shift_finger_s2) = (false, false);
+      let first = p.random_state(&mut rng);
+      for _ in 0..60 {
+        let st = p.random_state(&mut rng);
+        // 글자만의 비용은 어느 배치에서나 같으므로 두 배치의 차이를 비교
+        let want = (simulate(&p, &st, &keys) - simulate(&p, &first, &keys)) * per;
+        let got = p.total(&st) - p.total(&first);
+        assert!((want - got).abs() < 1e-7, "one_hand {}: {want} vs {got}", t.one_hand);
+        if t.one_hand {
+          let f = |k: u8| t.fingers[st.pos[k as usize] as usize];
+          held_s2 |= keys.windows(2).any(|w| st.layer[w[0] as usize] == Layer::Sym2 && st.layer[w[1] as usize] == Layer::Sym2 && f(w[0]) != st.shift_finger && f(w[1]) != st.shift_finger);
+          shift_finger_s2 |= keys.iter().any(|&k| st.layer[k as usize] == Layer::Sym2 && f(k) == st.shift_finger);
+        }
+      }
+      // 한손: ②를 누른 채로 이어 친 S2 기호와, ② 손가락 자리의 S2 기호를 모두 거침
+      if t.one_hand { assert!(held_s2 && shift_finger_s2, "{held_s2} {shift_finger_s2}"); }
+    }
+  }
+
+  #[test]
+  fn one_hand_taps_hold_and_the_shift_key() {
+    let c = one_hand_config();
+    let t = Tables::new(&c);
+    let g = ngrams();
+    let base = one_hand_base();
+    let p = Problem::new(&t, &g, &base, &c.symbols).unwrap();
+    let mut st = p.random_state(&mut fastrand::Rng::with_seed(2));
+    let key = |ch: char| keycorpus::char_key(ch).unwrap();
+    let item = |ch: char| keycorpus::sym_index(ch).unwrap();
+    // 기호를 칸 번호(심볼층 칸)에 두기
+    let put = |st: &mut State, it: usize, slot: u8| {
+      let other = st.item_at[slot as usize] as usize;
+      if other != it { let mv = vec![(it, slot), (other, st.slot_of[it])]; p.apply(st, &mv, &mut p.work()); }
+    };
+    // ②는 S1 새끼 홈(칸 10), ( 와 ) 는 S1 중지·검지 홈, ~ 는 S2 약지 홈(칸 18), ^ 는 S2 새끼 윗줄(칸 9, ②와 같은 손가락)
+    put(&mut st, NSYM, 10);
+    put(&mut st, item('('), 12);
+    put(&mut st, item(')'), 13);
+    put(&mut st, item('~'), 18);
+    put(&mut st, item('^'), 9);
+    let (o, cl, ti, ca) = (key('('), key(')'), key('~'), key('^'));
+    let (t_, a_) = (key('t'), key('a'));
+    // 기본층 글자 → S1: 엄지 탭 (탭 너머 쌍). S1 → S1: 누른 채로
+    assert!(Problem::tapped(&st, t_, o) && Problem::held(&st, o, cl));
+    // S1 → S2: S를 누른 채로 ②를 누름 (탭 없음). S2 → S2 (② 손가락이 아님): ②를 누른 채로
+    assert!(Problem::held(&st, o, ti) && p.shifted(&st, o, ti) && !p.shifted(&st, ti, ti));
+    // ② 손가락(새끼) 자리의 S2 기호는 ②를 다시 누르고, 그 기호 다음 S2 기호도 ②를 다시 누름
+    assert!(p.shifted(&st, ti, ca) && p.shifted(&st, ca, ti));
+    // 글자 엄지층 글자(a) → S1: S 탭. S1 → 글자 엄지층 글자: L 탭. 기호 → 기본층 글자: 바로
+    assert!(Problem::tapped(&st, a_, o) && Problem::tapped(&st, o, a_) && !Problem::tapped(&st, o, t_) && !Problem::held(&st, o, t_));
+    // ② 앞뒤 쌍: S1 ( → ② → ~ 는 ( → ② 쌍과 ( ② ~ 세 누름, ② → ~ 는 uni에 들어 있음
+    let (po, pt, sp) = (st.pos[o as usize] as usize, st.pos[ti as usize] as usize, st.shift_pos as usize);
+    let want = t.bg[po * N + sp] - p.tap_cost + t.tg[(po * N + sp) * N + pt];
+    assert!((p.bi(&st, o, ti) - want).abs() < 1e-12);
+    // ~ → ~ 는 ②를 누른 채로: uni의 ② 누름을 되돌림
+    let want = t.bg[pt * N + pt] - p.tap_cost - t.eff[sp] - t.bg[sp * N + pt];
+    assert!((p.bi(&st, ti, ti) - want).abs() < 1e-12);
+  }
+
+  #[test]
+  fn one_hand_pairs_read_left_to_right_on_screen() {
+    let at = |r: usize, c: usize| (r * COLS + c) as u8;
+    let ordered = placements(true, true);
+    // S1(0~4열): 왼쪽(새끼 쪽)이 먼저. S2(5~9열 거울): 화면 왼쪽 = 큰 열이 먼저 (칸 18 = 화면 S2 약지, 17 = 중지)
+    assert!(ordered.contains(&(at(1, 1), at(1, 2))) && !ordered.contains(&(at(1, 2), at(1, 1))));
+    assert!(ordered.contains(&(at(1, 8), at(1, 7))) && !ordered.contains(&(at(1, 7), at(1, 8))));
+    // 두 층의 같은 키: 첫 글자가 S1
+    assert!(ordered.contains(&(at(2, 3), at(2, 6))) && !ordered.contains(&(at(2, 6), at(2, 3))));
+    assert_eq!(ordered.len(), placements(true, false).len());
+    // 화면에서 같은 모양이면 S1이든 S2든 같은 두 열로 봄
+    assert_eq!(pair_shape(at(1, 1) as usize, at(1, 2) as usize).map(|s| s.group()), Some(0));
+    assert_eq!(shape_violations(&[(at(1, 1) as usize, at(1, 2) as usize), (at(0, 8) as usize, at(0, 7) as usize)]), [0, 0, 0]);
+  }
+
+  #[test]
+  fn one_hand_text_roundtrip() {
+    let c = one_hand_config();
+    let (t, g) = (Tables::new(&c), ngrams());
+    let base = one_hand_base();
+    let p = Problem::new(&t, &g, &base, &c.symbols).unwrap();
+    let st = p.random_state(&mut fastrand::Rng::with_seed(4));
+    let text = p.to_text(&base, &st);
+    assert_eq!(text.lines().skip(1).take(3).map(|l| l.matches(SHIFT_TOKEN).count()).sum::<usize>(), 1);
+    // 글자층은 화면 형식 그대로 (오른쪽 5칸은 손가락 순서)
+    let letters: Vec<&str> = text.lines().skip(5).collect();
+    assert!(letters[0].starts_with(" p r i o z   v m u b") && letters[1].starts_with(" t s ␣ n j   g l d a"), "{text}");
+    let placed = parse_text(&text, true).unwrap();
+    assert_eq!(placed.base.slots, base.slots);
+    let st2 = p.state_of(&placed).unwrap();
+    assert!((p.total(&st2) - p.total(&st)).abs() < 1e-9);
+    assert_eq!(p.to_text(&base, &st2), text);
+    // ②가 없거나, 둘이거나, S2에 있으면 거부
+    assert!(parse_text(&text.replace(SHIFT_TOKEN, &EMPTY_TOKEN.to_string()), true).is_err());
+    let lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let row = (1..4).find(|&r| lines[r].contains(SHIFT_TOKEN)).unwrap();
+    let mut cells: Vec<String> = lines[row].split_whitespace().map(str::to_string).collect();
+    let k = cells.iter().position(|x| x == &SHIFT_TOKEN.to_string()).unwrap();
+    let (j, _) = cells.iter().enumerate().skip(5).find(|(_, x)| keycorpus::sym_index(x.chars().next().unwrap()).is_some()).unwrap();
+    cells.swap(k, j);
+    let mut moved = lines.clone();
+    moved[row] = format!(" {}   {}", cells[..5].join(" "), cells[5..].join(" "));
+    let err = parse_text(&moved.join("\n"), true).err().expect("② on S2 is refused").to_string();
+    assert!(err.contains("must be on S1"), "{err}");
+  }
+
+  #[test]
+  fn one_hand_search_keeps_pairs_and_the_shift_key_on_s1() {
+    fastrand::seed(13);
+    let mut c = one_hand_config();
+    c.sa.starts_per_batch = 4;
+    c.sa.stop_after_hits = 1;
+    c.sa.max_starts = 4;
+    let (t, g) = (Tables::new(&c), ngrams());
+    let base = one_hand_base();
+    let p = Problem::new(&t, &g, &base, &c.symbols).unwrap();
+    let (cost, st, _, starts) = p.search(&c.sa, 200_000, None);
+    assert_eq!(starts, 4);
+    assert!((cost - p.total(&st)).abs() < 1e-9);
+    assert!(p.broken_pairs(&st).is_empty(), "{:?}", p.broken_pairs(&st));
+    assert_eq!(p.slots[st.slot_of[NSYM] as usize].layer, Layer::Sym1);
+    // 글자층 빈칸 3칸에는 모두 기호가 들어가고, 드문 기호만
+    let on_letters: Vec<usize> = (0..NSYM).filter(|&i| !p.slots[st.slot_of[i] as usize].layer.on_symbol_layer()).collect();
+    assert_eq!(on_letters.len(), 3);
+    let freq = |i: usize| g.uni[FIRST_SYM as usize + i];
+    let mut sorted: Vec<f64> = (0..NSYM).map(freq).collect();
+    sorted.sort_by(f64::total_cmp);
+    assert!(on_letters.iter().all(|&i| freq(i) <= sorted[NSYM / 3]), "{on_letters:?}");
+    let (again, _) = p.polish(st.clone(), &mut p.work());
+    assert!((again - cost).abs() < 1e-9);
   }
 }

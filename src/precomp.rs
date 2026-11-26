@@ -79,6 +79,7 @@ pub enum Window {
 }
 
 // 손가락 번호 (왼손 검지 1 … 새끼 4, 오른손 검지 5 … 새끼 8). 가운데 열은 검지
+#[cfg(test)]
 pub fn finger(p: usize) -> u8 { FINGER_GRID[p / COLS][p % COLS] }
 #[cfg(test)]
 fn is_left(p: usize) -> bool { p % COLS < COLS / 2 }

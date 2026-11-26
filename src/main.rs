@@ -306,10 +306,6 @@ fn cmd_run(result_path: &Path, config: &Config, reset: bool) -> anyhow::Result<(
     println!("[Run] stopped before the symbol layer; run `symbols 1` to make it");
     return Ok(());
   }
-  if config.one_hand {
-    println!("[Run] one_hand: no symbol layer yet");
-    return Ok(());
-  }
   println!();
   cmd_symbols(result_path, config, &[])
 }
@@ -317,7 +313,6 @@ fn cmd_run(result_path: &Path, config: &Config, reset: bool) -> anyhow::Result<(
 // 심볼 레이어 최적화: 저장된 결과 N번(기본 1, results와 같은 순서) 또는 배열 파일을 베이스로
 fn cmd_symbols(result_path: &Path, config: &Config, args: &[String]) -> anyhow::Result<()> {
   // 모르는 옵션은 그냥 넘기지 않음 (없앤 --flip을 주면 뒤집히지 않은 베이스로 돌게 되므로). --reset은 모든 명령이 받음
-  two_hands_only(config, "symbols")?;
   if let Some(o) = args.iter().find(|a| a.starts_with("--") && *a != "--reset") { anyhow::bail!("unknown option {o} for symbols"); }
   let target = args.iter().find(|a| !a.starts_with("--")).map_or("1", String::as_str);
   let (base, label, what) = if let Ok(n) = target.parse::<usize>() {
@@ -328,7 +323,7 @@ fn cmd_symbols(result_path: &Path, config: &Config, args: &[String]) -> anyhow::
     (results[n - 1], n.to_string(), format!("saved result #{n} of {}", result_file.display()))
   } else {
     let stem = Path::new(target).file_stem().map_or_else(|| "layout".to_string(), |s| s.to_string_lossy().into_owned());
-    (read_layout(target, false)?, stem, target.to_string())
+    (read_layout(target, config.one_hand)?, stem, target.to_string())
   };
   anyhow::ensure!(base.key_count() == 27, "the base layout must hold a-z and the space key (_)");
   println!("[Symbols] base: {what}");
@@ -370,7 +365,7 @@ fn main() -> anyhow::Result<()> {
     Some("sensitivity") => cmd_sensitivity(result_path, &config, &args[3..].iter().filter(|a| *a != "--reset").cloned().collect::<Vec<_>>()),
     Some("analyze-code") => code::build_corpus(result_path, &config).map(|_| ()),
     Some("symbols") => cmd_symbols(result_path, &config, &args[3..]),
-    Some("symbols-score") => two_hands_only(&config, "symbols-score").and_then(|()| symbols::score_files(result_path, &config, &args[3..])),
+    Some("symbols-score") => symbols::score_files(result_path, &config, &args[3..]),
     _ => {
       eprintln!("Usage: {} <result_path> {USAGE}", args[0]);
       std::process::exit(1);
