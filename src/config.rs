@@ -146,6 +146,7 @@ fn default_trigram_coverage() -> f64 { 0.97 }
 fn default_sample() -> f64 { 1.0 }
 fn default_true() -> bool { true }
 fn default_min_home_diff() -> u32 { 1 }
+fn default_layer_effort() -> f32 { 3.0 }
 
 #[derive(Deserialize, Clone)]
 pub struct Config {
@@ -204,6 +205,14 @@ pub struct Config {
   // 0(기본) = 제약 없음. 3~6 (센터는 6칸, 키 27개(a-z와 스페이스) 중 나머지가 바깥 24칸에 다 들어가야 하므로 3 이상)
   #[serde(default)]
   pub center_rare: usize,
+  // 한손 키보드 (왼손 3×5 + 엄지 원샷 레이어 키): 27키를 기본층 15칸과 엄지층 15칸에 둠. 손 비율 규칙은 쓰지 않고,
+  // 결과는 result_file 이름에 -one-hand를 붙인 파일에 따로 저장 (result_file_name). 심볼 레이어는 아직 없음. 기본 false
+  #[serde(default)]
+  pub one_hand: bool,
+  // 한손: 엄지층 키의 노력값 배율 (같은 자리 기본층 노력값 × 이 값). 누름 노력값과 SFB·시저스·롤·리다이렉트 크기에 모두 씀.
+  // 엄지 탭(노력값 표의 가장 작은 값)은 따로 그대로. 기본 3
+  #[serde(default = "default_layer_effort")]
+  pub one_hand_layer_effort: f32,
   // 예전 설정의 space_key는 없어짐: 스페이스는 항상 배열의 한 칸(27번째 키). 설정에 남아 있어도 무시됨
   pub weights: Weights,
   // 예전 설정의 score_normalization, [rates]는 더 이상 쓰지 않으며 남아 있어도 무시됨
@@ -328,6 +337,18 @@ fn url_file_name(url: &str) -> Option<&str> {
 impl Config {
   pub fn hand_hard_limit(&self) -> f32 { self.hand_hard_limit.unwrap_or(self.min_hand_usage) }
 
+  // 결과 파일 이름 (result_path 기준): 한손이면 확장자 앞에 -one-hand를 붙여 두 손 결과와 섞이지 않게
+  // (result.bin → result-one-hand.bin)
+  pub fn result_file_name(&self) -> String {
+    let f = &self.result_file;
+    if !self.one_hand { return f.clone(); }
+    let name_start = f.rfind('/').map_or(0, |i| i + 1);
+    match f.rfind('.').filter(|&i| i > name_start) {
+      Some(i) => format!("{}-one-hand{}", &f[..i], &f[i..]),
+      None => format!("{f}-one-hand"),
+    }
+  }
+
   // 비어 있지 않은 덤프 주소들 (적은 순서대로)
   pub fn dump_urls(&self) -> Vec<String> {
     let all = match &self.wikipedia_dump_url {
@@ -405,6 +426,9 @@ impl Config {
     if sa.starts_per_batch == 0 || sa.stop_after_hits == 0 { anyhow::bail!("sa.starts_per_batch and sa.stop_after_hits must be > 0"); }
     if sa.max_starts < sa.starts_per_batch { anyhow::bail!("sa.max_starts must be >= sa.starts_per_batch"); }
     if !(0.0..=1.0).contains(&self.code_share) { anyhow::bail!("code_share must be in 0.0..=1.0"); }
+    if !(self.one_hand_layer_effort > 0.0 && self.one_hand_layer_effort.is_finite()) {
+      anyhow::bail!("one_hand_layer_effort must be a positive number");
+    }
     self.code.validate()?;
     self.symbols.validate()
   }
@@ -579,6 +603,36 @@ loose_pairs = ["(\""]"#, "steps = 0", "base_slot_extra = -1.0", r#"pairs = ["(1"
     assert_eq!((c.code_share, c.result_file.as_str()), (0.25, "result.bin"));
     for bad in ["code_share = -0.1", "code_share = 1.5"] { assert!(config(&format!("{url}{bad}")).validate().is_err(), "{bad}"); }
     assert!(config(&format!("{url}code_share = 1.0")).validate().is_ok());
+  }
+
+  #[test]
+  fn one_hand_keeps_its_own_result_file() {
+    let url = "wikipedia_dump_url = \"https://m.org/a.xml.bz2\"\n";
+    // config.toml은 두 손 (one_hand = false)
+    let c = config(url);
+    assert!(!c.one_hand);
+    assert_eq!(c.result_file_name(), "result.bin");
+    let c = config(&format!("{url}one_hand = true"));
+    assert_eq!(c.result_file_name(), "result-one-hand.bin");
+    for (file, want) in [("out/res", "out/res-one-hand"), ("a.b/res", "a.b/res-one-hand"), ("x.y.bin", "x.y-one-hand.bin")] {
+      let c = config(&format!("{url}one_hand = true\nresult_file = \"{file}\""));
+      assert_eq!(c.result_file_name(), want, "{file}");
+    }
+  }
+
+  #[test]
+  fn one_hand_layer_effort_is_a_positive_factor() {
+    let url = "wikipedia_dump_url = \"https://m.org/a.xml.bz2\"\n";
+    // config.toml은 3배, 없어도 3배
+    assert_eq!(config(url).one_hand_layer_effort, 3.0);
+    let mut table: toml::Table = toml::from_str(&std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/config.toml")).unwrap()).unwrap();
+    table.remove("one_hand_layer_effort");
+    let c: Config = toml::Value::Table(table).try_into().unwrap();
+    assert_eq!(c.one_hand_layer_effort, 3.0);
+    for bad in ["0.0", "-1.0", "nan"] {
+      assert!(config(&format!("{url}one_hand_layer_effort = {bad}")).validate().is_err(), "{bad}");
+    }
+    assert!(config(&format!("{url}one_hand_layer_effort = 1.0")).validate().is_ok());
   }
 
   #[test]

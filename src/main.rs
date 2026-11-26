@@ -127,9 +127,9 @@ impl Scoring {
 // 저장된 결과 (결과 파일이 없으면 빈 목록). 채점 기준이 있으면 그 코퍼스와 키 구성이 같은 것만 지금 설정으로 다시 채점해서
 // 정렬 (results 명령의 순서)
 fn saved_results(result_path: &Path, config: &Config, scoring: Option<&Scoring>) -> anyhow::Result<Vec<Layout>> {
-  let file = result_path.join(&config.result_file);
+  let file = result_path.join(config.result_file_name());
   if !file.exists() { return Ok(Vec::new()); }
-  let mut results = load_results(file.to_str().context("Invalid result file path")?)?;
+  let mut results = load_results(file.to_str().context("Invalid result file path")?, config.one_hand)?;
   if let Some(s) = scoring {
     results.retain(|l| l.key_count() == s.arrays.keys.len());
     for l in &mut results { s.score(l); }
@@ -140,29 +140,44 @@ fn saved_results(result_path: &Path, config: &Config, scoring: Option<&Scoring>)
 
 // 결과 파일이 없을 때의 안내
 fn no_results(result_path: &Path, config: &Config) -> String {
-  format!("no results at {}: run optimize first", result_path.join(&config.result_file).display())
+  format!("no results at {}: run optimize first", result_path.join(config.result_file_name()).display())
 }
 
-// 배열 파일 읽기: 행마다 10칸씩 3행 (스페이스 키는 '_', 빈칸은 '.')
-fn read_layout(file: &str) -> anyhow::Result<Layout> {
-  Layout::parse(&fs::read_to_string(file).with_context(|| format!("reading {file}"))?).with_context(|| format!("parsing {file}"))
+// 배열 파일 읽기: 행마다 10칸씩 3행 (스페이스 키는 '_', 빈칸은 '.'). 한손이면 오른쪽 5칸은 엄지층을 손가락 순서(새끼 → 가운데 열)로
+// 적은 것 (results 출력과 같은 형식)
+fn read_layout(file: &str, one_hand: bool) -> anyhow::Result<Layout> {
+  let l = Layout::parse(&fs::read_to_string(file).with_context(|| format!("reading {file}"))?).with_context(|| format!("parsing {file}"))?;
+  Ok(if one_hand { l.flip_layer() } else { l })
+}
+
+// 한손 배열을 출력하기 전에 한 번: 열의 뜻
+fn print_one_hand_note(config: &Config) {
+  if config.one_hand {
+    println!("[One-hand] left 5 columns: base layer, right 5 columns: thumb layer (one-shot), both from pinky to the center column");
+  }
+}
+
+// 한손 배열에는 아직 없는 명령
+fn two_hands_only(config: &Config, cmd: &str) -> anyhow::Result<()> {
+  anyhow::ensure!(!config.one_hand, "{cmd} is not available for one_hand layouts yet (set one_hand = false in config.toml)");
+  Ok(())
 }
 
 // 채점할 배열 파일들: 키 구성이 코퍼스와 같아야 함. center_rare를 어기면 알리기만 함
 fn layout_files(files: &[String], s: &Scoring, config: &Config, tag: &str) -> anyhow::Result<Vec<(String, Layout)>> {
   let center_mask = s.arrays.rare_mask(config.center_rare);
   files.iter().map(|f| {
-    let l = read_layout(f)?;
+    let l = read_layout(f, config.one_hand)?;
     anyhow::ensure!(l.key_count() == s.arrays.keys.len(), "{f} has {} letters, the corpus has {}", l.key_count(), s.arrays.keys.len());
     if !l.center_ok(center_mask) { println!("[{tag}] note: {f} does not follow center_rare ({} letters)", config.center_rare); }
     Ok((f.clone(), l))
   }).collect()
 }
 
-fn print_results(results: &[Layout], scoring: Option<&Scoring>) {
+fn print_results(results: &[Layout], scoring: Option<&Scoring>, one_hand: bool) {
   for (i, l) in results.iter().enumerate() {
     println!("[{}]", i + 1);
-    l.print();
+    l.print(one_hand);
     if let Some(s) = scoring { s.print_goodness(l); }
     println!();
   }
@@ -186,14 +201,15 @@ fn cmd_analyze(result_path: &Path, config: &Config, reset: bool) -> anyhow::Resu
 }
 
 fn cmd_results(result_path: &Path, config: &Config) -> anyhow::Result<()> {
-  let result_file = result_path.join(&config.result_file);
+  let result_file = result_path.join(config.result_file_name());
   if !result_file.exists() {
     eprintln!("{}", no_results(result_path, config));
     std::process::exit(1);
   }
   println!("[Results] {}", result_file.display());
+  print_one_hand_note(config);
   let scoring = Scoring::load_if_present(result_path, config)?;
-  print_results(&saved_results(result_path, config, scoring.as_ref())?, scoring.as_ref());
+  print_results(&saved_results(result_path, config, scoring.as_ref())?, scoring.as_ref(), config.one_hand);
   Ok(())
 }
 
@@ -212,9 +228,10 @@ fn cmd_score(result_path: &Path, config: &Config, files: &[String]) -> anyhow::R
     s.score(&mut l);
     entries.push((f, l));
   }
+  print_one_hand_note(config);
   for (name, l) in &entries {
     println!("[{name}]");
-    l.print();
+    l.print(config.one_hand);
     s.print_goodness(l);
     l.print_stats(&full_arrays, &s.precomp, &windows);
     println!();
@@ -224,6 +241,7 @@ fn cmd_score(result_path: &Path, config: &Config, files: &[String]) -> anyhow::R
 
 // 점수 설정값을 하나씩 흔들어 저장된 결과와 배열 파일들의 1등이 바뀌는지 점검 (설정·결과 파일은 바꾸지 않음)
 fn cmd_sensitivity(result_path: &Path, config: &Config, files: &[String]) -> anyhow::Result<()> {
+  two_hands_only(config, "sensitivity")?;
   let s = Scoring::load(result_path, config)?;
   let mut cands: Vec<(String, Layout)> = saved_results(result_path, config, Some(&s))?.into_iter().enumerate()
     .map(|(i, l)| (format!("saved #{}", i + 1), l)).collect();
@@ -236,7 +254,10 @@ fn cmd_sensitivity(result_path: &Path, config: &Config, files: &[String]) -> any
 // english: 위키 영어 코퍼스의 전체 통계 (code_share가 0보다 크면 코드를 섞어서 최적화)
 fn run_optimize(result_path: &Path, config: &Config, english: &CorpusStats, reset: bool) -> anyhow::Result<()> {
   let s = Scoring::new(english, code_letters(result_path, config)?.as_ref(), config);
-  let result_file = result_path.join(&config.result_file);
+  let result_file = result_path.join(config.result_file_name());
+  if config.one_hand {
+    println!("[One-hand] left hand 3x5 with a one-shot thumb layer -> {}", result_file.display());
+  }
   if config.code_share > 0.0 {
     println!("[Corpus] Wikipedia English with {:.0}% Rust code (by letters) -> {}", config.code_share * 100.0, result_file.display());
   }
@@ -247,7 +268,7 @@ fn run_optimize(result_path: &Path, config: &Config, english: &CorpusStats, rese
   }
   let result_file_str = result_file.to_str().context("Invalid result file path")?;
   let base_layouts = if !reset && result_file.exists() {
-    let mut layouts = load_results(result_file_str)?;
+    let mut layouts = load_results(result_file_str, config.one_hand)?;
     // 키 구성이 다른 결과(스페이스 방식이 다를 때)는 시드로 쓰지 않음
     let before = layouts.len();
     layouts.retain(|l| l.key_count() == s.arrays.keys.len());
@@ -265,13 +286,14 @@ fn run_optimize(result_path: &Path, config: &Config, english: &CorpusStats, rese
   } else { vec![] };
   let optimizer = Optimizer::new(s.arrays.clone(), &s.precomp, &s.norm, config.elites, config.min_home_diff, config.sa.clone(), center_mask);
   println!("[Optimize]");
+  print_one_hand_note(config);
   let layouts = optimizer.run(&base_layouts, result_file_str);
   let mut combined = base_layouts;
   combined.extend(layouts);
   let best = sort_unique_layouts(combined, config.elites, &[], config.min_home_diff);
   save_results(&best, result_file_str)?;
   println!("\n[Results]");
-  print_results(&best, Some(&s));
+  print_results(&best, Some(&s), config.one_hand);
   Ok(())
 }
 
@@ -284,6 +306,10 @@ fn cmd_run(result_path: &Path, config: &Config, reset: bool) -> anyhow::Result<(
     println!("[Run] stopped before the symbol layer; run `symbols 1` to make it");
     return Ok(());
   }
+  if config.one_hand {
+    println!("[Run] one_hand: no symbol layer yet");
+    return Ok(());
+  }
   println!();
   cmd_symbols(result_path, config, &[])
 }
@@ -291,17 +317,18 @@ fn cmd_run(result_path: &Path, config: &Config, reset: bool) -> anyhow::Result<(
 // 심볼 레이어 최적화: 저장된 결과 N번(기본 1, results와 같은 순서) 또는 배열 파일을 베이스로
 fn cmd_symbols(result_path: &Path, config: &Config, args: &[String]) -> anyhow::Result<()> {
   // 모르는 옵션은 그냥 넘기지 않음 (없앤 --flip을 주면 뒤집히지 않은 베이스로 돌게 되므로). --reset은 모든 명령이 받음
+  two_hands_only(config, "symbols")?;
   if let Some(o) = args.iter().find(|a| a.starts_with("--") && *a != "--reset") { anyhow::bail!("unknown option {o} for symbols"); }
   let target = args.iter().find(|a| !a.starts_with("--")).map_or("1", String::as_str);
   let (base, label, what) = if let Ok(n) = target.parse::<usize>() {
-    let result_file = result_path.join(&config.result_file);
+    let result_file = result_path.join(config.result_file_name());
     anyhow::ensure!(result_file.exists(), "{}, or pass a layout file", no_results(result_path, config));
     let results = saved_results(result_path, config, Scoring::load_if_present(result_path, config)?.as_ref())?;
     anyhow::ensure!((1..=results.len()).contains(&n), "there are {} saved results; pick 1..={}", results.len(), results.len());
     (results[n - 1], n.to_string(), format!("saved result #{n} of {}", result_file.display()))
   } else {
     let stem = Path::new(target).file_stem().map_or_else(|| "layout".to_string(), |s| s.to_string_lossy().into_owned());
-    (read_layout(target)?, stem, target.to_string())
+    (read_layout(target, false)?, stem, target.to_string())
   };
   anyhow::ensure!(base.key_count() == 27, "the base layout must hold a-z and the space key (_)");
   println!("[Symbols] base: {what}");
@@ -343,7 +370,7 @@ fn main() -> anyhow::Result<()> {
     Some("sensitivity") => cmd_sensitivity(result_path, &config, &args[3..].iter().filter(|a| *a != "--reset").cloned().collect::<Vec<_>>()),
     Some("analyze-code") => code::build_corpus(result_path, &config).map(|_| ()),
     Some("symbols") => cmd_symbols(result_path, &config, &args[3..]),
-    Some("symbols-score") => symbols::score_files(result_path, &config, &args[3..]),
+    Some("symbols-score") => two_hands_only(&config, "symbols-score").and_then(|()| symbols::score_files(result_path, &config, &args[3..])),
     _ => {
       eprintln!("Usage: {} <result_path> {USAGE}", args[0]);
       std::process::exit(1);

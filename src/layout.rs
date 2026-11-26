@@ -142,19 +142,20 @@ impl Layout {
     for (p, &id) in self.slots.iter().enumerate() {
       if id < CHARS as u8 { rows[p / COLS] += corpus.freq[id as usize]; letters += corpus.freq[id as usize]; }
     }
-    let (mut bg, mut sfb, mut roll, mut sciss, mut lsb) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    let (mut bg, mut sfb, mut roll, mut sciss, mut lsb, mut tap) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
     for &(a, b, n) in &corpus.nz_bigrams {
       let (p1, p2) = (self.pos[a as usize], self.pos[b as usize]);
       bg += n;
       if p1 == EMPTY || p2 == EMPTY { continue; }
       let (p1, p2) = (p1 as usize, p2 as usize);
+      // 한손: 엄지 탭이 사이에 낀 쌍은 따로 셈 (SFB·롤·시저스가 아님)
+      if precomp.tapped(p1, p2) { tap += n; continue; }
       let e = precomp.bigram(p1, p2);
       if e.sfb_base > 0.0 { sfb += n; }
       if e.rolling_base > 0.0 { roll += n; }
       if e.scissors_base > 0.0 { sciss += n; }
       // 가운데 열로 뻗기(LSB): 가운데 열 키 + 같은 손 다른 손가락 (scissors에 포함)
-      let same_hand = (p1 % COLS < COLS / 2) == (p2 % COLS < COLS / 2);
-      if same_hand && (is_center_slot(p1) || is_center_slot(p2)) && crate::precomp::finger(p1) != crate::precomp::finger(p2) { lsb += n; }
+      if precomp.same_hand(p1, p2) && (is_center_slot(p1) || is_center_slot(p2)) && precomp.finger_of(p1) != precomp.finger_of(p2) { lsb += n; }
     }
     let (mut tg, mut sfs, mut redirect, mut roll3) = (0u64, 0u64, 0u64, 0u64);
     for &(a, b, c, n) in &corpus.nz_trigrams {
@@ -167,6 +168,14 @@ impl Layout {
       if e.roll_base > 0.0 { roll3 += n; } // 세 글자 롤
     }
     println!("rows: top={:.1}%  home={:.1}%  bottom={:.1}%", pct(rows[0], letters), pct(rows[1], letters), pct(rows[2], letters));
+    if precomp.one_hand {
+      // 엄지층 누름의 비율(스페이스 포함)과 글자(a-z) 100개당 엄지 탭 수, 엄지 탭이 낀 바이그램의 비율
+      let thumb: u64 = (0..ROWS * COLS).filter(|&p| precomp.on_layer(p) && self.slots[p] < CHARS as u8)
+        .map(|p| corpus.freq[self.slots[p] as usize]).sum();
+      let az: u64 = corpus.freq.iter().take(26).sum();
+      println!("layers: base={:.1}%  thumb={:.1}%  thumb taps={:.2} per 100 letters  bigrams across a tap={:.1}%",
+        pct(letters - thumb, letters), pct(thumb, letters), self.thumb_taps(corpus, precomp) * 100.0 / az.max(1) as f64, pct(tap, bg));
+    }
     println!("bigrams: sfb={:.2}%  roll={:.1}%  scissors={:.2}% (lateral stretch {:.2}%)   trigrams: skipgram(other key)={:.2}%  one-hand-roll={:.1}%  redirect={:.2}%",
       pct(sfb, bg), pct(roll, bg), pct(sciss, bg), pct(lsb, bg), pct(sfs, tg), pct(roll3, tg), pct(redirect, tg));
     self.print_window_stats(precomp, windows);
@@ -174,27 +183,34 @@ impl Layout {
 
   // 창 기준 통계: 세 키(공백 포함)를 하나씩 밀며 나눈 분류의 비율. 스킵그램은 다른 분류와 겹쳐서 따로 셈
   fn print_window_stats(&self, precomp: &Precomp, windows: &[(u8, u8, u8, u64)]) {
-    use crate::precomp::{finger, Window};
+    use crate::precomp::Window;
     let at = |id: u8| -> Option<usize> {
       let p = self.pos[id as usize];
       (p != EMPTY).then_some(p as usize)
     };
     let kinds = [Window::Alternate, Window::Roll2In, Window::Roll2Out, Window::Roll3In, Window::Roll3Out,
-      Window::Redirect, Window::BadRedirect, Window::SameHandOther];
-    let mut counts = [0u64; 8];
+      Window::Redirect, Window::BadRedirect, Window::SameHandOther, Window::Tap];
+    let mut counts = [0u64; 9];
     let (mut total, mut skip, mut skip_space) = (0u64, 0u64, 0u64);
+    let f = |p: usize| precomp.finger_of(p);
     for &(a, b, c, n) in windows {
       let (Some(p1), Some(p2), Some(p3)) = (at(a), at(b), at(c)) else { continue };
       total += n;
       let w = precomp.window(p1, p2, p3);
       counts[kinds.iter().position(|&k| k == w).unwrap_or(0)] += n;
-      // 1·3번이 같은 손가락의 다른 키 (가운데는 다른 손가락)
-      if p1 != p3 && finger(p1) == finger(p3) && finger(p2) != finger(p1) {
+      // 1·3번이 같은 손가락의 다른 키 (가운데는 다른 손가락). 한손에서 엄지 탭이 낀 창은 점수처럼 빼고 셈
+      if w != Window::Tap && !precomp.same_key(p1, p3) && f(p1) == f(p3) && f(p2) != f(p1) {
         skip += n;
         if b == crate::SPACE_ID { skip_space += n; }
       }
     }
     let pct = |a: u64| if total == 0 { 0.0 } else { a as f64 * 100.0 / total as f64 };
+    if precomp.one_hand {
+      // 한 손이라 교차와 2키 롤은 없음
+      println!("windows: roll3 in={:.1}% out={:.1}%  redirect={:.2}%  bad-redirect={:.2}%  same-hand-other={:.1}%  thumb tap={:.1}%  skipgram={:.2}% (across space {:.2}%)",
+        pct(counts[3]), pct(counts[4]), pct(counts[5]), pct(counts[6]), pct(counts[7]), pct(counts[8]), pct(skip), pct(skip_space));
+      return;
+    }
     println!("windows: alternate={:.1}%  roll2 in={:.1}% out={:.1}%  roll3 in={:.1}% out={:.1}%  redirect={:.2}%  bad-redirect={:.2}%  same-hand-other={:.1}%  skipgram={:.2}% (across space {:.2}%)",
       pct(counts[0]), pct(counts[1]), pct(counts[2]), pct(counts[3]), pct(counts[4]), pct(counts[5]), pct(counts[6]), pct(counts[7]),
       pct(skip), pct(skip_space));
@@ -258,6 +274,8 @@ impl Layout {
       sfb      += count as f64 * f64::from(e.sfb_base);
       rolling  += count as f64 * f64::from(e.rolling_base);
       scissors += count as f64 * f64::from(e.scissors_base);
+      // 한손: 엄지층 글자를 누른 채로 이어 치면 탭 하나를 돌려줌 (탭은 노력값 항목에 들어감)
+      effort   += count as f64 * f64::from(e.tap_base);
     }
 
     for &(a, b, c, count) in &corpus.nz_trigrams {
@@ -281,11 +299,22 @@ impl Layout {
     self.total = if penalized { PENALTY_SCORE } else { 0 };
   }
 
-  pub fn print(&self) {
+  // 한손: 오른쪽 5열(엄지층)을 좌우로 뒤집음. 안에서는 거울 자리(9열 = 새끼)에 두고, 보여 주거나 파일에서 읽을 때는
+  // 손가락 순서(새끼 → 가운데 열)로 씀. 두 번 뒤집으면 그대로. 글자가 다른 키로 가므로 점수는 다시 매겨야 함
+  pub fn flip_layer(&self) -> Layout {
+    let mut m = *self;
+    for r in 0..ROWS { m.slots[r * COLS + COLS / 2..(r + 1) * COLS].reverse(); }
+    for (p, &id) in m.slots.iter().enumerate() { if id < CHARS as u8 { m.pos[id as usize] = p as u8; } }
+    m
+  }
+
+  // 행마다 10칸 (가운데에 간격). 한손이면 왼쪽 5칸은 기본층, 오른쪽 5칸은 엄지층을 손가락 순서(새끼 → 가운데 열)로
+  pub fn print(&self, one_hand: bool) {
+    let shown = if one_hand { self.flip_layer() } else { *self };
     for r in 0..ROWS {
       let mut s = String::new();
       for c in 0..COLS {
-        let char_idx = self.slots[r * COLS + c];
+        let char_idx = shown.slots[r * COLS + c];
         let ch = key_char(char_idx);
         if c == 5 { s.push_str("  "); }
         s.push(' ');
@@ -310,6 +339,7 @@ impl Layout {
       sc.sfb += n as f64 * f64::from(e.sfb_base);
       sc.rolling += n as f64 * f64::from(e.rolling_base);
       sc.scissors += n as f64 * f64::from(e.scissors_base);
+      sc.effort += n as f64 * f64::from(e.tap_base);
     }
     for &(a, b, c, n) in &corpus.nz_trigrams {
       if a != sp && b != sp && c != sp { continue; }
@@ -334,7 +364,26 @@ impl Layout {
     let total = c.effort + c.sfb + c.rolling + c.scissors + hand;
     let hand_part = if hand > 0.0 { format!("  hand-balance={hand:.1}") } else { String::new() };
     let space = self.space_cost(corpus, precomp, norm);
+    if precomp.one_hand {
+      // 엄지 탭은 노력값 항목 안에 들어 있어서 떼어 보여 줌
+      let taps = self.thumb_taps(corpus, precomp) * f64::from(precomp.tap) * norm.abs.effort * norm.abs.per_letter * 100.0;
+      println!("total={total:.1}  effort={:.1}  taps={taps:.1}  sfb={:.1}  scissors={:.1}  rolling={:.1}  (space key {space:.1} of the total)",
+        c.effort - taps, c.sfb, c.scissors, c.rolling);
+      return;
+    }
     println!("total={total:.1}  effort={:.1}  sfb={:.1}  scissors={:.1}  rolling={:.1}{hand_part}  (space key {space:.1} of the total)", c.effort, c.sfb, c.scissors, c.rolling);
+  }
+
+  // 한손의 엄지 탭 수 (코퍼스 빈도 단위): 엄지층 글자 누름에서, 앞 글자도 엄지층이라 누른 채로 이어 친 누름을 뺌.
+  // 채점과 같은 n-gram(빈도가 낮은 것은 잘라 낸 것)으로 셈
+  pub fn thumb_taps(&self, corpus: &CorpusArrays, precomp: &Precomp) -> f64 {
+    let presses: u64 = (0..ROWS * COLS).filter(|&p| precomp.on_layer(p) && self.slots[p] < CHARS as u8)
+      .map(|p| corpus.freq[self.slots[p] as usize]).sum();
+    let held: u64 = corpus.nz_bigrams.iter().filter(|&&(a, b, _)| {
+      let (p1, p2) = (self.pos[a as usize], self.pos[b as usize]);
+      p1 != EMPTY && p2 != EMPTY && precomp.on_layer(p1 as usize) && precomp.on_layer(p2 as usize)
+    }).map(|e| e.2).sum();
+    presses as f64 - held as f64
   }
 
   pub fn calc_total_score(&mut self, norm: &ScoreNorm) {
@@ -380,11 +429,12 @@ pub fn save_results(layouts: &[Layout], path: &str) -> anyhow::Result<()> {
   Ok(())
 }
 
-// 저장된 결과. 스페이스가 왼손에 있는 배열(예전 결과)은 좌우를 뒤집어서 (space_right)
-pub fn load_results(path: &str) -> anyhow::Result<Vec<Layout>> {
+// 저장된 결과. 두 손이면 스페이스가 왼손에 있는 배열(예전 결과)은 좌우를 뒤집어서 (space_right).
+// 한손은 기본층과 엄지층을 바꿀 수 없으므로 그대로
+pub fn load_results(path: &str, one_hand: bool) -> anyhow::Result<Vec<Layout>> {
   let bytes = std::fs::read(path)?;
   let layouts: Vec<Layout> = bincode::deserialize(&bytes)?;
-  Ok(layouts.iter().map(Layout::space_right).collect())
+  Ok(if one_hand { layouts } else { layouts.iter().map(Layout::space_right).collect() })
 }
 
 // 총점 기준: [costs]의 대표 사건 비용을 환산한 배율과 손 비율 감점
@@ -394,6 +444,12 @@ pub fn init_score_norm(arrays: &CorpusArrays, precomp: &Precomp, costs: &crate::
 
 // 설정대로 채점할 때의 표와 총점 기준
 pub fn scoring(arrays: &CorpusArrays, c: &crate::config::Config) -> (Precomp, ScoreNorm) {
+  if c.one_hand {
+    // 한손: 손 비율 규칙(min_hand_usage, hand_penalty, hand_hard_limit)은 쓰지 않음
+    let precomp = Precomp::one_hand(&arrays.freq, &c.weights, &c.costs, &c.effort, c.one_hand_layer_effort);
+    let norm = init_score_norm(arrays, &precomp, &c.costs, crate::score::HandRule::default());
+    return (precomp, norm);
+  }
   let precomp = Precomp::new(&arrays.freq, &c.weights, &c.costs, &c.effort, c.hand_hard_limit());
   let norm = init_score_norm(arrays, &precomp, &c.costs, crate::score::HandRule::from_config(c));
   (precomp, norm)
@@ -557,6 +613,45 @@ mod tests {
   }
 
   #[test]
+  fn one_hand_files_show_the_thumb_layer_in_finger_order() {
+    // 파일·출력의 오른쪽 5칸 = 엄지층 (새끼 → 가운데 열). 안에서는 거울 자리 (9열 = 새끼)
+    let file = Layout::parse("abcde fghij\nklmno pqrst\nuvwxy z_...\n").unwrap();
+    let inner = file.flip_layer();
+    inner.assert_invariants();
+    let at = |l: &Layout, ch: u8| l.pos[(ch - b'a') as usize] as usize;
+    // 엄지층 새끼 윗줄의 f는 9열, 가운데 열 j는 5열. 기본층은 그대로
+    assert_eq!((at(&inner, b'f'), at(&inner, b'j'), at(&inner, b'a')), (9, 5, 0));
+    assert_eq!(inner.pos[crate::SPACE_ID as usize] as usize, 2 * COLS + 8);
+    // 두 번 뒤집으면 그대로
+    assert_eq!(inner.flip_layer().slots, file.slots);
+    // 엄지층 새끼 자리는 기본층 새끼 자리와 같은 손가락
+    let (precomp, _) = test_util::precomp_norm_one_hand(&test_util::stats().to_arrays());
+    assert_eq!(precomp.finger_of(at(&inner, b'f')), precomp.finger_of(at(&inner, b'a')));
+    assert!(precomp.same_key(at(&inner, b'f'), at(&inner, b'a')));
+  }
+
+  #[test]
+  fn one_hand_effort_includes_one_tap_per_run_of_thumb_letters() {
+    let stats = test_util::stats();
+    let arrays = stats.to_arrays();
+    let (precomp, norm) = test_util::precomp_norm_one_hand(&arrays);
+    let mut l = Layout::make_random(&arrays.keys, &[], 0);
+    l.calc_scores(&arrays, &precomp);
+    l.calc_total_score(&norm);
+    // 노력값 = 키 노력값(엄지층은 test_util::ONE_HAND_LAYER_EFFORT배) + 엄지 탭 × (엄지층 누름 - 누른 채로 이어 친 누름)
+    let grid = crate::config::EffortGrid::default().grid();
+    let keys: f64 = (0..ROWS * COLS).filter(|&p| l.slots[p] < CHARS as u8).map(|p| {
+      let factor = if precomp.on_layer(p) { test_util::ONE_HAND_LAYER_EFFORT } else { 1.0 };
+      arrays.freq[l.slots[p] as usize] as f64 * f64::from(grid[p / COLS][p % COLS] * factor)
+    }).sum();
+    let taps = l.thumb_taps(&arrays, &precomp);
+    assert!(taps > 0.0);
+    assert!((l.score.effort - keys - taps * f64::from(precomp.tap)).abs() < 1e-6 * l.score.effort, "{} vs {keys} + {taps}", l.score.effort);
+    // 손 비율 규칙이 없어 엄지층에 글자가 거의 없어도 실격이 아님
+    assert!(l.total > PENALTY_SCORE && norm.hand_cost(l.left_usage, l.right_usage) == 0.0);
+  }
+
+  #[test]
   fn space_cost_is_the_part_of_the_total_that_the_space_key_adds() {
     let stats = test_util::stats();
     let g = stats.to_arrays();
@@ -681,12 +776,14 @@ mod tests {
     let ls = vec![Layout::make_random(&test_util::stats().to_arrays().keys, &[], 0); 2];
     save_results(&ls, path).unwrap();
     save_results(&ls[..1], path).unwrap();
-    assert_eq!(load_results(path).unwrap().len(), 1);
+    assert_eq!(load_results(path, false).unwrap().len(), 1);
     assert!(!std::path::Path::new(&format!("{path}.tmp")).exists());
     // 스페이스가 왼손에 있던 결과는 읽을 때 좌우를 뒤집음
     let left = Layout::parse("_blyx.foup\nmanijzreht\ncgkdq.s.vw\n").unwrap();
     save_results(&[left], path).unwrap();
-    assert_eq!(load_results(path).unwrap()[0].slots, left.mirrored().slots);
+    assert_eq!(load_results(path, false).unwrap()[0].slots, left.mirrored().slots);
+    // 한손 결과는 기본층과 엄지층을 바꿀 수 없으므로 그대로
+    assert_eq!(load_results(path, true).unwrap()[0].slots, left.slots);
     std::fs::remove_dir_all(&dir).unwrap();
   }
 

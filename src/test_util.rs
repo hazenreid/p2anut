@@ -43,3 +43,13 @@ pub fn precomp_norm_for(arrays: &CorpusArrays) -> (Precomp, ScoreNorm) {
   let norm = crate::layout::init_score_norm(arrays, &precomp, &crate::config::Costs::default(), crate::score::HandRule::default());
   (precomp, norm)
 }
+
+// 한손 표의 엄지층 노력값 배율 (설정 기본값과 같음)
+pub const ONE_HAND_LAYER_EFFORT: f32 = 3.0;
+
+// 한손 표 (왼손 3×5 + 엄지층, 손 비율 규칙 없음)
+pub fn precomp_norm_one_hand(arrays: &CorpusArrays) -> (Precomp, ScoreNorm) {
+  let precomp = Precomp::one_hand(&arrays.freq, &weights(), &crate::config::Costs::default(), &crate::config::EffortGrid::default(), ONE_HAND_LAYER_EFFORT);
+  let norm = crate::layout::init_score_norm(arrays, &precomp, &crate::config::Costs::default(), crate::score::HandRule::default());
+  (precomp, norm)
+}

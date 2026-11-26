@@ -41,6 +41,8 @@ pub struct BigramEntry {
   pub sfb_base: f32,
   pub rolling_base: f32,
   pub scissors_base: f32,
+  // 한손: 엄지층 글자가 이어지면 엄지를 누른 채로 쳐서 탭 하나를 돌려줌 (노력값 단위, 음수. 두 손이면 0)
+  pub tap_base: f32,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -72,10 +74,13 @@ pub enum Window {
   BadRedirect,
   // 같은 손 연속에 SFB·시저스·가운데 열이 끼어 롤로 치지 않는 창
   SameHandOther,
+  // 한손: 엄지 탭이 낀 창 (롤로 치지 않음)
+  Tap,
 }
 
 // 손가락 번호 (왼손 검지 1 … 새끼 4, 오른손 검지 5 … 새끼 8). 가운데 열은 검지
 pub fn finger(p: usize) -> u8 { FINGER_GRID[p / COLS][p % COLS] }
+#[cfg(test)]
 fn is_left(p: usize) -> bool { p % COLS < COLS / 2 }
 
 pub struct Precomp {
@@ -84,32 +89,65 @@ pub struct Precomp {
   pub cross: Box<[CrossEntry]>,
   pub alphabet_effort: Box<[f64]>, // Flattened: [pos_idx * CHARS + char_idx]
   pub min_hand_usage: f32,
+  // 한손 배열 (왼손 3×5 + 엄지 원샷 레이어 키). 왼쪽 5열은 기본층, 오른쪽 5열은 엄지층을 좌우로 뒤집어 둔 것
+  // (9열 = 새끼 … 5열 = 가운데 열. 노력값 표와 가운데 열 규칙을 그대로 쓰려고 두 손의 오른손 자리와 맞춤)
+  pub one_hand: bool,
+  // 엄지 탭 한 번의 노력값 (노력값 표에서 가장 작은 값, 두 손이면 0). 엄지층 글자를 누를 때마다 더하고, 앞 글자도
+  // 엄지층이면(누른 채로 이어 침) 바이그램의 tap_base로 돌려줌. 심볼 레이어의 탭과 같은 값·같은 규칙
+  pub tap: f32,
+  // 칸마다 실제로 누르는 손가락, 키(엄지층은 같은 자리 기본층 칸 번호), 엄지층 여부, 왼손 여부
+  fingers: [u8; N],
+  keys: [u8; N],
+  layers: [bool; N],
+  lefts: [bool; N],
 }
 
 impl Precomp {
-  // 롤 값(바이그램 rolling_base, 트라이그램 roll_base)은 비용 단위로 계산: 대표 안쪽 롤 = costs.inroll,
-  // 대표 리다이렉트 세 글자 전체 = -costs.redirect. 그래서 리다이렉트 크기가 inroll과 독립적임
+  // 두 손 배열의 표
   pub fn new(freqs: &[u64], weights: &Weights, costs: &Costs, effort: &EffortGrid, min_hand_usage: f32) -> Self {
+    Self::build(freqs, weights, costs, effort, min_hand_usage, false, 1.0)
+  }
+
+  // 한손 배열의 표 (손 비율 규칙 없음). layer_effort: 엄지층 키의 노력값 배율 (설정의 one_hand_layer_effort)
+  pub fn one_hand(freqs: &[u64], weights: &Weights, costs: &Costs, effort: &EffortGrid, layer_effort: f32) -> Self {
+    Self::build(freqs, weights, costs, effort, 0.0, true, layer_effort)
+  }
+
+  // 롤 값(바이그램 rolling_base, 트라이그램 roll_base)은 비용 단위로 계산: 대표 안쪽 롤 = costs.inroll,
+  // 대표 리다이렉트 세 글자 전체 = -costs.redirect. 그래서 리다이렉트 크기가 inroll과 독립적임.
+  // 한손이면 엄지층 칸도 같은 자리 기본층의 손가락·행·노력값으로 셈. 원샷 레이어라 기본층 다음 엄지층 글자는 엄지 탭이
+  // 사이에 끼고(탭 너머 쌍: 같은 손가락이면 스킵그램, 인접 손가락 두 줄 차이면 스킵 시저스만, 롤 없음), 엄지층 글자끼리는
+  // 엄지를 누른 채로, 엄지층 다음 기본층 글자는 원샷이 풀려 바로 이어 치므로 보통 바이그램(롤 포함).
+  // 같은 키의 두 층 글자를 잇따라 치는 것은 같은 키 연타라 SFB가 아님.
+  // 엄지층 키의 노력값은 같은 자리 기본층 노력값의 layer_effort배로, 누름 노력값과 SFB·시저스·롤·리다이렉트 크기에 모두 씀
+  // (대표 사건은 모두 기본층이라 [costs]의 기준은 그대로). 엄지 탭은 노력값 표의 가장 작은 값 그대로
+  fn build(freqs: &[u64], weights: &Weights, costs: &Costs, effort: &EffortGrid, min_hand_usage: f32, one_hand: bool, layer_effort: f32) -> Self {
     let effort_grid = effort.grid();
     let mut bigrams = vec![BigramEntry::default(); N * N].into_boxed_slice();
     let mut trigrams = vec![TrigramEntry::default(); N * N * N].into_boxed_slice();
-    
+
     let mid = COLS / 2;
+    // 실제로 누르는 키의 열: 한손이면 엄지층(오른쪽 5열)을 뒤집어 왼손 자리로
+    let phys_col = |c: usize| if one_hand && c >= mid { COLS - 1 - c } else { c };
+    let layers: [bool; N] = std::array::from_fn(|p| one_hand && p % COLS >= mid);
+    let keys: [u8; N] = std::array::from_fn(|p| (p / COLS * COLS + phys_col(p % COLS)) as u8);
+    let tap = if one_hand { effort_grid.iter().flatten().copied().fold(f32::INFINITY, f32::min) } else { 0.0 };
+    let tapped = |a: usize, b: usize| layers[b] && !layers[a];
+    let key_effort = |p: usize| effort_grid[p / COLS][phys_col(p % COLS)] * if layers[p] { layer_effort } else { 1.0 };
     let mut alphabet_effort = vec![0.0f64; crate::layout::CHARS * N].into_boxed_slice();
     for char_idx in 0..crate::layout::CHARS {
       let f = freqs[char_idx] as f64;
       for pos_idx in 0..N {
-        let r = pos_idx / COLS; let c = pos_idx % COLS;
-        alphabet_effort[pos_idx * crate::layout::CHARS + char_idx] = f * f64::from(effort_grid[r][c]);
+        alphabet_effort[pos_idx * crate::layout::CHARS + char_idx] = f * f64::from(key_effort(pos_idx) + if layers[pos_idx] { tap } else { 0.0 });
       }
     }
 
     let pos_info: Vec<(usize, u8, f32, bool, bool)> = (0..N).map(|p| {
-      let r = p / COLS; let c = p % COLS;
+      let r = p / COLS; let c = phys_col(p % COLS);
       let finger = FINGER_GRID[r][c];
       let is_center = c == mid-1 || c == mid;
       let is_left = c < mid;
-      (r, finger, effort_grid[r][c], is_center, is_left)
+      (r, finger, key_effort(p), is_center, is_left)
     }).collect();
 
     // 손가락 간격 배율 (붙은 손가락 = 1, 하나 건너뛸 때마다 gap배)
@@ -160,7 +198,7 @@ impl Precomp {
     let sfs_of = |p1: usize, p3: usize| {
       let (r1, f1, e1, ic1, _) = pos_info[p1]; let (r3, f3, e3, ic3, _) = pos_info[p3];
       if f1 != f3 { return 0.0; }
-      let w = if p1 == p3 { weights.sfs_same_key() } else { weights.sfs };
+      let w = if keys[p1] == keys[p3] { weights.sfs_same_key() } else { weights.sfs };
       w * (e1 + e3) * (if ic1 || ic3 { weights.center } else { 1.0 }) * (1.0 + weights.row * r1.abs_diff(r3) as f32)
     };
     let mut cross = vec![CrossEntry::default(); N * N].into_boxed_slice();
@@ -178,6 +216,16 @@ impl Precomp {
         let is_center = ic1 || ic2;
         let effort_sum = e1 + e2;
         let entry = &mut bigrams[p1 * N + p2];
+        // 한손: 엄지층 글자끼리는 엄지를 누른 채로 이어 쳐서 탭을 돌려줌
+        if layers[p1] && layers[p2] { entry.tap_base = -tap; }
+        // 한손: 기본층 다음 엄지층 글자는 엄지 탭이 사이에 낌 (탭 너머 쌍. 같은 키면 같은 키 스킵그램 배율)
+        if tapped(p1, p2) {
+          entry.sfb_base = sfs_of(p1, p2);
+          entry.scissors_base = skip_scissors_of(p1, p2);
+          continue;
+        }
+        // 한손: 같은 키의 엄지층 글자 다음 기본층 글자는 같은 키 연타
+        if keys[p1] == keys[p2] { continue; }
         if f1 == f2 {
           let row_mult = 1.0 + (weights.row * row_dist as f32);
           entry.sfb_base = effort_sum * (if is_center { weights.center } else { 1.0 }) * row_mult;
@@ -206,6 +254,9 @@ impl Precomp {
         let (r2, f2, e2, ic2, il2) = pos_info[p2];
         for p3 in 0..N {
           if p2 == p3 { continue; }
+          // 한손: 엄지 탭이 사이에 끼거나 같은 키를 잇따라 치는 세 글자는 셈에서 뺌 (탭 너머 쌍과 같은 키 연타는
+          // 바이그램에서 셈. 심볼 레이어와 같은 규칙). 두 손이면 해당 없음
+          if tapped(p1, p2) || tapped(p2, p3) || keys[p1] == keys[p2] || keys[p2] == keys[p3] { continue; }
           let (r3, f3, e3, ic3, il3) = pos_info[p3];
           let entry = &mut trigrams[p1 * N * N + p2 * N + p3];
           entry.skip_scissors_base = skip_scissors_of(p1, p3);
@@ -235,8 +286,20 @@ impl Precomp {
         }
       }
     }
-    Self { bigrams, trigrams, cross, alphabet_effort, min_hand_usage }
+    let fingers = std::array::from_fn(|p| pos_info[p].1);
+    let lefts = std::array::from_fn(|p| pos_info[p].4);
+    Self { bigrams, trigrams, cross, alphabet_effort, min_hand_usage, one_hand, tap, fingers, keys, layers, lefts }
   }
+
+  // 칸 p를 누르는 손가락 (한손이면 엄지층 칸도 왼손 손가락 번호 1~4)
+  #[inline] pub fn finger_of(&self, p: usize) -> u8 { self.fingers[p] }
+  #[inline] pub fn same_hand(&self, p1: usize, p2: usize) -> bool { self.lefts[p1] == self.lefts[p2] }
+  // 같은 물리 키인지 (한손이면 같은 자리의 기본층·엄지층 칸)
+  #[inline] pub fn same_key(&self, p1: usize, p2: usize) -> bool { self.keys[p1] == self.keys[p2] }
+  // 한손의 엄지층 칸인지
+  #[inline] pub fn on_layer(&self, p: usize) -> bool { self.layers[p] }
+  // p1 다음 p2를 칠 때 엄지가 레이어 키를 새로 누르는지 (기본층 다음 엄지층 글자)
+  #[inline] pub fn tapped(&self, p1: usize, p2: usize) -> bool { self.layers[p2] && !self.layers[p1] }
 
   // 왼손·오른손 중 한쪽이라도 min_hand_usage(여기서는 실격 기준 hand_hard_limit을 받음) 미만이면 실격
   #[inline] pub fn violates_hand_usage(&self, left: u64, right: u64) -> bool {
@@ -252,17 +315,20 @@ impl Precomp {
 
   // 창 하나의 분류. 같은 손 두 키가 붙어 있고 나머지 하나가 다른 손이면 2키 롤,
   // 같은 손 세 키면 세 글자 롤·리다이렉트 (점수 계산과 같은 기준: 롤 값이 있는 쌍·창만 롤)
+  // 한손이면 엄지 탭이 낀 창은 따로 (Tap)
   pub fn window(&self, a: usize, b: usize, c: usize) -> Window {
+    if self.tapped(a, b) || self.tapped(b, c) { return Window::Tap; }
+    let f = |p: usize| self.fingers[p];
     let pair = |a: usize, b: usize| {
       if self.bigram(a, b).rolling_base <= 0.0 { Window::SameHandOther }
-      else if finger(a) > finger(b) { Window::Roll2In } else { Window::Roll2Out }
+      else if f(a) > f(b) { Window::Roll2In } else { Window::Roll2Out }
     };
-    let (ab, bc) = (is_left(a) == is_left(b), is_left(b) == is_left(c));
+    let (ab, bc) = (self.same_hand(a, b), self.same_hand(b, c));
     if ab && bc {
       let t = self.trigram(a, b, c).roll_base;
-      if t > 0.0 { if finger(a) > finger(b) { Window::Roll3In } else { Window::Roll3Out } }
+      if t > 0.0 { if f(a) > f(b) { Window::Roll3In } else { Window::Roll3Out } }
       else if t < 0.0 {
-        if [a, b, c].iter().any(|&p| matches!(finger(p), 1 | 5)) { Window::Redirect } else { Window::BadRedirect }
+        if [a, b, c].iter().any(|&p| matches!(f(p), 1 | 5)) { Window::Redirect } else { Window::BadRedirect }
       } else { Window::SameHandOther }
     } else if ab { pair(a, b) } else if bc { pair(b, c) } else { Window::Alternate }
   }
@@ -473,5 +539,108 @@ mod tests {
     // 중지 윗줄(0,2) → 검지 홈(1,3): 편한 방향, 롤 보상 유지
     assert_eq!(on.bigram(2, COLS + 3).scissors_base, 0.0);
     assert!(on.bigram(2, COLS + 3).rolling_base > 0.0);
+  }
+
+  // 한손 표: 엄지층 칸 (같은 자리 기본층 칸 p의 거울 자리. 9열 = 새끼 … 5열 = 가운데 열)
+  fn layer(p: usize) -> usize { p / COLS * COLS + (COLS - 1 - p % COLS) }
+
+  fn one_hand_weights() -> Weights {
+    // 설정 파일처럼 스킵그램 0.5, 같은 키 스킵그램 0
+    Weights { sfs: 0.5, sfs_same_key: Some(0.0), ..crate::test_util::weights() }
+  }
+
+  #[test]
+  fn one_hand_counts_taps_the_way_we_agreed() {
+    let (w, c) = (one_hand_weights(), Costs::default());
+    let pc = Precomp::one_hand(&[1; crate::layout::CHARS], &w, &c, &EffortGrid::default(), 1.0);
+    let two = Precomp::new(&[1; crate::layout::CHARS], &w, &c, &EffortGrid::default(), 0.45);
+    let (middle, index, index_top) = (REF_MIDDLE_HOME, REF_INDEX_HOME, REF_INDEX_TOP);
+    // 엄지층 칸은 같은 자리 기본층의 손가락·노력값에 탭(노력값 표의 가장 작은 값)을 더함
+    assert!(pc.one_hand && (pc.tap - 1.0).abs() < 1e-6);
+    assert_eq!(pc.finger_of(layer(index)), pc.finger_of(index));
+    assert!(pc.on_layer(layer(index)) && !pc.on_layer(index) && pc.same_key(index, layer(index)));
+    assert!((pc.effort(layer(index), 0) - pc.effort(index, 0) - 1.0).abs() < 1e-9);
+    // 기본 중지 홈 → 기본 검지 홈: 안쪽 롤, 두 손 표와 같음
+    assert_eq!(pc.bigram(middle, index).rolling_base, two.bigram(middle, index).rolling_base);
+    // 기본 중지 홈 → 엄지층 검지 홈: 탭이 끼어 롤 없음 (탭 비용은 엄지층 글자의 노력값에)
+    let e = pc.bigram(middle, layer(index));
+    assert_eq!((e.sfb_base, e.rolling_base, e.scissors_base, e.tap_base), (0.0, 0.0, 0.0, 0.0));
+    assert!(pc.tapped(middle, layer(index)));
+    // 기본 검지 홈 → 엄지층 검지 윗줄: SFB가 아니라 스킵그램 (sfs 배)
+    let x = pc.bigram(index, layer(index_top));
+    assert!((x.sfb_base - w.sfs * pc.bigram(index, index_top).sfb_base).abs() < 1e-6 && x.rolling_base == 0.0);
+    // 엄지층 중지 홈 → 엄지층 검지 홈: 누른 채로 이어 침 → 안쪽 롤, 탭 하나를 돌려줌
+    let h = pc.bigram(layer(middle), layer(index));
+    assert!((h.rolling_base - c.inroll).abs() < 1e-6 && (h.tap_base + 1.0).abs() < 1e-6);
+    // 엄지층 → 기본층: 원샷이 풀려 바로 이어 침 → 안쪽 롤(바깥쪽은 outroll배)과 SFB를 그대로 셈, 탭은 돌려주지 않음
+    assert!((pc.bigram(layer(middle), index).rolling_base - c.inroll).abs() < 1e-6);
+    assert!((pc.bigram(layer(index), middle).rolling_base - c.inroll * w.outroll).abs() < 1e-6);
+    assert_eq!(pc.bigram(layer(index), index_top).sfb_base, pc.bigram(index, index_top).sfb_base);
+    assert_eq!(pc.bigram(layer(middle), index).tap_base, 0.0);
+    // 같은 키의 두 층 글자: 기본 → 엄지층은 탭만, 엄지층 → 기본은 같은 키 연타라 아무것도 없음
+    for (a, b) in [(index, layer(index)), (layer(index), index)] {
+      let e = pc.bigram(a, b);
+      assert_eq!((e.sfb_base, e.rolling_base, e.scissors_base, e.tap_base), (0.0, 0.0, 0.0, 0.0), "{a} {b}");
+    }
+    // 한 손이라 손 비율 규칙 없음
+    assert!(!pc.violates_hand_usage(1, 0) && !pc.violates_hand_usage(0, 1));
+  }
+
+  #[test]
+  fn one_hand_trigrams_skip_taps_and_repeated_keys() {
+    let (w, c) = (one_hand_weights(), Costs::default());
+    let pc = Precomp::one_hand(&[1; crate::layout::CHARS], &w, &c, &EffortGrid::default(), 1.0);
+    let (ring, middle, index) = (REF_RING_HOME, REF_MIDDLE_HOME, REF_INDEX_HOME);
+    let zero = |t: &TrigramEntry| t.sfs_base == 0.0 && t.roll_base == 0.0 && t.skip_scissors_base == 0.0;
+    // 세 글자 롤: 기본층끼리, 엄지층끼리(누른 채로), 엄지층 → 기본층 → 기본층(원샷이 풀림)
+    for (a, b, d) in [(ring, middle, index), (layer(ring), layer(middle), layer(index)), (layer(ring), middle, index)] {
+      assert!(pc.trigram(a, b, d).roll_base > 0.0, "{a} {b} {d}");
+      assert_eq!(pc.window(a, b, d), Window::Roll3In);
+    }
+    // 엄지 탭이 사이에 끼면 롤·스킵그램 없음
+    for (a, b, d) in [(ring, layer(middle), layer(index)), (layer(ring), middle, layer(index))] {
+      assert!(zero(pc.trigram(a, b, d)), "{a} {b} {d}");
+      assert_eq!(pc.window(a, b, d), Window::Tap);
+    }
+    // 스킵그램: 검지 홈 → 중지 → 검지 윗줄 (층이 달라도 같은 손가락)
+    assert!(pc.trigram(layer(index), middle, REF_INDEX_TOP).sfs_base > 0.0);
+    // 같은 키를 잇따라 치는 세 글자는 바이그램에서만 셈
+    assert!(zero(pc.trigram(layer(middle), middle, index)));
+    // 리다이렉트도 층과 상관없이 같은 손 세 키
+    assert!(pc.trigram(layer(ring), index, middle).roll_base < 0.0);
+    assert_eq!(pc.window(layer(ring), index, middle), Window::Redirect);
+  }
+
+  #[test]
+  fn one_hand_layer_effort_scales_thumb_keys_everywhere() {
+    let (w, c) = (one_hand_weights(), Costs::default());
+    let x1 = Precomp::one_hand(&[1; crate::layout::CHARS], &w, &c, &EffortGrid::default(), 1.0);
+    let x3 = Precomp::one_hand(&[1; crate::layout::CHARS], &w, &c, &EffortGrid::default(), 3.0);
+    let (middle, index, index_top) = (REF_MIDDLE_HOME, REF_INDEX_HOME, REF_INDEX_TOP);
+    // 누름: 엄지층 키 노력값 3배 + 탭 (탭은 그대로 노력값 표의 가장 작은 값)
+    assert!((x3.effort(layer(index), 0) - (3.0 * x1.effort(index, 0) + 1.0)).abs() < 1e-6);
+    assert_eq!(x3.tap, x1.tap);
+    // 기본층 키는 그대로
+    assert_eq!(x3.effort(index, 0), x1.effort(index, 0));
+    assert_eq!(x3.bigram(middle, index).rolling_base, x1.bigram(middle, index).rolling_base);
+    // 엄지층끼리 SFB는 노력값 합에 비례해 3배, 롤은 노력값 합에 반비례해 1/3
+    let sfb = |pc: &Precomp| pc.bigram(layer(index), layer(index_top)).sfb_base;
+    assert!((sfb(&x3) - 3.0 * sfb(&x1)).abs() < 1e-5);
+    let roll = |pc: &Precomp, a: usize, b: usize| pc.bigram(a, b).rolling_base;
+    assert!((roll(&x3, layer(middle), layer(index)) - roll(&x1, layer(middle), layer(index)) / 3.0).abs() < 1e-5);
+    // 층을 건너면 두 키의 노력값 합으로: 엄지층 중지 홈(3.0) → 기본 검지 홈(1.0)의 롤은 합 2 → 4라 절반
+    assert!((roll(&x3, layer(middle), index) - roll(&x1, layer(middle), index) / 2.0).abs() < 1e-5);
+    // 탭 너머 스킵그램도 노력값 합으로: 기본 검지 홈(1.0) → 엄지층 검지 윗줄(1.3 → 3.9)
+    let x = |pc: &Precomp| pc.bigram(index, layer(index_top)).sfb_base;
+    assert!((x(&x3) / x(&x1) - (1.0 + 3.9) / (1.0 + 1.3)).abs() < 1e-5);
+  }
+
+  #[test]
+  fn two_hand_tables_have_no_taps() {
+    let pc = Precomp::new(&[1; crate::layout::CHARS], &crate::test_util::weights(), &Costs::default(), &EffortGrid::default(), 0.45);
+    assert!(!pc.one_hand && pc.tap == 0.0);
+    assert!(pc.bigrams.iter().all(|e| e.tap_base == 0.0));
+    assert!((0..N).all(|p| !pc.on_layer(p) && pc.finger_of(p) == finger(p) && pc.same_key(p, p)));
+    assert!(!pc.same_key(COLS + 3, COLS + 6) && !pc.same_hand(COLS + 3, COLS + 6));
   }
 }

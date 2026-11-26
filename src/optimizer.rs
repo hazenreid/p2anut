@@ -118,8 +118,8 @@ impl<'a> Optimizer<'a> {
 
     for i in 0..elites_len {
       let (elite, tally) = self.find_one(i + 1, elites_len, &excluded_homes, seeds.get(i).copied(), start);
-      // 점수는 좌우 대칭이라, 스페이스가 오른손 쪽에 오게 뒤집어 둠
-      let elite = elite.space_right();
+      // 두 손은 점수가 좌우 대칭이라, 스페이스가 오른손 쪽에 오게 뒤집어 둠 (한손은 기본층과 엄지층을 바꿀 수 없어서 그대로)
+      let elite = if self.precomp.one_hand { elite } else { elite.space_right() };
       excluded_homes.push(home_row_keys(&elite));
       all_elites.push(elite);
       sort_layouts(&mut all_elites);
@@ -127,7 +127,7 @@ impl<'a> Optimizer<'a> {
       let merged = sort_unique_layouts(seeds.iter().chain(&all_elites).copied().collect(), elites_len, &[], self.min_home_diff);
       save_results(&merged, result_file).ok();
       println!("\n[Elite {}/{}] best found {} times in {} starts", i + 1, elites_len, tally.hits, tally.starts);
-      elite.print();
+      elite.print(self.precomp.one_hand);
       elite.print_goodness(self.norm, &self.corpus_arrays, self.precomp);
       println!();
       if crate::SHUTDOWN.load(std::sync::atomic::Ordering::SeqCst) { break; }
@@ -366,13 +366,14 @@ impl<'a> Optimizer<'a> {
       return result;
     }
 
-    let mut old_bg = (0.0f64, 0.0f64, 0.0f64);
+    let mut old_bg = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
     for &idx in &ws.aff_bg_indices {
       let (a, b, cnt) = self.corpus_arrays.nz_bigrams[idx];
       let e = self.precomp.bigram(base.pos[a as usize] as usize, base.pos[b as usize] as usize);
       old_bg.0 += cnt as f64 * f64::from(e.sfb_base);
       old_bg.1 += cnt as f64 * f64::from(e.rolling_base);
       old_bg.2 += cnt as f64 * f64::from(e.scissors_base);
+      old_bg.3 += cnt as f64 * f64::from(e.tap_base);
     }
     let mut old_tg = (0.0f64, 0.0f64, 0.0f64);
     for &idx in &ws.aff_tg_indices {
@@ -386,20 +387,21 @@ impl<'a> Optimizer<'a> {
     let part_sfb      = base.score.sfb      - old_bg.0 - old_tg.0;
     let part_rolling  = base.score.rolling  - old_bg.1 - old_tg.1;
     let part_scissors = base.score.scissors - old_bg.2 - old_tg.2;
-    let part_effort   = base.score.effort
+    let part_effort   = base.score.effort - old_bg.3
       - (if v1 < CHARS as u8 { self.precomp.effort(p1, v1 as usize) } else { 0.0 })
       - (if v2 < CHARS as u8 { self.precomp.effort(p2, v2 as usize) } else { 0.0 });
     let new_effort =
       (if v2 < CHARS as u8 { self.precomp.effort(p1, v2 as usize) } else { 0.0 })
       + (if v1 < CHARS as u8 { self.precomp.effort(p2, v1 as usize) } else { 0.0 });
 
-    let mut new_bg = (0.0f64, 0.0f64, 0.0f64);
+    let mut new_bg = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
     for &idx in &ws.aff_bg_indices {
       let (a, b, cnt) = self.corpus_arrays.nz_bigrams[idx];
       let e = self.precomp.bigram(temp_pos[a as usize] as usize, temp_pos[b as usize] as usize);
       new_bg.0 += cnt as f64 * f64::from(e.sfb_base);
       new_bg.1 += cnt as f64 * f64::from(e.rolling_base);
       new_bg.2 += cnt as f64 * f64::from(e.scissors_base);
+      new_bg.3 += cnt as f64 * f64::from(e.tap_base);
     }
     let mut new_tg = (0.0f64, 0.0f64, 0.0f64);
     for &idx in &ws.aff_tg_indices {
@@ -410,7 +412,7 @@ impl<'a> Optimizer<'a> {
       new_tg.2 += cnt as f64 * f64::from(e.skip_scissors_base);
     }
 
-    let pe = part_effort   + new_effort;
+    let pe = part_effort   + new_effort + new_bg.3;
     let ps = part_sfb      + new_bg.0 + new_tg.0;
     let pr = part_rolling  + new_bg.1 + new_tg.1;
     let pc = part_scissors + new_bg.2 + new_tg.2;
@@ -463,13 +465,14 @@ impl<'a> Optimizer<'a> {
       return result;
     }
 
-    let mut old_bg = (0.0f64, 0.0f64, 0.0f64);
+    let mut old_bg = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
     for &idx in &ws.aff_bg_indices {
       let (a, b, cnt) = self.corpus_arrays.nz_bigrams[idx];
       let e = self.precomp.bigram(base.pos[a as usize] as usize, base.pos[b as usize] as usize);
       old_bg.0 += cnt as f64 * f64::from(e.sfb_base);
       old_bg.1 += cnt as f64 * f64::from(e.rolling_base);
       old_bg.2 += cnt as f64 * f64::from(e.scissors_base);
+      old_bg.3 += cnt as f64 * f64::from(e.tap_base);
     }
     let mut old_tg = (0.0f64, 0.0f64, 0.0f64);
     for &idx in &ws.aff_tg_indices {
@@ -483,7 +486,7 @@ impl<'a> Optimizer<'a> {
     let part_sfb      = base.score.sfb      - old_bg.0 - old_tg.0;
     let part_rolling  = base.score.rolling  - old_bg.1 - old_tg.1;
     let part_scissors = base.score.scissors - old_bg.2 - old_tg.2;
-    let part_effort   = base.score.effort
+    let part_effort   = base.score.effort - old_bg.3
       - (if v1 < CHARS as u8 { self.precomp.effort(p1, v1 as usize) } else { 0.0 })
       - (if v2 < CHARS as u8 { self.precomp.effort(p2, v2 as usize) } else { 0.0 })
       - (if v3 < CHARS as u8 { self.precomp.effort(p3, v3 as usize) } else { 0.0 });
@@ -492,13 +495,14 @@ impl<'a> Optimizer<'a> {
       + (if n2 < CHARS as u8 { self.precomp.effort(p2, n2 as usize) } else { 0.0 })
       + (if n3 < CHARS as u8 { self.precomp.effort(p3, n3 as usize) } else { 0.0 });
 
-    let mut new_bg = (0.0f64, 0.0f64, 0.0f64);
+    let mut new_bg = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
     for &idx in &ws.aff_bg_indices {
       let (a, b, cnt) = self.corpus_arrays.nz_bigrams[idx];
       let e = self.precomp.bigram(temp_pos[a as usize] as usize, temp_pos[b as usize] as usize);
       new_bg.0 += cnt as f64 * f64::from(e.sfb_base);
       new_bg.1 += cnt as f64 * f64::from(e.rolling_base);
       new_bg.2 += cnt as f64 * f64::from(e.scissors_base);
+      new_bg.3 += cnt as f64 * f64::from(e.tap_base);
     }
     let mut new_tg = (0.0f64, 0.0f64, 0.0f64);
     for &idx in &ws.aff_tg_indices {
@@ -509,7 +513,7 @@ impl<'a> Optimizer<'a> {
       new_tg.2 += cnt as f64 * f64::from(e.skip_scissors_base);
     }
 
-    let pe = part_effort   + new_effort;
+    let pe = part_effort   + new_effort + new_bg.3;
     let ps = part_sfb      + new_bg.0 + new_tg.0;
     let pr = part_rolling  + new_bg.1 + new_tg.1;
     let pc = part_scissors + new_bg.2 + new_tg.2;
@@ -585,13 +589,14 @@ impl<'a> Optimizer<'a> {
     }
 
     // Old delta contributions (f64 for precision on large corpora)
-    let mut old_bg = (0.0f64, 0.0f64, 0.0f64);
+    let mut old_bg = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
     for &idx in &ws.aff_bg_indices {
       let (a, b, cnt) = self.corpus_arrays.nz_bigrams[idx];
       let e = self.precomp.bigram(base.pos[a as usize] as usize, base.pos[b as usize] as usize);
       old_bg.0 += cnt as f64 * f64::from(e.sfb_base);
       old_bg.1 += cnt as f64 * f64::from(e.rolling_base);
       old_bg.2 += cnt as f64 * f64::from(e.scissors_base);
+      old_bg.3 += cnt as f64 * f64::from(e.tap_base);
     }
     let mut old_tg = (0.0f64, 0.0f64, 0.0f64);
     for &idx in &ws.aff_tg_indices {
@@ -605,7 +610,7 @@ impl<'a> Optimizer<'a> {
     let part_sfb      = base.score.sfb - old_bg.0 - old_tg.0;
     let part_rolling  = base.score.rolling - old_bg.1 - old_tg.1;
     let part_scissors = base.score.scissors - old_bg.2 - old_tg.2;
-    let part_effort   = base.score.effort
+    let part_effort   = base.score.effort - old_bg.3
       - values.iter().take(k).enumerate()
           .map(|(i, &id)| if id < CHARS as u8 { self.precomp.effort(swap_pos[i], id as usize) } else { 0.0 })
           .sum::<f64>();
@@ -618,13 +623,14 @@ impl<'a> Optimizer<'a> {
       result.total = PENALTY_SCORE;
       return result;
     }
-    let (mut new_sfb, mut new_roll, mut new_sciss) = (0.0f64, 0.0f64, 0.0f64);
+    let (mut new_sfb, mut new_roll, mut new_sciss, mut new_tap) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
     for &idx in &ws.aff_bg_indices {
       let (a, b, cnt) = self.corpus_arrays.nz_bigrams[idx];
       let e = self.precomp.bigram(temp_pos[a as usize] as usize, temp_pos[b as usize] as usize);
       new_sfb   += cnt as f64 * f64::from(e.sfb_base);
       new_roll  += cnt as f64 * f64::from(e.rolling_base);
       new_sciss += cnt as f64 * f64::from(e.scissors_base);
+      new_tap   += cnt as f64 * f64::from(e.tap_base);
     }
     let (mut new_sfs, mut new_troll, mut new_tsciss) = (0.0f64, 0.0f64, 0.0f64);
     for &idx in &ws.aff_tg_indices {
@@ -634,7 +640,7 @@ impl<'a> Optimizer<'a> {
       new_troll += cnt as f64 * f64::from(e.roll_base);
       new_tsciss += cnt as f64 * f64::from(e.skip_scissors_base);
     }
-    let pe = part_effort + new_effort;
+    let pe = part_effort + new_effort + new_tap;
     let ps = part_sfb   + new_sfb + new_sfs;
     let pr = part_rolling + new_roll + new_troll;
     let pc = part_scissors + new_sciss + new_tsciss;
@@ -706,16 +712,17 @@ mod tests {
     assert!((cand.total - full.total).abs() <= 1000, "total {} vs {}", cand.total, full.total);
   }
 
+  // 손 비율 감점이 붙는 구간(40~45%)과 한손 표(엄지 탭을 돌려주는 바이그램)에서도 delta 계산이 전체 재계산과 같은지
   #[test]
   fn delta_moves_match_full_recompute() {
-    for soft in [false, true] { check_delta_moves(soft); }
+    let arrays = test_util::stats().to_arrays();
+    for (precomp, norm) in [test_util::precomp_norm_for(&arrays), test_util::precomp_norm_soft_hand(&arrays), test_util::precomp_norm_one_hand(&arrays)] {
+      check_delta_moves(&arrays, &precomp, &norm);
+    }
   }
 
-  // soft_hand: 손 비율 감점이 붙는 구간(40~45%)에서도 delta 계산이 전체 재계산과 같은지
-  fn check_delta_moves(soft_hand: bool) {
-    let arrays = test_util::stats().to_arrays();
-    let (precomp, norm) = if soft_hand { test_util::precomp_norm_soft_hand(&arrays) } else { test_util::precomp_norm_for(&arrays) };
-    let o = Optimizer::new(arrays, &precomp, &norm, 1, 1, test_util::sa(), 0);
+  fn check_delta_moves(arrays: &CorpusArrays, precomp: &Precomp, norm: &ScoreNorm) {
+    let o = Optimizer::new(arrays.clone(), precomp, norm, 1, 1, test_util::sa(), 0);
     let mut ws = SaWorkspace::new(&o.corpus_arrays);
     let mut cur = o.make_scored_excl(&[]);
     let mut checked = 0;
@@ -730,7 +737,7 @@ mod tests {
         _ => o.random_permute_k(&cur, 4 + fastrand::usize(..2), &mut ws),
       };
       if cand.total <= PENALTY_SCORE { continue; }
-      assert_matches_full_recompute(&cand, &o.corpus_arrays, &precomp, &norm);
+      assert_matches_full_recompute(&cand, &o.corpus_arrays, precomp, norm);
       checked += 1;
       // 누적 delta 오차까지 검증하려고 후보를 계속 이어서 사용
       cur = cand;
@@ -815,6 +822,24 @@ mod tests {
       assert_ne!(l.pos[26], EMPTY);
     }
     assert!(a.total > PENALTY_SCORE);
+  }
+
+  #[test]
+  fn one_hand_sa_fills_both_layers() {
+    fastrand::seed(7);
+    let arrays = test_util::stats().to_arrays();
+    let (precomp, norm) = test_util::precomp_norm_one_hand(&arrays);
+    let o = Optimizer::new(arrays, &precomp, &norm, 1, 1, test_util::sa(), 0);
+    let start = o.make_scored_excl(&[]);
+    let l = o.optimize_sa(start, &[]);
+    l.assert_invariants();
+    assert_eq!(l.key_count(), 27);
+    // 손 비율 규칙이 없어 실격이 없고, 담금질이 시작 배열보다 나음
+    assert!(l.total > PENALTY_SCORE && l.total > start.total);
+    // 기본층은 15칸뿐이라 적어도 12키는 엄지층에 있고, 엄지 탭을 셈
+    let thumb_keys = (0..ROWS * COLS).filter(|&p| precomp.on_layer(p) && l.slots[p] < CHARS as u8).count();
+    assert!(thumb_keys >= 12, "{thumb_keys}");
+    assert!(l.thumb_taps(&o.corpus_arrays, &precomp) > 0.0);
   }
 
   #[test]
