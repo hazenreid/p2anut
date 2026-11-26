@@ -1030,6 +1030,8 @@ mod tests {
   fn config() -> Config {
     let mut t: toml::Table = toml::from_str(&std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/config.toml")).unwrap()).unwrap();
     t.insert("wikipedia_dump_url".into(), toml::Value::String("https://m.org/a.xml.bz2".into()));
+    // 두 손 기준 (config.toml의 one_hand는 브랜치에 따라 true. 한손 테스트는 one_hand_config)
+    t.insert("one_hand".into(), toml::Value::Boolean(false));
     toml::Value::Table(t).try_into().unwrap()
   }
 

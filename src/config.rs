@@ -451,9 +451,9 @@ mod tests {
 
   fn config(extra: &str) -> Config {
     let base = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/config.toml")).unwrap();
-    // 기본 config.toml에서 덤프·커버리지 항목을 빼고 테스트할 값만 넣음
+    // 기본 config.toml에서 덤프·커버리지 항목과 one_hand(브랜치에 따라 true)를 빼고 테스트할 값만 넣음
     let mut table: toml::Table = toml::from_str(&base).unwrap();
-    table.retain(|k, _| !k.starts_with("wikipedia_") && !k.ends_with("_coverage"));
+    table.retain(|k, _| !k.starts_with("wikipedia_") && !k.ends_with("_coverage") && k != "one_hand");
     table.extend(toml::from_str::<toml::Table>(extra).unwrap());
     toml::Value::Table(table).try_into().unwrap()
   }
@@ -612,7 +612,7 @@ loose_pairs = ["(\""]"#, "steps = 0", "base_slot_extra = -1.0", r#"pairs = ["(1"
   #[test]
   fn one_hand_keeps_its_own_result_file() {
     let url = "wikipedia_dump_url = \"https://m.org/a.xml.bz2\"\n";
-    // config.toml은 두 손 (one_hand = false)
+    // one_hand가 없으면 두 손
     let c = config(url);
     assert!(!c.one_hand);
     assert_eq!(c.result_file_name(), "result.bin");
@@ -627,7 +627,7 @@ loose_pairs = ["(\""]"#, "steps = 0", "base_slot_extra = -1.0", r#"pairs = ["(1"
   #[test]
   fn one_hand_ignores_center_rare() {
     let url = "wikipedia_dump_url = \"https://m.org/a.xml.bz2\"\n";
-    // config.toml은 두 손 center_rare = 3
+    // 두 손이면 config.toml의 center_rare = 3 그대로
     assert_eq!(config(url).center_rare_letters(), 3);
     let c = config(&format!("{url}one_hand = true"));
     assert_eq!((c.center_rare, c.center_rare_letters()), (3, 0));

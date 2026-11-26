@@ -397,7 +397,7 @@ mod tests {
   fn saved_results_are_rescored_and_sorted_when_a_corpus_is_given() {
     let dir = std::env::temp_dir().join(format!("p2anut-saved-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let config = crate::config::load_config(std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/config.toml"))).unwrap();
+    let config = crate::test_util::two_hand_config();
     let s = super::Scoring::new(&crate::test_util::stats(), None, &config);
     // 결과 파일이 없으면 빈 목록
     assert!(super::saved_results(&dir, &config, Some(&s)).unwrap().is_empty());
@@ -423,7 +423,7 @@ mod tests {
 
   #[test]
   fn symbols_refuses_unknown_options() {
-    let config = crate::config::load_config(std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/config.toml"))).unwrap();
+    let config = crate::test_util::two_hand_config();
     let dir = std::env::temp_dir().join(format!("p2anut-symopt-{}", std::process::id()));
     let err = super::cmd_symbols(&dir, &config, &["1".to_string(), "--flip".to_string()]).unwrap_err().to_string();
     assert!(err.contains("unknown option --flip"), "{err}");
@@ -432,7 +432,7 @@ mod tests {
 
   #[test]
   fn code_is_mixed_in_by_letters_and_shown_by_part() {
-    let mut config = crate::config::load_config(std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/config.toml"))).unwrap();
+    let mut config = crate::test_util::two_hand_config();
     (config.bigram_coverage, config.trigram_coverage) = (1.0, 1.0);
     // 손 비율 감점은 섞은 뒤의 비율로 매겨 평균이 되지 않으므로 끔
     (config.min_hand_usage, config.hand_hard_limit) = (0.0, Some(0.0));

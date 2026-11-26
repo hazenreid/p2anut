@@ -22,6 +22,13 @@ pub fn weights() -> Weights {
   Weights { gap: 0.78, row: 0.97, center: 2.5, outroll: 0.70, bad_redirect: 1.0, roll_row: None, half_scissors: 1.0, full_scissors_good: 0.5, skip_scissors: 0.5, sfs: 1.0, sfs_same_key: None }
 }
 
+// 저장소의 config.toml을 두 손 배열로 (config.toml의 one_hand는 브랜치에 따라 true)
+pub fn two_hand_config() -> crate::config::Config {
+  let mut c = crate::config::load_config(std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/config.toml"))).unwrap();
+  c.one_hand = false;
+  c
+}
+
 pub fn sa() -> SaParams {
   SaParams { max_no_improve: 300, accept_start: 0.3, cooling: 0.98, starts_per_batch: 8, stop_after_hits: 2, max_starts: 64 }
 }

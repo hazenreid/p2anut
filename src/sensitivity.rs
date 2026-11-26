@@ -299,9 +299,7 @@ mod tests {
   use crate::score::HandRule;
   use crate::test_util;
 
-  fn config() -> Config {
-    crate::config::load_config(std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/config.toml"))).unwrap()
-  }
+  fn config() -> Config { test_util::two_hand_config() }
 
   fn random_layouts(arrays: &CorpusArrays, n: usize) -> Vec<Layout> {
     (0..n).map(|_| Layout::make_random(&arrays.keys, &[], 0)).collect()
