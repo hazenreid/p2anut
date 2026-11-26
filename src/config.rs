@@ -202,7 +202,8 @@ pub struct Config {
   #[serde(default = "default_trigram_coverage")]
   pub trigram_coverage: f64,
   // 코퍼스 빈도 최하위 n글자를 가운데 두 열(검지 안쪽)에 강제 배치. 다른 글자는 절대 센터에 안 옴.
-  // 0(기본) = 제약 없음. 3~6 (센터는 6칸, 키 27개(a-z와 스페이스) 중 나머지가 바깥 24칸에 다 들어가야 하므로 3 이상)
+  // 0(기본) = 제약 없음. 3~6 (센터는 6칸, 키 27개(a-z와 스페이스) 중 나머지가 바깥 24칸에 다 들어가야 하므로 3 이상).
+  // 한손 배열에는 쓰지 않음 (center_rare_letters)
   #[serde(default)]
   pub center_rare: usize,
   // 한손 키보드 (왼손 3×5 + 엄지 원샷 레이어 키): 27키를 기본층 15칸과 엄지층 15칸에 둠. 손 비율 규칙은 쓰지 않고,
@@ -336,6 +337,9 @@ fn url_file_name(url: &str) -> Option<&str> {
 
 impl Config {
   pub fn hand_hard_limit(&self) -> f32 { self.hand_hard_limit.unwrap_or(self.min_hand_usage) }
+
+  // 배열 최적화·채점에 실제로 쓰는 center_rare 글자 수: 한손 배열에는 쓰지 않음 (가운데 열에도 아무 글자나)
+  pub fn center_rare_letters(&self) -> usize { if self.one_hand { 0 } else { self.center_rare } }
 
   // 결과 파일 이름 (result_path 기준): 한손이면 확장자 앞에 -one-hand를 붙여 두 손 결과와 섞이지 않게
   // (result.bin → result-one-hand.bin)
@@ -618,6 +622,15 @@ loose_pairs = ["(\""]"#, "steps = 0", "base_slot_extra = -1.0", r#"pairs = ["(1"
       let c = config(&format!("{url}one_hand = true\nresult_file = \"{file}\""));
       assert_eq!(c.result_file_name(), want, "{file}");
     }
+  }
+
+  #[test]
+  fn one_hand_ignores_center_rare() {
+    let url = "wikipedia_dump_url = \"https://m.org/a.xml.bz2\"\n";
+    // config.toml은 두 손 center_rare = 3
+    assert_eq!(config(url).center_rare_letters(), 3);
+    let c = config(&format!("{url}one_hand = true"));
+    assert_eq!((c.center_rare, c.center_rare_letters()), (3, 0));
   }
 
   #[test]

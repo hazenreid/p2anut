@@ -165,7 +165,7 @@ fn two_hands_only(config: &Config, cmd: &str) -> anyhow::Result<()> {
 
 // 채점할 배열 파일들: 키 구성이 코퍼스와 같아야 함. center_rare를 어기면 알리기만 함
 fn layout_files(files: &[String], s: &Scoring, config: &Config, tag: &str) -> anyhow::Result<Vec<(String, Layout)>> {
-  let center_mask = s.arrays.rare_mask(config.center_rare);
+  let center_mask = s.arrays.rare_mask(config.center_rare_letters());
   files.iter().map(|f| {
     let l = read_layout(f, config.one_hand)?;
     anyhow::ensure!(l.key_count() == s.arrays.keys.len(), "{f} has {} letters, the corpus has {}", l.key_count(), s.arrays.keys.len());
@@ -247,7 +247,7 @@ fn cmd_sensitivity(result_path: &Path, config: &Config, files: &[String]) -> any
     .map(|(i, l)| (format!("saved #{}", i + 1), l)).collect();
   cands.extend(layout_files(files, &s, config, "Sensitivity")?);
   anyhow::ensure!(!cands.is_empty(), "no layouts to check: run optimize first or pass layout files");
-  sensitivity::run(&s.arrays, config, cands, s.arrays.rare_mask(config.center_rare));
+  sensitivity::run(&s.arrays, config, cands, s.arrays.rare_mask(config.center_rare_letters()));
   Ok(())
 }
 
@@ -261,7 +261,7 @@ fn run_optimize(result_path: &Path, config: &Config, english: &CorpusStats, rese
   if config.code_share > 0.0 {
     println!("[Corpus] Wikipedia English with {:.0}% Rust code (by letters) -> {}", config.code_share * 100.0, result_file.display());
   }
-  let center_mask = s.arrays.rare_mask(config.center_rare);
+  let center_mask = s.arrays.rare_mask(config.center_rare_letters());
   if center_mask != 0 {
     let letters: String = (0..s.arrays.keys.len()).filter(|&i| center_mask >> i & 1 == 1).map(|i| s.arrays.keys[i]).collect();
     println!("[Center] least frequent {} letters forced into the center columns: {letters}", config.center_rare);
